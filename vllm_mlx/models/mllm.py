@@ -317,6 +317,145 @@ def _build_mllm_chat_messages(
     return chat_messages
 
 
+def _as_plain_dict(obj: object) -> object:
+    """Coerce a pydantic model (v1/v2) to a plain dict; pass through otherwise."""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(exclude_none=True)
+    if hasattr(obj, "dict"):
+        return {k: v for k, v in obj.dict().items() if v is not None}
+    return obj
+
+
+def _render_gemma_tool_call_args(arguments: object) -> str:
+    """Render OpenAI tool-call arguments as Gemma-native kwargs: ``key=repr(value)``.
+
+    Using ``repr`` keeps the values round-trippable through the gemma4 output
+    parser's ``ast.literal_eval`` (see gemma4_tool_parser._call_node_to_tool).
+    """
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except (ValueError, TypeError):
+            arguments = {}
+    if not isinstance(arguments, dict):
+        return ""
+    return ", ".join(f"{key}={value!r}" for key, value in arguments.items())
+
+
+def _coerce_tool_call(call: object) -> tuple[str, str] | None:
+    """Extract ``(function_name, rendered_args)`` from an OpenAI tool_call.
+
+    Accepts dicts or pydantic objects, with the function payload either nested
+    under ``function`` or inlined. Returns None if no usable name is present.
+    """
+    call = _as_plain_dict(call)
+    if not isinstance(call, dict):
+        return None
+    fn = _as_plain_dict(call.get("function", call))
+    if not isinstance(fn, dict):
+        return None
+    name = fn.get("name")
+    if not name:
+        return None
+    return str(name), _render_gemma_tool_call_args(fn.get("arguments", {}))
+
+
+def _stringify_message_content(content: object) -> str:
+    """Flatten a message ``content`` (str, or list of OpenAI parts) to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(item.get("text") or item.get("content") or "")
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _serialize_tool_messages_gemma_native(messages: list[dict]) -> list[dict]:
+    """Rewrite OpenAI tool-call/tool-result turns into Gemma-native text turns.
+
+    Gemma's chat template knows only user/model/system roles, and the --mllm
+    message builder reads only ``role`` + ``content`` -- so assistant turns
+    carrying ``tool_calls`` (empty ``content``) get dropped and ``role:"tool"``
+    results are mis-rendered, losing tool state across turns (#82). This is the
+    inverse of the gemma4 output parser (#80): the assistant call becomes a
+    ```` ```tool_code``` ```` block and each tool result a ```` ```tool_output``` ````
+    block in a user turn, so the model sees a coherent call->result transcript.
+    Non-tool messages pass through unchanged.
+    """
+    out: list[dict] = []
+    pending_outputs: list[str] = []
+
+    def _flush_outputs() -> None:
+        if pending_outputs:
+            body = "\n".join(pending_outputs)
+            out.append({"role": "user", "content": f"```tool_output\n{body}\n```"})
+            pending_outputs.clear()
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            _flush_outputs()
+            out.append(msg)
+            continue
+
+        role = msg.get("role", "user")
+
+        if role == "tool":
+            pending_outputs.append(_stringify_message_content(msg.get("content", "")))
+            continue
+
+        _flush_outputs()
+
+        tool_calls = msg.get("tool_calls")
+        if role == "assistant" and tool_calls:
+            lines = []
+            for call in tool_calls:
+                coerced = _coerce_tool_call(call)
+                if coerced is not None:
+                    name, args = coerced
+                    lines.append(f"{name}({args})")
+            block = "```tool_code\n" + "\n".join(lines) + "\n```"
+            text = _stringify_message_content(msg.get("content", ""))
+            new_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+            new_msg["role"] = "assistant"
+            new_msg["content"] = f"{text}\n{block}" if text else block
+            out.append(new_msg)
+            continue
+
+        out.append(msg)
+
+    _flush_outputs()
+    return out
+
+
+def _template_supports_tool_role(processor: object, config: object) -> bool:
+    """True if the active chat template renders ``tool_calls`` / ``role:"tool"``.
+
+    When True the template handles tool turns itself; when False (e.g. Gemma)
+    the caller serializes them to Gemma-native text first (#82). Inspects the
+    template string when available, else falls back to a model_type heuristic.
+    """
+    template = getattr(processor, "chat_template", None)
+    if not template:
+        tokenizer = getattr(processor, "tokenizer", None)
+        template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, str) and template:
+        return (
+            "tool_calls" in template
+            or "'tool'" in template
+            or '"tool"' in template
+        )
+    # Unknown template: assume support except for the Gemma family.
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+    return "gemma" not in model_type
+
+
 @dataclass
 class MultimodalInput:
     """Input for multimodal generation."""
@@ -2391,6 +2530,13 @@ class MLXMultimodalLM:
         if "enable_thinking" in chat_template_kwargs:
             enable_thinking = chat_template_kwargs.pop("enable_thinking")
 
+        # Serialize tool-call/tool-result turns into Gemma-native text when the
+        # chat template can't render them (#82). Done before any msg_idx-based
+        # collection below so indices stay consistent (and covers the native
+        # video path, which is reached with these same messages).
+        if not _template_supports_tool_role(self.processor, self.config):
+            messages = _serialize_tool_messages_gemma_native(messages)
+
         # Collect video and audio inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
         _msg_audio_inputs = self._collect_audio_inputs(messages)
@@ -2794,6 +2940,11 @@ class MLXMultimodalLM:
         chat_template_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
         if "enable_thinking" in chat_template_kwargs:
             enable_thinking = chat_template_kwargs.pop("enable_thinking")
+
+        # Serialize tool-call/tool-result turns into Gemma-native text when the
+        # chat template can't render them (#82); see chat() for rationale.
+        if not _template_supports_tool_role(self.processor, self.config):
+            messages = _serialize_tool_messages_gemma_native(messages)
 
         # Collect video and audio inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
