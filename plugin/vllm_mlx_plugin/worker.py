@@ -20,6 +20,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _compilation_times():
+    """Zero compilation times in vLLM's own type when it exists (>= 0.27)."""
+    try:
+        from vllm.v1.worker.worker_base import CompilationTimes
+    except ImportError:  # older vLLM: return value is ignored
+        return None
+    return CompilationTimes(language_model=0.0, encoder=0.0)
+
+
 class MLXWorker:
     """
     Worker implementation for MLX-based inference on Apple Silicon.
@@ -158,11 +167,17 @@ class MLXWorker:
             return self.model_runner.get_kv_cache_spec()
         return {}
 
-    def compile_or_warm_up_model(self) -> None:
-        """Warm up model for inference."""
+    def compile_or_warm_up_model(self):
+        """Warm up model for inference.
+
+        vLLM >= 0.27 expects a ``CompilationTimes`` back (the executor reads
+        ``.language_model`` / ``.encoder`` off every worker's result); older
+        releases ignore the return value.
+        """
         if self.model_runner:
             self.model_runner.warm_up()
         logger.info("Model warm-up complete")
+        return _compilation_times()
 
     def execute_model(
         self,
