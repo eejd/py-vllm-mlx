@@ -92,7 +92,11 @@ class MLXPlatform(Platform):
     _enum = PlatformEnum.OOT
 
     device_name: str = "mlx"
-    device_type: str = "mlx"
+    # vLLM builds torch.device(device_type) (DeviceConfig.__post_init__), and
+    # "mlx" is not a torch device. Tensors handed to/from vLLM live on the CPU
+    # side of unified memory; MLX manages its own device (worker.py does the
+    # same with torch.device("cpu")).
+    device_type: str = "cpu"
 
     # MLX uses CPU dispatch key since it's not registered in PyTorch
     dispatch_key: str = "CPU"
