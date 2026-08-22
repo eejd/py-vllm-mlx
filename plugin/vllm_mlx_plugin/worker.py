@@ -84,7 +84,7 @@ class MLXWorker:
             logger.info(f"MLX default device: {default_device}")
 
             # Get device info
-            from vllm_mlx.plugin import get_mlx_device_info
+            from vllm_mlx_plugin.plugin import get_mlx_device_info
 
             info = get_mlx_device_info()
             logger.info(
@@ -92,7 +92,7 @@ class MLXWorker:
             )
 
             # Initialize model runner
-            from vllm_mlx.model_runner import MLXModelRunner
+            from vllm_mlx_plugin.model_runner import MLXModelRunner
 
             self.model_runner = MLXModelRunner(self.vllm_config)
 

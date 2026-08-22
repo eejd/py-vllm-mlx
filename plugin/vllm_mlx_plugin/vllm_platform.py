@@ -14,6 +14,7 @@ import sys
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.platforms.interface import Platform, PlatformEnum
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ def _is_apple_silicon() -> bool:
     return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
-class MLXPlatform:
+class MLXPlatform(Platform):
     """
     Platform implementation for Apple Silicon using MLX.
 
@@ -83,14 +84,12 @@ class MLXPlatform:
     - Support for quantized models (4-bit, 8-bit)
     """
 
-    # Platform identification
-    # Using OOT (Out-of-Tree) since MLX is not a built-in vLLM platform
-    # Import here to avoid circular imports at module level
-    @property
-    def _enum(self):
-        from vllm.platforms.interface import PlatformEnum
-
-        return PlatformEnum.OOT
+    # Platform identification: OOT (Out-of-Tree) since MLX is not a built-in
+    # vLLM platform. Subclassing ``Platform`` (rather than duck-typing it)
+    # inherits every default vLLM adds to the interface over time --
+    # ``fp8_dtype``, ``get_infinity_values``, ... -- so new interface
+    # members never break ``import vllm`` for this plugin.
+    _enum = PlatformEnum.OOT
 
     device_name: str = "mlx"
     device_type: str = "mlx"
@@ -227,7 +226,7 @@ class MLXPlatform:
     ) -> str:
         """Return MLX attention backend class path."""
         # Use our custom MLX attention backend
-        return "vllm_mlx.attention.MLXAttentionBackend"
+        return "vllm_mlx_plugin.attention.MLXAttentionBackend"
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -248,7 +247,7 @@ class MLXPlatform:
         if hasattr(vllm_config, "parallel_config"):
             parallel_config = vllm_config.parallel_config
             if parallel_config.worker_cls == "auto":
-                parallel_config.worker_cls = "vllm_mlx.worker.MLXWorker"
+                parallel_config.worker_cls = "vllm_mlx_plugin.worker.MLXWorker"
 
             # Disable features not supported on MLX
             if parallel_config.enable_dbo:

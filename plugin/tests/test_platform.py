@@ -9,7 +9,7 @@ import pytest
 
 def test_is_apple_silicon():
     """Test Apple Silicon detection."""
-    from vllm_mlx.plugin import is_mlx_available
+    from vllm_mlx_plugin.plugin import is_mlx_available
 
     if sys.platform == "darwin" and platform.machine() == "arm64":
         # Should be available on Apple Silicon Mac
@@ -27,7 +27,7 @@ def test_is_apple_silicon():
 
 def test_mlx_platform_properties():
     """Test MLXPlatform class properties."""
-    from vllm_mlx.vllm_platform import MLXPlatform
+    from vllm_mlx_plugin.vllm_platform import MLXPlatform
 
     platform_obj = MLXPlatform()
 
@@ -42,7 +42,7 @@ def test_mlx_platform_properties():
 
 def test_get_device_name():
     """Test getting device name."""
-    from vllm_mlx.vllm_platform import MLXPlatform
+    from vllm_mlx_plugin.vllm_platform import MLXPlatform
 
     name = MLXPlatform.get_device_name()
     assert isinstance(name, str)
@@ -51,7 +51,7 @@ def test_get_device_name():
 
 def test_get_device_memory():
     """Test getting device memory."""
-    from vllm_mlx.vllm_platform import MLXPlatform
+    from vllm_mlx_plugin.vllm_platform import MLXPlatform
 
     memory = MLXPlatform.get_device_total_memory()
     assert isinstance(memory, int)
@@ -61,7 +61,7 @@ def test_get_device_memory():
 def test_supported_dtypes():
     """Test supported dtypes."""
     import torch
-    from vllm_mlx.vllm_platform import MLXPlatform
+    from vllm_mlx_plugin.vllm_platform import MLXPlatform
 
     platform_obj = MLXPlatform()
     dtypes = platform_obj.supported_dtypes
@@ -72,7 +72,7 @@ def test_supported_dtypes():
 
 def test_plugin_entry_point():
     """Test plugin entry point returns correct class path."""
-    from vllm_mlx.plugin import mlx_platform_plugin
+    from vllm_mlx_plugin.plugin import mlx_platform_plugin
 
     if sys.platform != "darwin" or platform.machine() != "arm64":
         pytest.skip("Not on Apple Silicon")
@@ -83,12 +83,12 @@ def test_plugin_entry_point():
         pytest.skip("MLX not installed")
 
     result = mlx_platform_plugin()
-    assert result == "vllm_mlx.vllm_platform.MLXPlatform"
+    assert result == "vllm_mlx_plugin.vllm_platform.MLXPlatform"
 
 
 def test_device_info():
     """Test getting device info."""
-    from vllm_mlx.plugin import get_mlx_device_info
+    from vllm_mlx_plugin.plugin import get_mlx_device_info
 
     info = get_mlx_device_info()
 
