@@ -87,8 +87,11 @@ dev = [
     "mypy>=1.0.0",
     "pre-commit>=4.6.0",
 ]
+# vLLM integration lives in the separate vllm-mlx-plugin distribution
+# (./plugin), which owns the vllm.platform_plugins entry point. This extra is
+# kept so `pip install vllm-mlx[vllm]` keeps working.
 vllm = [
-    "vllm>=0.4.0",
+    "vllm-mlx-plugin>=0.4.0rc1",
 ]
 vision = [
     "torch>=2.8.0",
@@ -128,9 +131,6 @@ Documentation = "https://vllm-mlx.is-a.dev/"
 Repository = "https://github.com/waybarrios/vllm-mlx"
 Issues = "https://github.com/waybarrios/vllm-mlx/issues"
 "Release Notes" = "https://github.com/waybarrios/vllm-mlx/releases"
-
-[project.entry-points."vllm.platform_plugins"]
-mlx = "vllm_mlx.plugin:mlx_platform_plugin"
 
 [project.scripts]
 vllm-mlx = "vllm_mlx.cli:main"

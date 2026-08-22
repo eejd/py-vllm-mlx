@@ -69,33 +69,20 @@ def __getattr__(name):
 
         return getattr(model_registry, name)
 
-    # vLLM integration components (require torch)
-    if name == "MLXPlatform":
-        from vllm_mlx.vllm_platform import MLXPlatform
-
-        return MLXPlatform
-    if name == "MLXWorker":
-        from vllm_mlx.worker import MLXWorker
-
-        return MLXWorker
-    if name == "MLXModelRunner":
-        from vllm_mlx.model_runner import MLXModelRunner
-
-        return MLXModelRunner
-    if name == "MLXAttentionBackend":
-        from vllm_mlx.attention import MLXAttentionBackend
-
-        return MLXAttentionBackend
+    # vLLM integration components moved to the separate ``vllm-mlx-plugin``
+    # distribution (package ``vllm_mlx_plugin``), which owns the
+    # ``vllm.platform_plugins`` entry point. Keep a clear error here so old
+    # import sites say what to install instead of a bare AttributeError.
+    if name in ("MLXPlatform", "MLXWorker", "MLXModelRunner", "MLXAttentionBackend"):
+        raise ImportError(
+            f"vllm_mlx.{name} moved to the vllm_mlx_plugin package "
+            f"(pip install vllm-mlx-plugin); import it from there."
+        )
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
-    # Core (lazy loaded, require torch)
-    "MLXPlatform",
-    "MLXWorker",
-    "MLXModelRunner",
-    "MLXAttentionBackend",
     # Request management
     "Request",
     "RequestOutput",

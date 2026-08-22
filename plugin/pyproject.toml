@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-mlx-plugin"
+version = "0.4.0rc1"
+description = "vLLM platform plugin for Apple Silicon, backed by the vllm-mlx engine"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "vllm-mlx contributors"}
+]
+keywords = ["llm", "mlx", "apple-silicon", "vllm", "plugin", "inference"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "vllm-mlx>=0.4.0rc1",
+    "vllm>=0.10",
+    "torch>=2.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/vllm-mlx/vllm-mlx"
+Repository = "https://github.com/vllm-mlx/vllm-mlx"
+
+# The one and only place this repository registers a vLLM platform plugin.
+[project.entry-points."vllm.platform_plugins"]
+mlx = "vllm_mlx_plugin.plugin:mlx_platform_plugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_mlx_plugin*"]
