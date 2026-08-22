@@ -181,6 +181,22 @@ class MLXPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        """Seed the MLX global PRNG for this platform.
+
+        vLLM's ``set_random_seed`` calls this after seeding Python, NumPy and
+        torch; the base ``Platform`` raises NotImplementedError, which aborts
+        worker ``init_device``. MLX keeps its own generator that
+        ``torch.manual_seed`` does not reach.
+        """
+        try:
+            import mlx.core as mx
+
+            mx.random.seed(seed)
+        except Exception:  # pragma: no cover - MLX unavailable or too old
+            pass
+
+    @classmethod
     def set_device(cls, device: torch.device) -> None:
         """Set the device (no-op for MLX, uses default device)."""
         # MLX automatically uses the GPU
