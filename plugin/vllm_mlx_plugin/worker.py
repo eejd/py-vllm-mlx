@@ -223,6 +223,17 @@ class MLXWorker:
 
         return self.model_runner.execute_model(scheduler_output)
 
+    def reset_mm_cache(self) -> None:
+        """vLLM >= 0.27 worker hook; MLX keeps no vLLM-side multimodal cache."""
+
+    def sample_tokens(self, grammar_output=None):
+        """vLLM >= 0.27 calls this only if execute_model returned None.
+
+        execute_model here always returns its ModelRunnerOutput directly, so
+        this is a no-op that keeps the worker surface complete.
+        """
+        return None
+
     def get_model(self):
         """Get the underlying model."""
         if self.model_runner:
