@@ -68,14 +68,12 @@ class MLXModelRunner:
         self.tokenizer = None
         self._loaded = False
 
-        # Sampler for generation
-        self._sampler = None
-
         # Per-request generation state (vLLM >= 0.27 step contract):
         # each request owns an mlx-lm generate_step generator whose internal
         # KV cache persists between scheduler steps.
         self._gens: dict[str, Iterator] = {}
         self._tokens: dict[str, list[int]] = {}
+        self._params: dict[str, Any] = {}
         self._pending_output: ModelRunnerOutput | None = None
 
         # Cache for prompt processing
@@ -118,9 +116,6 @@ class MLXModelRunner:
             logger.info(f"Model loaded in {load_time:.2f}s")
 
             self._loaded = True
-
-            # Create default sampler
-            self._create_default_sampler()
 
             # Apply low-level optimizations
             if self._enable_optimizations:
@@ -176,18 +171,6 @@ class MLXModelRunner:
         except Exception as e:
             logger.warning(f"Failed to compile forward pass: {e}")
             self._compiled_forward = None
-
-    def _create_default_sampler(self) -> None:
-        """Create default sampler for generation."""
-        try:
-            from mlx_lm.sample_utils import make_sampler
-
-            self._sampler = make_sampler(
-                temp=0.7,
-                top_p=0.9,
-            )
-        except ImportError:
-            logger.warning("Could not create sampler, using defaults")
 
     def initialize_cache(self, num_blocks: int) -> None:
         """Initialize KV cache."""
@@ -264,23 +247,28 @@ class MLXModelRunner:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         for req_id in scheduler_output.finished_req_ids:
-            self._gens.pop(req_id, None)
-            self._tokens.pop(req_id, None)
+            self._release(req_id)
 
         req_ids: list[str] = []
         sampled_token_ids: list[list[int]] = []
 
         for req_data in scheduler_output.scheduled_new_reqs:
             req_id = req_data.req_id
-            gen = self._start_request(
+            self._params[req_id] = req_data.sampling_params
+            self._gens[req_id] = self._start_request(
                 req_data.prompt_token_ids or [], req_data.sampling_params
             )
-            self._gens[req_id] = gen
             self._tokens[req_id] = []
             req_ids.append(req_id)
             sampled_token_ids.append(self._step_request(req_id))
 
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id in cached.req_ids:
+            if req_id in cached.resumed_req_ids:
+                # Preempted and re-prefilled by the scheduler: the old
+                # generator's KV state is stale, rebuild from the full token
+                # history the scheduler sends for resumed requests.
+                self._resume_request(req_id, cached.all_token_ids.get(req_id))
             req_ids.append(req_id)
             sampled_token_ids.append(self._step_request(req_id))
 
@@ -300,6 +288,24 @@ class MLXModelRunner:
         self._pending_output = None
         return output
 
+    def _release(self, req_id: str) -> None:
+        self._gens.pop(req_id, None)
+        self._tokens.pop(req_id, None)
+        self._params.pop(req_id, None)
+
+    def _resume_request(self, req_id: str, all_token_ids: list[int] | None) -> None:
+        """Rebuild a preempted request's generator from its full token history."""
+        if not all_token_ids:
+            logger.error(f"Resumed request {req_id} without token history")
+            self._gens.pop(req_id, None)
+            return
+        params = self._params.get(req_id)
+        self._gens[req_id] = self._start_request(list(all_token_ids), params)
+        self._tokens.setdefault(req_id, [])
+
+    def _eos_token_id(self) -> int | None:
+        return getattr(self.tokenizer, "eos_token_id", None)
+
     def _start_request(
         self, prompt_token_ids: list[int], sampling_params: Any
     ) -> Iterator:
@@ -308,14 +314,14 @@ class MLXModelRunner:
         from mlx_lm.sample_utils import make_sampler
 
         temp = float(getattr(sampling_params, "temperature", 1.0) or 0.0)
-        top_p = float(getattr(sampling_params, "top_p", 1.0) or 1.0)
+        top_p_raw = getattr(sampling_params, "top_p", None)
+        # vLLM: 1.0 = disabled; mlx-lm: 0.0 = disabled.
+        top_p = 0.0 if top_p_raw is None or top_p_raw >= 1.0 else float(top_p_raw)
         min_p = float(getattr(sampling_params, "min_p", 0.0) or 0.0)
         top_k = int(getattr(sampling_params, "top_k", 0) or 0)
         if top_k < 0:  # vLLM uses -1 / 0 for "disabled"
             top_k = 0
-        sampler = make_sampler(
-            temp=temp, top_p=top_p if top_p < 1.0 else 0.0, min_p=min_p, top_k=top_k
-        )
+        sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
         # vLLM's scheduler enforces max_tokens / stop conditions; keep the
         # generator open for the whole context window.
         return generate_step(
@@ -326,23 +332,32 @@ class MLXModelRunner:
         )
 
     def _step_request(self, req_id: str) -> list[int]:
-        """Advance one request by one token; ``[]`` if it has no generator."""
+        """Advance one request by one token.
+
+        A request that can no longer generate (missing/exhausted generator or
+        an mlx-lm error) is terminated by emitting EOS: the scheduler only
+        stops a request on a sampled stop token -- an empty list leaves it
+        running forever (vllm/v1/core/sched/scheduler.py update_from_output).
+        """
         gen = self._gens.get(req_id)
         if gen is None:
-            logger.warning(f"No generator for request {req_id}")
-            return []
+            logger.error(f"No generator for request {req_id}; terminating it")
+            return self._terminate(req_id)
         try:
             token, _logprobs = next(gen)
         except StopIteration:
-            self._gens.pop(req_id, None)
-            return []
+            return self._terminate(req_id)
         except Exception as e:
             logger.error(f"Generation failed for {req_id}: {e}")
-            self._gens.pop(req_id, None)
-            return []
+            return self._terminate(req_id)
         tok = int(token.item()) if hasattr(token, "item") else int(token)
         self._tokens[req_id].append(tok)
         return [tok]
+
+    def _terminate(self, req_id: str) -> list[int]:
+        self._gens.pop(req_id, None)
+        eos = self._eos_token_id()
+        return [int(eos)] if eos is not None else []
 
     def decode_tokens(self, token_ids: list[int]) -> str:
         """Decode token IDs to text."""
