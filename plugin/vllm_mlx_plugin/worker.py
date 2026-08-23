@@ -162,10 +162,36 @@ class MLXWorker:
         logger.info(f"Initialized cache: {num_gpu_blocks} GPU blocks")
 
     def get_kv_cache_spec(self) -> dict:
-        """Get KV cache specification."""
-        if self.model_runner:
-            return self.model_runner.get_kv_cache_spec()
-        return {}
+        """Return the KV cache spec in vLLM's own types.
+
+        vLLM >= 0.27 requires ``dict[layer_name, KVCacheSpec]`` (a plain
+        ``{"num_blocks": ...}`` dict is rejected by the KV-cache planner).
+        MLX manages the real cache; a uniform FullAttentionSpec per layer lets
+        vLLM's scheduler track capacity and block allocation.
+        """
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        config = getattr(getattr(self.model_runner, "model", None), "config", None)
+        num_layers = getattr(config, "num_hidden_layers", 32)
+        head_size = getattr(config, "head_dim", 64)
+        num_kv_heads = getattr(
+            config, "num_key_value_heads", getattr(config, "num_attention_heads", 1)
+        )
+        block_size = self.cache_config.block_size
+        return {
+            f"layers.{i}.self_attn": FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=torch.float16,
+            )
+            for i in range(num_layers)
+        }
+
+    def initialize_from_config(self, kv_cache_config) -> None:
+        """vLLM >= 0.27 entry point: size the cache from the planner's result."""
+        num_blocks = getattr(kv_cache_config, "num_blocks", 0)
+        self.initialize_cache(num_blocks, 0)
 
     def compile_or_warm_up_model(self):
         """Warm up model for inference.
