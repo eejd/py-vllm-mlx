@@ -339,11 +339,6 @@ class MLXPlatform(Platform):
         return False
 
     @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        """Return the communicator class for distributed."""
-        return "vllm_mlx.distributed.MLXCommunicator"
-
-    @classmethod
     def get_punica_wrapper(cls) -> str:
         """Return LoRA wrapper (not yet implemented for MLX)."""
         raise NotImplementedError("LoRA not yet supported on MLX backend")
