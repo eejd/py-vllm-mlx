@@ -234,6 +234,25 @@ class MLXWorker:
         """
         return None
 
+    # -- vLLM >= 0.27 worker RPC surface (collective_rpc targets) ----------
+    def get_supported_tasks(self) -> tuple:
+        return ("generate",)
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.model_config.max_model_len = max_model_len
+
+    def reset_encoder_cache(self) -> None:
+        """MLX keeps no vLLM-side encoder cache."""
+
+    def reset_prefix_cache(self) -> None:
+        """Prefix caching is managed inside the MLX engine."""
+
+    def execute_dummy_batch(self) -> None:
+        """No-op: nothing to keep in lockstep on a single-device backend."""
+
+    def take_draft_token_ids(self):
+        return None
+
     def get_model(self):
         """Get the underlying model."""
         if self.model_runner:
