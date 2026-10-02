@@ -32,7 +32,9 @@ def test_mlx_platform_properties():
     platform_obj = MLXPlatform()
 
     assert platform_obj.device_name == "mlx"
-    assert platform_obj.device_type == "mlx"
+    # vLLM passes this through torch.device(), so the platform shim must expose
+    # a torch-recognized device type even though execution is backed by MLX.
+    assert platform_obj.device_type == "cpu"
     assert platform_obj.dispatch_key == "CPU"
     assert platform_obj.dist_backend == "gloo"
     assert platform_obj.is_mlx()
