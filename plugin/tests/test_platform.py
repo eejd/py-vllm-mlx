@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLX Platform."""
 
+import importlib.util
 import platform
 import sys
 
@@ -25,6 +26,16 @@ def test_is_apple_silicon():
         assert not is_mlx_available()
 
 
+# MLXPlatform subclasses vLLM's Platform and builds on torch, neither of which
+# the engine's own CI installs. Skip (rather than error) where they are absent.
+needs_vllm_and_torch = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None
+    or importlib.util.find_spec("vllm") is None,
+    reason="vllm and torch are not installed",
+)
+
+
+@needs_vllm_and_torch
 def test_mlx_platform_properties():
     """Test MLXPlatform class properties."""
     from vllm_mlx_plugin.vllm_platform import MLXPlatform
@@ -42,6 +53,7 @@ def test_mlx_platform_properties():
     assert not platform_obj.is_rocm()
 
 
+@needs_vllm_and_torch
 def test_get_device_name():
     """Test getting device name."""
     from vllm_mlx_plugin.vllm_platform import MLXPlatform
@@ -51,6 +63,7 @@ def test_get_device_name():
     assert len(name) > 0
 
 
+@needs_vllm_and_torch
 def test_get_device_memory():
     """Test getting device memory."""
     from vllm_mlx_plugin.vllm_platform import MLXPlatform
@@ -60,6 +73,7 @@ def test_get_device_memory():
     assert memory > 0
 
 
+@needs_vllm_and_torch
 def test_supported_dtypes():
     """Test supported dtypes."""
     import torch

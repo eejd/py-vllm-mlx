@@ -11,6 +11,33 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+
+def _restore_module(name):
+    """Undo a fixture's re-import so later tests see the real module.
+
+    These fixtures import ``vllm_mlx.engine_core`` / ``vllm_mlx.engine.batched``
+    against stand-ins for mlx and the model registry. ``monkeypatch`` puts the
+    stand-in ``sys.modules`` entries back but not the module that was *imported*
+    through them, which would otherwise stay bound to ``get_registry = lambda:
+    None`` for every later test (EngineCore then fails at ``registry.acquire``).
+    """
+    original = sys.modules.get(name)
+
+    def restore():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+        parent_name, _, attr = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            if original is None:
+                parent.__dict__.pop(attr, None)
+            else:
+                setattr(parent, attr, original)
+
+    return restore
+
 @pytest.fixture
 def engine_core_module(monkeypatch):
     """Import engine_core with lightweight substitutes for MLX-only modules."""
@@ -37,9 +64,13 @@ def engine_core_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_mlx.scheduler", fake_scheduler)
     monkeypatch.setitem(sys.modules, "vllm_mlx.model_registry", fake_registry)
     monkeypatch.setitem(sys.modules, "vllm_mlx.mlx_streams", fake_streams)
+    # Capture before the delitem below, which would make it look never-imported.
+    restore = _restore_module("vllm_mlx.engine_core")
     monkeypatch.delitem(sys.modules, "vllm_mlx.engine_core", raising=False)
-
-    return importlib.import_module("vllm_mlx.engine_core")
+    try:
+        yield importlib.import_module("vllm_mlx.engine_core")
+    finally:
+        restore()
 
 
 @pytest.fixture
@@ -52,10 +83,13 @@ def batched_module(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
+    restore = _restore_module("vllm_mlx.engine.batched")
     monkeypatch.delitem(sys.modules, "vllm_mlx.engine.batched", raising=False)
-
-    module = importlib.import_module("vllm_mlx.engine.batched")
-    return module, fake_mx
+    try:
+        module = importlib.import_module("vllm_mlx.engine.batched")
+        yield module, fake_mx
+    finally:
+        restore()
 
 
 @pytest.mark.anyio
