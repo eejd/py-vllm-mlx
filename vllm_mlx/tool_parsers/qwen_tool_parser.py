@@ -330,22 +330,28 @@ class QwenToolParser(ToolParser):
         # like ")]" or "</tool_call>" often span token boundaries and may
         # never appear within a single delta chunk.
         if "</tool_call>" in current_text or ")]" in current_text:
-            # Tool call complete, parse the whole thing
+            # Emit only calls that completed in this delta. Re-parsing the whole
+            # text on every later delta (trailing tokens, or the next call still
+            # streaming) would send earlier calls again with fresh ids, and a
+            # client concatenating deltas per index would see them duplicated.
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
-                }
+                already_sent = len(self.extract_tool_calls(previous_text).tool_calls)
+                new_calls = result.tool_calls[already_sent:]
+                if new_calls:
+                    return {
+                        "tool_calls": [
+                            {
+                                "index": already_sent + i,
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": tc["arguments"],
+                                },
+                            }
+                            for i, tc in enumerate(new_calls)
+                        ]
+                    }
 
         return None
