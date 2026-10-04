@@ -24,6 +24,7 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+from .mlx_cache_compat import restore_from_state, snapshot_state
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
@@ -1987,17 +1988,17 @@ class Scheduler:
         extracted = []
         for layer_cache in raw_cache:
             try:
-                if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
-                    state = layer_cache.state  # (keys, values) or more for Mamba
-                    meta = layer_cache.meta_state  # (offset,) as strings
-                    extracted.append(
-                        {
-                            "state": state,
-                            "meta_state": meta,
-                            "class_name": type(layer_cache).__name__,
-                            "class_ref": type(layer_cache),
-                        }
-                    )
+                # Contract-neutral: mlx-lm 0.32 has no ``meta_state`` and a
+                # padded ``.state``; see mlx_cache_compat.
+                state, meta = snapshot_state(layer_cache)
+                extracted.append(
+                    {
+                        "state": state,  # (keys, values) or more for recurrent
+                        "meta_state": meta,  # (offset,) as strings, or None
+                        "class_name": type(layer_cache).__name__,
+                        "class_ref": type(layer_cache),
+                    }
+                )
             except Exception as e:
                 logger.debug(f"Failed to extract state from cache layer: {e}")
                 continue
@@ -2033,23 +2034,10 @@ class Scheduler:
                     return None
 
                 if cache_cls is not None and hasattr(cache_cls, "from_state"):
-                    # BatchKVCache doesn't inherit from KVCache, so
-                    # _merge_caches can't handle it. Convert to KVCache
-                    # (safe because mid-prefill save is always batch_size=1).
-                    from mlx_lm.models.cache import (
-                        BatchKVCache as _BatchKVCache,
-                        KVCache as _KVCache,
-                    )
-
-                    if cache_cls is _BatchKVCache:
-                        # BatchKVCache.state = (keys, values, offset, left_padding)
-                        keys, values = state[0], state[1]
-                        cache = _KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                    else:
-                        cache = cache_cls.from_state(state, meta_state)
+                    # restore_from_state also turns a BatchKVCache snapshot
+                    # (always batch_size=1 here) into a plain KVCache, which
+                    # _merge_caches can handle.
+                    cache = restore_from_state(cache_cls, state, meta_state)
                 else:
                     # Fallback: try KVCache manual reconstruction
                     from mlx_lm.models.cache import KVCache

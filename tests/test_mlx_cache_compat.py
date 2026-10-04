@@ -193,3 +193,50 @@ class TestCopyState:
 def test_prompt_cache_format_matches_installed_mlx_lm():
     expected = "meta" if compat.uses_meta_state(lm_cache._BaseCache) else "state-v2"
     assert compat.prompt_cache_format() == expected
+
+
+class TestPagedPrefixCacheRoundTrip:
+    """The paged prefix cache stored nothing for mlx-lm 0.32 layers: extraction
+    required ``meta_state``, which 0.32 caches no longer have, so every request
+    silently missed."""
+
+    def _scheduler_extract(self, layers):
+        from vllm_mlx.scheduler import Scheduler
+
+        return Scheduler._extract_cache_states(Scheduler.__new__(Scheduler), layers)
+
+    def test_extraction_is_not_empty_and_cuts_the_padded_buffer(self):
+        kv = _kv(lm_cache.KVCache)
+        extracted = self._scheduler_extract([kv])
+        assert len(extracted) == 1
+        state = extracted[0]["state"]
+        assert state[0].shape[2] == TOKENS  # not the 256-slot buffer
+
+    def test_store_and_reconstruct_hybrid_model(self):
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+        from vllm_mlx.scheduler import Scheduler
+
+        tokens = list(range(8))
+        kv = _kv(lm_cache.KVCache, tokens=8)
+        rec = lm_cache.ArraysCache(2)
+        rec[0] = mx.arange(6, dtype=mx.float32).reshape(1, 6)
+        rec[1] = mx.arange(4, dtype=mx.float32).reshape(1, 4)
+
+        extracted = self._scheduler_extract([kv, rec])
+        assert len(extracted) == 2
+
+        manager = PagedCacheManager(block_size=4, max_blocks=10)
+        prefix = BlockAwarePrefixCache(model=None, paged_cache_manager=manager)
+        table = prefix.store_cache("r1", tokens, extracted)
+        rebuilt = prefix.reconstruct_cache(table)
+
+        assert rebuilt is not None
+        assert rebuilt[0].offset == 8
+        assert mx.array_equal(rebuilt[0].keys_and_values()[0], kv.keys_and_values()[0])
+        assert mx.array_equal(rebuilt[1].cache[0], rec.cache[0])
+        assert mx.array_equal(rebuilt[1].cache[1], rec.cache[1])
+
+        scheduler = Scheduler.__new__(Scheduler)
+        again = scheduler._reconstruct_cache_from_states(extracted)
+        assert again is not None and again[0].offset == 8

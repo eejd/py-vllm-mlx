@@ -785,8 +785,8 @@ class TestBlockAwarePrefixCache:
         assert isinstance(reconstructed[1], ArraysCache)
         assert reconstructed[0].state[0].tolist() == kv_keys.tolist()
         assert reconstructed[0].state[1].tolist() == kv_values.tolist()
-        assert reconstructed[1].state[0].tolist() == linear_state[0].tolist()
-        assert reconstructed[1].state[1].tolist() == linear_state[1].tolist()
+        assert reconstructed[1].cache[0].tolist() == linear_state[0].tolist()
+        assert reconstructed[1].cache[1].tolist() == linear_state[1].tolist()
 
     def test_rejects_hybrid_prefix_without_boundary_snapshot(self):
         from mlx_lm.models.cache import ArraysCache, KVCache
@@ -916,9 +916,9 @@ class TestBlockAwarePrefixCache:
         # Reconstruct A: should use A's recurrent state (ones), not B's (twos)
         recon_a = cache.reconstruct_cache(bt_a)
         assert recon_a is not None
-        assert recon_a[1].state[0].tolist() == recurrent_a[0].tolist()
+        assert recon_a[1].cache[0].tolist() == recurrent_a[0].tolist()
 
         # Reconstruct B: should use B's recurrent state (twos)
         recon_b = cache.reconstruct_cache(bt_b)
         assert recon_b is not None
-        assert recon_b[1].state[0].tolist() == recurrent_b[0].tolist()
+        assert recon_b[1].cache[0].tolist() == recurrent_b[0].tolist()

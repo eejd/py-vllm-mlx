@@ -32,6 +32,11 @@ from typing import Any
 # ``state`` / ``from_state`` untouched.
 _PLAIN_KV_NAMES = frozenset({"KVCache", "ConcatenateKVCache", "BatchKVCache"})
 
+# Recurrent layers: canonical state is the bare list of arrays (what
+# ``ArraysCache.state`` returned up to mlx-lm 0.31). In 0.32 ``.state`` is
+# ``(cache, left_padding, lengths)`` and ``from_state`` wants that tuple back.
+_RECURRENT_NAMES = frozenset({"ArraysCache", "MambaCache"})
+
 
 @functools.lru_cache(maxsize=None)
 def uses_meta_state(cls: type) -> bool:
@@ -99,7 +104,11 @@ def snapshot_state(layer: Any) -> tuple[Any, Any]:
     cls = type(layer)
     view = kv_view(layer)
     if view is not None:
-        return (view[0], view[1]), (str(view[0].shape[2]),)
+        return (view[0], view[1]), (str(view[0].shape[-2]),)
+    if cls.__name__ in _RECURRENT_NAMES:
+        arrays = recurrent_arrays(layer)
+        if arrays is not None:
+            return list(arrays), ""
     meta = layer.meta_state if uses_meta_state(cls) else None
     return layer.state, meta
 
@@ -112,7 +121,11 @@ def restore_from_state(cls: type, state: Any, meta_state: Any = None) -> Any:
     if cls.__name__ in _PLAIN_KV_NAMES and _is_kv_pair(state):
         obj = _new_plain_kv(cls)
         obj.keys, obj.values = state[0], state[1]
-        obj.offset = state[0].shape[2]
+        obj.offset = state[0].shape[-2]
+        return obj
+    if cls.__name__ in _RECURRENT_NAMES and isinstance(state, list):
+        obj = cls(len(state))
+        set_recurrent_arrays(obj, state)
         return obj
     arity = _from_state_arity(cls)
     if arity >= 2:
@@ -126,7 +139,9 @@ def _is_kv_pair(state: Any) -> bool:
     return (
         isinstance(state, (list, tuple))
         and len(state) == 2
-        and all(hasattr(t, "shape") and len(t.shape) == 4 for t in state)
+        # (B, heads, seq, dim) -- or (heads, seq, dim) for Qwen3.5-style caches;
+        # the sequence axis is second to last either way.
+        and all(hasattr(t, "shape") and len(t.shape) in (3, 4) for t in state)
     )
 
 

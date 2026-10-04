@@ -24,6 +24,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from .mlx_cache_compat import restore_from_state
 from .paged_cache import BlockTable, PagedCacheManager
 
 logger = logging.getLogger(__name__)
@@ -922,19 +923,7 @@ class BlockAwarePrefixCache:
                 meta_state = layer_meta.get("meta_state")
 
                 if cache_cls is not None and hasattr(cache_cls, "from_state"):
-                    from mlx_lm.models.cache import (
-                        BatchKVCache as _BatchKVCache,
-                        KVCache as _KVCache,
-                    )
-
-                    if cache_cls is _BatchKVCache:
-                        keys, values = state[0], state[1]
-                        cache = _KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[self._cache_state_seq_axis(state)]
-                    else:
-                        cache = cache_cls.from_state(state, meta_state)
+                    cache = restore_from_state(cache_cls, state, meta_state)
                 else:
                     from mlx_lm.models.cache import KVCache
 
