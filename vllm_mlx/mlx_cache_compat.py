@@ -233,27 +233,33 @@ def clone_layer(layer: Any, max_tokens: int | None = None) -> Any:
     return restore_from_state(type(layer), state, meta)
 
 
-def snapshot_for_rollback(layer: Any) -> tuple[str, list[Any]]:
+def snapshot_for_rollback(layer: Any) -> tuple[str, list[Any], Any]:
     """Capture a layer that cannot be trimmed so it can be restored later.
 
     Speculative verification advances every layer by two tokens; layers that
     cannot ``trim`` (recurrent state, rotating windows) are put back from this
     snapshot instead. Recurrent layers are captured through their array list,
     because ``ArraysCache.state`` in mlx-lm 0.32 is ``(cache, left_padding,
-    lengths)`` and its first element is a list, not an array.
+    lengths)`` and its first element is a list, not an array. Under the legacy
+    contract a rotating layer's cursor lives in ``meta_state``, not ``state``,
+    so that is captured too; without it a restore would leave the offset where
+    the verify pass advanced it.
     """
     import mlx.core as mx
 
     arrays = recurrent_arrays(layer)
     if arrays is not None:
-        return "arrays", [mx.array(a) if a is not None else None for a in arrays]
-    return "state", [mx.array(s) if s is not None else None for s in layer.state]
+        return "arrays", [mx.array(a) if a is not None else None for a in arrays], None
+    meta = layer.meta_state if uses_meta_state(type(layer)) else None
+    return "state", [mx.array(s) if s is not None else None for s in layer.state], meta
 
 
-def restore_from_rollback(layer: Any, snapshot: tuple[str, list[Any]]) -> None:
+def restore_from_rollback(layer: Any, snapshot: tuple[str, list[Any], Any]) -> None:
     """Put back what :func:`snapshot_for_rollback` captured."""
-    kind, data = snapshot
+    kind, data, meta = snapshot
     if kind == "arrays":
         set_recurrent_arrays(layer, data)
-    else:
-        layer.state = data
+        return
+    layer.state = data
+    if meta is not None:
+        layer.meta_state = meta

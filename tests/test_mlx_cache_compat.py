@@ -14,6 +14,11 @@ except ImportError:  # pragma: no cover
 
 TOKENS = 5
 
+# mlx-lm 0.32 dropped meta_state and exposes padded ``.state`` buffers; both
+# contracts are supported, so tests of 0.32-only behaviour are skipped on 0.31.
+LM_IS_032 = not compat.uses_meta_state(lm_cache._BaseCache)
+only_lm_032 = pytest.mark.skipif(not LM_IS_032, reason="mlx-lm 0.32 contract only")
+
 
 def _kv(cls, tokens=TOKENS):
     c = cls()
@@ -55,9 +60,12 @@ class _LegacyMetaKV:
 
 
 class TestContractDetection:
-    def test_lm_032_has_no_meta_state(self):
-        assert not compat.uses_meta_state(lm_cache.KVCache)
-        assert compat._from_state_arity(lm_cache.KVCache) == 1
+    def test_installed_mlx_lm_contract_is_detected_from_the_class(self):
+        assert compat.uses_meta_state(lm_cache.KVCache) == hasattr(
+            lm_cache.KVCache, "meta_state"
+        )
+        arity = 1 if LM_IS_032 else 2
+        assert compat._from_state_arity(lm_cache.KVCache) == arity
 
     def test_legacy_fake_has_meta_state(self):
         assert compat.uses_meta_state(_LegacyMetaKV)
@@ -70,11 +78,15 @@ class TestContractDetection:
 
 
 class TestKVView:
+    def test_the_valid_tokens_are_returned(self):
+        k, v = compat.kv_view(_kv(lm_cache.KVCache))
+        assert k.shape[2] == v.shape[2] == TOKENS
+
+    @only_lm_032
     def test_padded_buffer_is_cut_to_the_valid_tokens(self):
         c = _kv(lm_cache.KVCache)
         assert c.state[0].shape[2] > TOKENS  # the 0.32 buffer is padded
-        k, v = compat.kv_view(c)
-        assert k.shape[2] == v.shape[2] == TOKENS
+        assert compat.kv_view(c)[0].shape[2] == TOKENS
 
     def test_batch_kv_of_one(self):
         b = lm_cache.BatchKVCache([0])
@@ -105,8 +117,8 @@ class TestSnapshotRestore:
         assert meta == (str(TOKENS),)
         out = compat.restore_from_state(lm_cache.KVCache, state, meta)
         assert out.offset == TOKENS
-        assert mx.array_equal(out.keys_and_values()[0], src.keys_and_values()[0])
-        assert mx.array_equal(out.keys_and_values()[1], src.keys_and_values()[1])
+        assert mx.array_equal(compat.kv_view(out)[0], compat.kv_view(src)[0])
+        assert mx.array_equal(compat.kv_view(out)[1], compat.kv_view(src)[1])
 
     def test_batch_kv_restores_as_plain_kv(self):
         b = lm_cache.BatchKVCache([0])
@@ -150,12 +162,15 @@ class TestSnapshotRestore:
 
 
 class TestRecurrentArrays:
-    def test_cache_list_is_the_array_list_not_the_state_tuple(self):
+    def test_cache_list_is_the_array_list(self):
         a = lm_cache.ArraysCache(2)
         a[0] = mx.ones((1, 3))
-        arrays = compat.recurrent_arrays(a)
-        assert arrays is a.cache
-        assert len(a.state) == 3  # (cache, left_padding, lengths) on 0.32
+        assert compat.recurrent_arrays(a) is a.cache
+
+    @only_lm_032
+    def test_state_is_not_the_array_list_on_032(self):
+        a = lm_cache.ArraysCache(2)
+        assert len(a.state) == 3  # (cache, left_padding, lengths)
 
     def test_kv_layer_has_none(self):
         assert compat.recurrent_arrays(_kv(lm_cache.KVCache)) is None
@@ -233,7 +248,7 @@ class TestPagedPrefixCacheRoundTrip:
 
         assert rebuilt is not None
         assert rebuilt[0].offset == 8
-        assert mx.array_equal(rebuilt[0].keys_and_values()[0], kv.keys_and_values()[0])
+        assert mx.array_equal(compat.kv_view(rebuilt[0])[0], compat.kv_view(kv)[0])
         assert mx.array_equal(rebuilt[1].cache[0], rec.cache[0])
         assert mx.array_equal(rebuilt[1].cache[1], rec.cache[1])
 
@@ -248,7 +263,7 @@ class TestCloneLayer:
         clone = compat.clone_layer(src)
         assert clone.keys.shape[2] == TOKENS  # not the 256-slot buffer
         assert clone.offset == TOKENS
-        assert mx.array_equal(clone.keys, src.keys_and_values()[0])
+        assert mx.array_equal(clone.keys, compat.kv_view(src)[0])
 
     def test_clone_trims_to_the_prompt(self):
         clone = compat.clone_layer(_kv(lm_cache.KVCache), max_tokens=3)
