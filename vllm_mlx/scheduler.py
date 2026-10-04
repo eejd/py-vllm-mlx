@@ -1545,6 +1545,12 @@ class Scheduler:
             # make_prompt_cache(model, max_kv_size=...) cannot do that — it
             # ignores max_kv_size entirely for models that define make_cache.
             max_kv_size=self._bounded_kv_size(),
+            # Name the stream explicitly. Left unset, BatchGenerator reads the
+            # process-global ``mlx_lm.generate.generation_stream``, which any
+            # other engine's worker may have rebound to a stream that only that
+            # thread can enter. This runs on the step thread, whose default
+            # stream is the one bind_generation_streams gave it.
+            stream=mx.default_stream(mx.default_device()),
         )
         # Set callback as attribute — used by _install_chunked_prefill
         # monkey-patch. Not a BatchGenerator constructor parameter.
