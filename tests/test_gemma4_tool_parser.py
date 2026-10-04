@@ -67,6 +67,23 @@ class TestGemma4ToolParserExtract:
         assert args0 == {"pattern": "README*.md"}
         assert args1 == {"pattern": "CONTRIBUTING.md"}
 
+    def test_multiple_tool_calls_in_separate_blocks(self):
+        """Gemma 4's chat template renders parallel calls as separate blocks."""
+        output = (
+            "<|tool_call>"
+            'call:glob{pattern:<|"|>README*.md<|"|>}'
+            "<tool_call|>"
+            "<|tool_call>"
+            'call:glob{pattern:<|"|>CONTRIBUTING.md<|"|>}'
+            "<tool_call|>"
+        )
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert [json.loads(tc["arguments"]) for tc in result.tool_calls] == [
+            {"pattern": "README*.md"},
+            {"pattern": "CONTRIBUTING.md"},
+        ]
+
     def test_content_before_tool_call(self):
         output = 'Let me read that file for you.\n<|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}<tool_call|>'
         result = self.parser.extract_tool_calls(output)
