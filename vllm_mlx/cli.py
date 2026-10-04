@@ -738,9 +738,10 @@ def bench_detok_command(args):
     # Benchmark streaming decode (new method)
     print("Benchmarking Streaming Detokenizer (NEW method)...")
     streaming_times = []
-    detok_class = tokenizer._detokenizer_class
+    # ``detokenizer`` is public on every mlx-lm that has it: a fresh instance in
+    # 0.31, a copy of a prototype in 0.32 (``_detokenizer_class`` is gone).
     for _ in range(iterations):
-        detok = detok_class(tokenizer)
+        detok = tokenizer.detokenizer
         detok.reset()
         start = time.perf_counter()
         for t in generated_tokens:
@@ -773,7 +774,7 @@ def bench_detok_command(args):
 
     # Verify correctness (strip for BPE edge cases with leading/trailing spaces)
     print("Verifying correctness...")
-    detok = detok_class(tokenizer)
+    detok = tokenizer.detokenizer
     detok.reset()
     for t in generated_tokens:
         detok.add_token(t)
