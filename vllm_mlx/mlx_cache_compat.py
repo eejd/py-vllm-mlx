@@ -31,6 +31,12 @@ from typing import Any
 # be rebuilt from a plain ``(keys, values)`` pair. Anything else (rotating,
 # quantized, chunked, recurrent, nested) round-trips through its own
 # ``state`` / ``from_state`` untouched.
+#
+# Matched by class *name*, not identity, because mlx-lm and mlx-vlm each ship
+# their own ``KVCache`` and both must take this path. The assumption is that no
+# other cache class in the process is called ``KVCache``/``BatchKVCache``/
+# ``ConcatenateKVCache`` while having different field semantics; a model that
+# defines such a class locally would be mis-routed.
 _PLAIN_KV_NAMES = frozenset({"KVCache", "ConcatenateKVCache", "BatchKVCache"})
 
 # Recurrent layers: canonical state is the bare list of arrays (what
@@ -233,30 +239,60 @@ def clone_layer(layer: Any, max_tokens: int | None = None) -> Any:
     return restore_from_state(type(layer), state, meta)
 
 
-def snapshot_for_rollback(layer: Any) -> tuple[str, list[Any], Any]:
-    """Capture a layer that cannot be trimmed so it can be restored later.
+def _copy_tree(value: Any) -> Any:
+    """Copy every array in a nested state structure; keep everything else as is.
 
-    Speculative verification advances every layer by two tokens; layers that
-    cannot ``trim`` (recurrent state, rotating windows) are put back from this
-    snapshot instead. Recurrent layers are captured through their array list,
-    because ``ArraysCache.state`` in mlx-lm 0.32 is ``(cache, left_padding,
-    lengths)`` and its first element is a list, not an array. Under the legacy
-    contract a rotating layer's cursor lives in ``meta_state``, not ``state``,
-    so that is captured too; without it a restore would leave the offset where
-    the verify pass advanced it.
+    mlx-lm 0.32 states mix arrays with plain Python values: a rotating layer's
+    ``state`` is ``(keys, values, offset, keep, max_size, _idx)`` with integer
+    cursors, a quantized layer nests tuples of arrays. Wrapping every element
+    in ``mx.array`` turns those integers into 0-d arrays, after which the layer
+    cannot slice (``Slice indices must be integers``).
     """
     import mlx.core as mx
 
+    if value is None:
+        return None
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, tuple):
+        return tuple(_copy_tree(v) for v in value)
+    if isinstance(value, list):
+        return [_copy_tree(v) for v in value]
+    return value
+
+
+def snapshot_for_rollback(layer: Any) -> tuple[str, Any, Any]:
+    """Capture a layer that cannot be trimmed so it can be restored later.
+
+    Speculative verification advances every layer by two tokens; layers that
+    cannot ``trim`` (recurrent state, rotating windows, containers of those)
+    are put back from this snapshot instead.
+
+    * Recurrent layers are captured through their array list, because
+      ``ArraysCache.state`` in mlx-lm 0.32 is ``(cache, left_padding, lengths)``.
+    * Containers (``CacheList``) are captured child by child: their ``state``
+      is ``[(child_state, class_name), ...]``, which is not array-shaped.
+    * Anything else is captured through ``state`` with arrays copied and plain
+      values (the rotating cursors) preserved. Under the legacy contract a
+      rotating layer's cursor lives in ``meta_state``, so that is captured too.
+    """
+    children = getattr(layer, "caches", None)
+    if children is not None:
+        return "children", [snapshot_for_rollback(c) for c in children], None
     arrays = recurrent_arrays(layer)
     if arrays is not None:
-        return "arrays", [mx.array(a) if a is not None else None for a in arrays], None
+        return "arrays", _copy_tree(list(arrays)), None
     meta = layer.meta_state if uses_meta_state(type(layer)) else None
-    return "state", [mx.array(s) if s is not None else None for s in layer.state], meta
+    return "state", _copy_tree(layer.state), meta
 
 
-def restore_from_rollback(layer: Any, snapshot: tuple[str, list[Any], Any]) -> None:
+def restore_from_rollback(layer: Any, snapshot: tuple[str, Any, Any]) -> None:
     """Put back what :func:`snapshot_for_rollback` captured."""
     kind, data, meta = snapshot
+    if kind == "children":
+        for child, child_snapshot in zip(layer.caches, data):
+            restore_from_rollback(child, child_snapshot)
+        return
     if kind == "arrays":
         set_recurrent_arrays(layer, data)
         return

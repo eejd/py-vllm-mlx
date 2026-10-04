@@ -35,14 +35,16 @@ Base: upstream `80e7fde` (2026-10-03, 57 commits past v0.5.0).
 | `--mllm` + continuous-batching guard (old main 547a4fa) | Upstream #601 closed unmerged: guard is incomplete because BatchedEngine auto-detects MLLM. Not carried |
 | MLLM tool metadata (36625e5), replayed tool-call arg normalization (77a7ad2) from old main | Not carried; verified covered by upstream #608/#611 code. The 14 regression tests from 77a7ad2 pass unchanged on this line, and the real Gemma 4 chat template renders identically with and without the `name` field 36625e5 also forwarded (the template never reads it). **Residual gap, not carried:** 36625e5 also forwarded `reasoning` and legacy `tool_responses`; the Gemma 4 template reads both (`reasoning` or `reasoning_content`; `tool_responses` is its legacy non-OpenAI assistant-embedded form), upstream's builder forwards only `reasoning_content`. Matters only for clients that send those field names (eejd/py-vllm-mlx#12) |
 
-## Known gaps on this line (not patches; verified, not assumed)
+## Known gaps on this line (measured; causes marked where not established)
 
 - **Hybrid-model prefix cache never hits.** On Nemotron-3-Nano-4B (ArraysCache) a repeated prompt gets
   0 cache hits with `--continuous-batching` (outputs are correct, just uncached). Measured identically
   on clean upstream main + mlx-lm 0.32, on this line + mlx-lm 0.32, and on this line + mlx-lm 0.31.3, so
-  it predates the 0.32 port. Cause: mlx-lm >= 0.31.2 removed `_process_prompts`/`active_batch`, which the
-  removed layer used to capture prompt-only state; nothing replaced it. Needs a prefill observer built on
-  the native API (`next()` responses, `extract_cache`, `insert_segments`); not implemented here.
+  it predates the 0.32 port. **Cause not established by experiment.** Working hypothesis: mlx-lm >= 0.31.2
+  removed `_process_prompts`/`active_batch`, which the deleted layer used to capture prompt-only state, so a
+  recurrent model only ever stores prompt-plus-output entries, and a recurrent state cannot be trimmed back to
+  a shorter prompt. The server log (INFO level) does not show the reason. A native-API prefill observer
+  (`next()` responses, `extract_cache`, `insert_segments`) would be the fix; not implemented here.
 - **Mid-prefill saves, `prefix_boundary` two-phase prefill and LLM-path MTP are inactive** on every
   supported mlx-lm for the same reason (they log or degrade silently).
 - An exact repeat of a prompt on plain-KV models is counted as a hit but is not noticeably faster;
