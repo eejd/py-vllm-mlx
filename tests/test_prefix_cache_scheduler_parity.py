@@ -24,7 +24,11 @@ class _Tokenizer:
 
     @staticmethod
     def encode(text, **_kwargs):
-        return [int(token) for token in text.split()]
+        words = text.split()
+        if words and all(word.isdigit() for word in words):
+            return [int(word) for word in words]
+        # mlx-lm >= 0.32's NaiveStreamingDetokenizer probes encode("a ,b").
+        return [ord(char) % 26 for char in text]
 
     @staticmethod
     def decode(tokens, **_kwargs):

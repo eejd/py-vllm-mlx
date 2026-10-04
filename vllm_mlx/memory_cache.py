@@ -33,6 +33,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
+from .mlx_cache_compat import prompt_cache_format, recurrent_arrays
 
 
 def is_text_only_prefix_cache_request(request: Any) -> bool:
@@ -186,8 +187,14 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
             # Walk the state recursively: the payload may nest containers or
             # mappings, and the old two-way unpack silently measured those
             # as 0.
+            # Recurrent layers are priced from their array list: on mlx-lm 0.32
+            # ``.state`` is ``(cache, left_padding, lengths)``, which would
+            # count the metadata arrays here and again below.
             try:
-                total_bytes += _nested_array_memory(layer_cache.state)
+                arrays = recurrent_arrays(layer_cache)
+                total_bytes += _nested_array_memory(
+                    arrays if arrays is not None else layer_cache.state
+                )
             except (TypeError, ValueError):
                 pass
             # Detachment also copies these metadata arrays on state-carrying
@@ -1710,6 +1717,9 @@ class MemoryAwarePrefixCache:
 
         index = {
             "version": _CACHE_PERSIST_VERSION,
+            # save_prompt_cache writes a different file layout on mlx-lm 0.32
+            # (no meta_state) than on 0.31; neither can read the other's.
+            "cache_format": prompt_cache_format(),
             "model_fingerprint": self._model_fingerprint,
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
@@ -1795,6 +1805,17 @@ class MemoryAwarePrefixCache:
             logger.warning(
                 f"[cache_persist] version mismatch: disk={version} "
                 f"current={_CACHE_PERSIST_VERSION}, discarding stale cache"
+            )
+            return 0
+
+        # Files written before the format was recorded came from mlx-lm <= 0.31.
+        disk_format = index.get("cache_format", "meta")
+        current_format = prompt_cache_format()
+        if disk_format != current_format:
+            logger.warning(
+                f"[cache_persist] cache format mismatch: disk={disk_format} "
+                f"current={current_format} (written by a different mlx-lm "
+                f"generation), discarding unreadable cache"
             )
             return 0
 

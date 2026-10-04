@@ -32,6 +32,12 @@ from .memory_cache import (
     MemoryCacheConfig,
     is_text_only_prefix_cache_request,
 )
+from .mlx_cache_compat import (
+    restore_from_rollback,
+    restore_from_state,
+    snapshot_for_rollback,
+    uses_meta_state,
+)
 from .multimodal_processor import MultimodalProcessor
 from .mllm_specprefill import (
     SpecPrefillOutcome,
@@ -1193,8 +1199,14 @@ class MLLMBatchGenerator:
         if not callable(from_state):
             raise TypeError(f"Unsupported prefix cache layer: {type(cache).__name__}")
         state = cls._copy_cache_state(cache.state)
-        meta_state = cls._copy_cache_state(cache.meta_state)
-        copied = from_state(state, meta_state)
+        # mlx-lm 0.32 layers have no ``meta_state`` (and ``from_state`` takes
+        # one argument); mlx-vlm's still do. See mlx_cache_compat.
+        meta_state = (
+            cls._copy_cache_state(cache.meta_state)
+            if uses_meta_state(type(cache))
+            else None
+        )
+        copied = restore_from_state(type(cache), state, meta_state)
         if "step" in getattr(cache, "__dict__", {}):
             copied.step = cache.step
         return copied
@@ -3188,9 +3200,7 @@ def install_mtp_mllm(
             for _ci, _c in enumerate(cache):
                 if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
                     if hasattr(_c, "state"):
-                        _rnn_snapshots[_ci] = [
-                            mx.array(s) if s is not None else None for s in _c.state
-                        ]
+                        _rnn_snapshots[_ci] = snapshot_for_rollback(_c)
 
             # Verify [primary, draft]
             verify_input = mx.concatenate(
@@ -3315,7 +3325,7 @@ def install_mtp_mllm(
                         ):
                             c.trim(2)
                     for _ci, _snap in _rnn_snapshots.items():
-                        cache[_ci].state = _snap
+                        restore_from_rollback(cache[_ci], _snap)
                     rerun_out = language_model(
                         (replay_tokens if sampled_reject else primary_tokens[:, None]),
                         cache=cache,

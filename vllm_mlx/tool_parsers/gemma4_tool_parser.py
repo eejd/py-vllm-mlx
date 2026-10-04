@@ -337,13 +337,27 @@ class Gemma4ToolParser(ToolParser):
 
         content_before = cleaned[:start_idx].strip() or None
 
-        block_start = start_idx + len(TOOL_CALL_START)
-        end_idx = cleaned.find(TOOL_CALL_END, block_start)
-        if end_idx == -1:
-            block = cleaned[block_start:]
-        else:
-            block = cleaned[block_start:end_idx]
+        # Gemma 4 renders parallel calls as separate <|tool_call>...<tool_call|>
+        # blocks (see its chat template); a single block may also hold several
+        # call:fn{...} entries. Walk every block, in order.
+        tool_calls: list[dict[str, Any]] = []
+        search_from = start_idx
+        while True:
+            block_start_marker = cleaned.find(TOOL_CALL_START, search_from)
+            if block_start_marker == -1:
+                break
+            block_start = block_start_marker + len(TOOL_CALL_START)
+            end_idx = cleaned.find(TOOL_CALL_END, block_start)
+            if end_idx == -1:
+                tool_calls.extend(self._parse_canonical_block(cleaned[block_start:]))
+                break
+            tool_calls.extend(self._parse_canonical_block(cleaned[block_start:end_idx]))
+            search_from = end_idx + len(TOOL_CALL_END)
 
+        return tool_calls, content_before
+
+    def _parse_canonical_block(self, block: str) -> list[dict[str, Any]]:
+        """Parse the call:fn{...} entries inside one <|tool_call> block."""
         tool_calls: list[dict[str, Any]] = []
 
         pos = 0
@@ -379,7 +393,7 @@ class Gemma4ToolParser(ToolParser):
 
             pos = brace_end + 1
 
-        return tool_calls, content_before
+        return tool_calls
 
     def _extract_fallback(self, cleaned: str) -> ExtractedToolCallInformation | None:
         """Parse the Python-style fallback forms (issue #80).
@@ -462,12 +476,18 @@ class Gemma4ToolParser(ToolParser):
             tools_called=True, tool_calls=tool_calls, content=content
         )
 
-    def _format_streaming(self, result: ExtractedToolCallInformation) -> dict[str, Any]:
-        """Render extracted tool calls into the streaming delta shape."""
+    def _format_streaming(
+        self, result: ExtractedToolCallInformation, start: int = 0
+    ) -> dict[str, Any]:
+        """Render extracted tool calls ``start:`` into the streaming delta shape.
+
+        ``index`` stays absolute so a client assembling deltas per index sees
+        each call exactly once.
+        """
         return {
             "tool_calls": [
                 {
-                    "index": i,
+                    "index": start + i,
                     "id": tc["id"],
                     "type": "function",
                     "function": {
@@ -475,9 +495,21 @@ class Gemma4ToolParser(ToolParser):
                         "arguments": tc["arguments"],
                     },
                 }
-                for i, tc in enumerate(result.tool_calls)
+                for i, tc in enumerate(result.tool_calls[start:])
             ]
         }
+
+    def _closed_canonical_call_count(self, text: str) -> int:
+        """Calls in canonical blocks of ``text`` that are already closed.
+
+        Counts only up to the last end marker, so a block still streaming
+        (whose braces may already balance) is not counted before it closes.
+        """
+        end = text.rfind(TOOL_CALL_END)
+        if end == -1:
+            return 0
+        closed = self.strip_think_tags(text[: end + len(TOOL_CALL_END)])
+        return len(self._extract_canonical(closed)[0])
 
     def extract_tool_calls_streaming(
         self,
@@ -496,18 +528,30 @@ class Gemma4ToolParser(ToolParser):
         if not has_canonical and not has_fallback:
             return {"content": delta_text}
 
-        # Canonical brace form: emit when the end delimiter arrives in this delta.
-        if has_canonical and TOOL_CALL_END in delta_text:
+        # Canonical brace form: emit the calls of a block when its end delimiter
+        # arrives. Compared on accumulated text so a marker split across deltas
+        # is still seen once; only calls not already sent are emitted.
+        if has_canonical and current_text.count(TOOL_CALL_END) > previous_text.count(
+            TOOL_CALL_END
+        ):
             result = self.extract_tool_calls(current_text)
-            if result.tools_called:
-                return self._format_streaming(result)
+            already_sent = self._closed_canonical_call_count(previous_text)
+            if result.tools_called and len(result.tool_calls) > already_sent:
+                return self._format_streaming(result, already_sent)
             return None
 
         # Fallback forms (`call:fn(...)` / ```tool_code```) have no end delimiter.
-        # Emit once, on the delta that first makes the call parseable.
-        if has_fallback and not self.extract_tool_calls(previous_text).tools_called:
+        # Emit each call once, on the delta that first makes it parseable. A brace
+        # form block still waiting for its end marker is left to the branch above,
+        # otherwise its calls would be sent here and again when the block closes.
+        brace_block_pending = has_canonical and bool(
+            self._extract_canonical(self.strip_think_tags(current_text))[0]
+        )
+        if has_fallback and not brace_block_pending:
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
-                return self._format_streaming(result)
+                already_sent = len(self.extract_tool_calls(previous_text).tool_calls)
+                if len(result.tool_calls) > already_sent:
+                    return self._format_streaming(result, already_sent)
 
         return None

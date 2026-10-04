@@ -18,7 +18,6 @@ cache_mod = pytest.importorskip("mlx_lm.models.cache")
 from vllm_mlx.scheduler import (  # noqa: E402
     Scheduler,
     SchedulerConfig,
-    _install_chunked_prefill,
 )
 
 
@@ -148,53 +147,6 @@ class TestBoundedCacheTopology:
         ]
         assert all(isinstance(c, cache_mod.RotatingKVCache) for c in bounded)
         assert all(c.max_size == 64 for c in bounded)
-
-    def test_chunked_prefill_keeps_the_scheduler_supplied_bound(self):
-        """An empty bounded cache must not be rebuilt through ``make_cache``."""
-
-        class _ModelWithMakeCache(_Model):
-            def make_cache(self):
-                return [cache_mod.KVCache() for _ in self.layers]
-
-            def __call__(self, inputs, cache=None):
-                keys = mx.zeros((inputs.shape[0], 1, inputs.shape[1], 4))
-                for layer in cache:
-                    layer.update_and_fetch(keys, keys)
-                return mx.zeros((inputs.shape[0], inputs.shape[1], 8))
-
-        class _Stats:
-            prompt_tokens = 0
-            prompt_time = 0.0
-            generation_time = 0.0
-
-        class _BatchGenerator:
-            def __init__(self):
-                self.model = _ModelWithMakeCache(n_layers=1)
-                supplied = Scheduler._bound_cache_layers(self.model.make_cache(), 64)
-                self.unprocessed_prompts = [
-                    (7, [1, 2, 3, 4, 5], 16, supplied, None, [None], 2)
-                ]
-                self._stats = _Stats()
-                self._partial = None
-                self.active_batch = None
-                self.prefill_batch_size = 1
-                self.completion_batch_size = 1
-                self.max_kv_size = 64
-                self.stop_tokens = set()
-                self.prompt_progress_callback = lambda _progress: None
-                self.prompt_checkpoint_callback = None
-                self._next = lambda: []
-                self.remove = lambda _uids: None
-                self._process_prompts = lambda _prompts: None
-
-        batch_gen = _BatchGenerator()
-        _install_chunked_prefill(batch_gen, budget=2)
-
-        batch_gen._next()
-
-        live = batch_gen._partial["cache"]
-        assert isinstance(live[0], cache_mod.BatchRotatingKVCache)
-        assert live[0].max_size == 64
 
 
 def _sampling_params():

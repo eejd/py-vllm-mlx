@@ -12,6 +12,7 @@ import subprocess
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.platforms.interface import Platform, PlatformEnum
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ def _get_unified_memory_size() -> int:
         return 8 * 1024 * 1024 * 1024
 
 
-class MLXPlatform:
+class MLXPlatform(Platform):
     """
     Platform implementation for Apple Silicon using MLX.
 
@@ -63,17 +64,19 @@ class MLXPlatform:
     - Support for quantized models (4-bit, 8-bit)
     """
 
-    # Platform identification
-    # Using OOT (Out-of-Tree) since MLX is not a built-in vLLM platform
-    # Import here to avoid circular imports at module level
-    @property
-    def _enum(self):
-        from vllm.platforms.interface import PlatformEnum
-
-        return PlatformEnum.OOT
+    # Platform identification: OOT (Out-of-Tree) since MLX is not a built-in
+    # vLLM platform. Subclassing ``Platform`` (rather than duck-typing it)
+    # inherits every default vLLM adds to the interface over time --
+    # ``fp8_dtype``, ``get_infinity_values``, ... -- so new interface
+    # members never break ``import vllm`` for this plugin.
+    _enum = PlatformEnum.OOT
 
     device_name: str = "mlx"
-    device_type: str = "mlx"
+    # vLLM builds torch.device(device_type) (DeviceConfig.__post_init__), and
+    # "mlx" is not a torch device. Tensors handed to/from vLLM live on the CPU
+    # side of unified memory; MLX manages its own device (worker.py does the
+    # same with torch.device("cpu")).
+    device_type: str = "cpu"
 
     # MLX uses CPU dispatch key since it's not registered in PyTorch
     dispatch_key: str = "CPU"
@@ -162,6 +165,22 @@ class MLXPlatform:
         return torch.no_grad()
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        """Seed the MLX global PRNG for this platform.
+
+        vLLM's ``set_random_seed`` calls this after seeding Python, NumPy and
+        torch; the base ``Platform`` raises NotImplementedError, which aborts
+        worker ``init_device``. MLX keeps its own generator that
+        ``torch.manual_seed`` does not reach.
+        """
+        try:
+            import mlx.core as mx
+
+            mx.random.seed(seed)
+        except Exception:  # pragma: no cover - MLX unavailable or too old
+            pass
+
+    @classmethod
     def set_device(cls, device: torch.device) -> None:
         """Set the device (no-op for MLX, uses default device)."""
         # MLX automatically uses the GPU
@@ -207,7 +226,7 @@ class MLXPlatform:
     ) -> str:
         """Return MLX attention backend class path."""
         # Use our custom MLX attention backend
-        return "vllm_mlx.attention.MLXAttentionBackend"
+        return "vllm_mlx_plugin.attention.MLXAttentionBackend"
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -228,7 +247,7 @@ class MLXPlatform:
         if hasattr(vllm_config, "parallel_config"):
             parallel_config = vllm_config.parallel_config
             if parallel_config.worker_cls == "auto":
-                parallel_config.worker_cls = "vllm_mlx.worker.MLXWorker"
+                parallel_config.worker_cls = "vllm_mlx_plugin.worker.MLXWorker"
 
             # Disable features not supported on MLX
             if parallel_config.enable_dbo:
@@ -298,11 +317,6 @@ class MLXPlatform:
     def support_static_graph_mode(cls) -> bool:
         """Static graph mode (CUDA graphs) not supported."""
         return False
-
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        """Return the communicator class for distributed."""
-        return "vllm_mlx.distributed.MLXCommunicator"
 
     @classmethod
     def get_punica_wrapper(cls) -> str:

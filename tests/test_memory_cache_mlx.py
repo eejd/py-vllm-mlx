@@ -67,7 +67,7 @@ class TestTrimCacheOffset:
         tc = _trim_cache_offset([layer], 500 - 60)[0]
 
         # cache.state is what KV-shared layers read directly.
-        keys_view, _ = tc.state
+        keys_view = tc.state[0]  # (keys, values) or (keys, values, offset)
         assert keys_view.shape[-2] == 60
         # No "7.0" tokens anywhere — private content was excluded.
         assert float(mx.max(keys_view).item()) == 1.0
@@ -466,7 +466,7 @@ class TestDequantizeCacheSlice:
         result = _dequantize_cache(trimmed)
 
         tc = result[0]
-        keys_view, _ = tc.state
+        keys_view = tc.state[0]  # (keys, values) or (keys, values, offset)
         assert keys_view.shape[-2] == 64
         # Dequantized values are approximate (quantization error), but should
         # be close to 1.0 (the shared prefix), never near 7.0 (the private data).
@@ -1275,3 +1275,73 @@ class TestFailClosedPostcondition:
                 resident += extra.nbytes
 
         assert estimate_kv_cache_memory([ac]) == resident
+
+
+class TestPersistedCacheFormat:
+    """save_prompt_cache's file layout differs between mlx-lm 0.31 and 0.32."""
+
+    def _cache(self):
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        return MemoryAwarePrefixCache(
+            None, MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1)
+        )
+
+    def _store_one(self, cache):
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        layer = KVCache()
+        layer.update_and_fetch(mx.ones((1, 2, 6, 8)), mx.ones((1, 2, 6, 8)))
+        assert cache.store([1, 2, 3, 4, 5, 6], [layer])
+
+    def test_round_trip_on_the_installed_mlx_lm(self, tmp_path):
+        src = self._cache()
+        self._store_one(src)
+        assert src.save_to_disk(str(tmp_path))
+
+        import json
+
+        from vllm_mlx.mlx_cache_compat import prompt_cache_format
+
+        index = json.loads((tmp_path / "index.json").read_text())
+        assert index["cache_format"] == prompt_cache_format()
+
+        dst = self._cache()
+        assert dst.load_from_disk(str(tmp_path)) == 1
+
+    def test_a_cache_written_in_another_format_is_discarded(self, tmp_path, caplog):
+        import json
+
+        src = self._cache()
+        self._store_one(src)
+        assert src.save_to_disk(str(tmp_path))
+        index_path = tmp_path / "index.json"
+        index = json.loads(index_path.read_text())
+        index["cache_format"] = "some-other-format"
+        index_path.write_text(json.dumps(index))
+
+        assert self._cache().load_from_disk(str(tmp_path)) == 0
+        assert "cache format mismatch" in caplog.text
+
+    def test_an_index_without_a_format_is_treated_as_the_legacy_one(
+        self, tmp_path, caplog
+    ):
+        import json
+
+        from vllm_mlx.mlx_cache_compat import prompt_cache_format
+
+        src = self._cache()
+        self._store_one(src)
+        assert src.save_to_disk(str(tmp_path))
+        index_path = tmp_path / "index.json"
+        index = json.loads(index_path.read_text())
+        del index["cache_format"]
+        index_path.write_text(json.dumps(index))
+
+        loaded = self._cache().load_from_disk(str(tmp_path))
+        if prompt_cache_format() == "meta":
+            assert loaded == 1
+        else:
+            assert loaded == 0
+            assert "cache format mismatch" in caplog.text

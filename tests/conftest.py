@@ -87,3 +87,29 @@ def _bind_mlx_default_stream():
         mx.set_default_stream(mx.new_stream(mx.default_device()))
     except ImportError:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_generation_stream_globals():
+    """Restore the process-global ``generation_stream`` handles after each test.
+
+    ``bind_generation_streams`` points ``mlx_lm.generate.generation_stream`` (a
+    module attribute) at a stream owned by whichever thread called it. A test
+    that binds on a worker thread would otherwise leave that handle naming a
+    stream no live thread can enter, and the next test that builds a
+    BatchGenerator without an explicit stream fails with "There is no
+    Stream(gpu, N) in current thread" -- depending on test order.
+    """
+    try:
+        from vllm_mlx.mlx_streams import (
+            restore_generation_streams,
+            snapshot_generation_streams,
+        )
+    except ImportError:
+        yield
+        return
+    snapshot = snapshot_generation_streams()
+    try:
+        yield
+    finally:
+        restore_generation_streams(snapshot)

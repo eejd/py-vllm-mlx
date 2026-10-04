@@ -1198,7 +1198,7 @@ class TestIntegrationSpillAndFetch:
 
         assert reconstructed is not None
         assert isinstance(reconstructed[0], cache_mod.ArraysCache)
-        assert reconstructed[0].state[0].tolist() == mx.array([1, 2]).tolist()
+        assert reconstructed[0].cache[0].tolist() == mx.array([1, 2]).tolist()
 
     def test_capacity_eviction_end_to_end(self, tmp_path):
         """Entries beyond max_entries are evicted from SSD."""

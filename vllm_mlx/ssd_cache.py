@@ -32,6 +32,8 @@ from typing import Any
 
 import numpy as np
 
+from .mlx_cache_compat import recurrent_arrays
+
 logger = logging.getLogger(__name__)
 
 _BYTES_PER_MB = 1024 * 1024
@@ -608,7 +610,10 @@ class ArraysCacheSerializer(LayerSerializer):
     def snapshot_layer(self, layer: Any) -> dict[str, Any]:
         state_np: list[np.ndarray] = []
         original_dtypes: list[str | None] = []
-        for arr in layer.state:
+        # ``layer.cache`` is the array list on every mlx-lm contract; in 0.32
+        # ``.state`` is ``(cache, left_padding, lengths)`` and would not iterate
+        # as arrays.
+        for arr in recurrent_arrays(layer):
             np_arr, orig = _mx_to_numpy_safe(arr)
             state_np.append(np_arr)
             original_dtypes.append(orig)
@@ -788,7 +793,7 @@ def get_serializer_for_layer(layer: Any) -> LayerSerializer:
         return CacheListSerializer()
     if hasattr(layer, "keys") and hasattr(layer, "values") and hasattr(layer, "offset"):
         return KVCacheSerializer()
-    if hasattr(layer, "state") and isinstance(getattr(layer, "state", None), list):
+    if recurrent_arrays(layer) is not None:
         return ArraysCacheSerializer()
     raise ValueError(
         f"Unsupported cache layer type: {type(layer).__name__}. "

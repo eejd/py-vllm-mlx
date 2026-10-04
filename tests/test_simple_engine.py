@@ -12,6 +12,21 @@ import pytest
 pytestmark = pytest.mark.anyio
 
 
+def _wrappable_tokenizer():
+    """A MagicMock tokenizer that mlx-lm's ``TokenizerWrapper`` accepts.
+
+    mlx-lm 0.32 inspects ``type(tokenizer).apply_chat_template`` when it builds
+    the wrapper, and raises AttributeError for a class that lacks it. Real HF
+    tokenizers inherit it from ``PreTrainedTokenizerBase``; each MagicMock has
+    its own class, so setting it here affects only this instance.
+    """
+    from transformers import PreTrainedTokenizerBase
+
+    tokenizer = MagicMock()
+    type(tokenizer).apply_chat_template = PreTrainedTokenizerBase.apply_chat_template
+    return tokenizer
+
+
 class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""
 
@@ -1462,7 +1477,7 @@ class TestSimpleEngineConcurrency:
         captured = {}
         text_model = MagicMock()
         text_model.mtp = None
-        tokenizer = MagicMock()
+        tokenizer = _wrappable_tokenizer()
         tokenizer.convert_tokens_to_ids.return_value = 42
 
         mock_mllm = MagicMock()
@@ -1526,7 +1541,7 @@ class TestSimpleEngineConcurrency:
 
         text_model = MagicMock()
         text_model.mtp = None
-        tokenizer = MagicMock()
+        tokenizer = _wrappable_tokenizer()
         tokenizer.convert_tokens_to_ids.return_value = 42
 
         mock_mllm = MagicMock()

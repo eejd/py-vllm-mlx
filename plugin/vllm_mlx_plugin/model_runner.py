@@ -8,15 +8,16 @@ handling with mlx-lm's inference capabilities.
 Includes low-level optimizations:
 - mx.compile() for kernel fusion
 - Memory bandwidth optimization
-- Prefill chunking for L2 cache efficiency
+- Per-request mlx-lm generators (KV cache lives inside each generator)
 """
 
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 import mlx.core as mx
+from vllm.v1.outputs import ModelRunnerOutput
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -31,23 +32,6 @@ class SamplerOutput:
 
     token_ids: list[int]
     logprobs: list[dict] | None = None
-
-
-@dataclass
-class MLXModelRunnerOutput:
-    """Output from MLX model runner, compatible with vLLM's ModelRunnerOutput."""
-
-    # Request ID to sampled token IDs
-    req_id_to_token_ids: dict[str, list[int]]
-
-    # Request ID to logprobs (if requested)
-    req_id_to_logprobs: dict[str, list[dict]] | None = None
-
-    # Number of tokens generated
-    num_tokens_generated: int = 0
-
-    # Time taken for generation
-    generation_time_s: float = 0.0
 
 
 class MLXModelRunner:
@@ -84,8 +68,13 @@ class MLXModelRunner:
         self.tokenizer = None
         self._loaded = False
 
-        # Sampler for generation
-        self._sampler = None
+        # Per-request generation state (vLLM >= 0.27 step contract):
+        # each request owns an mlx-lm generate_step generator whose internal
+        # KV cache persists between scheduler steps.
+        self._gens: dict[str, Iterator] = {}
+        self._tokens: dict[str, list[int]] = {}
+        self._params: dict[str, Any] = {}
+        self._pending_output: ModelRunnerOutput | None = None
 
         # Cache for prompt processing
         self._prompt_cache = None
@@ -128,9 +117,6 @@ class MLXModelRunner:
 
             self._loaded = True
 
-            # Create default sampler
-            self._create_default_sampler()
-
             # Apply low-level optimizations
             if self._enable_optimizations:
                 self._apply_optimizations()
@@ -147,19 +133,13 @@ class MLXModelRunner:
     def _apply_optimizations(self) -> None:
         """Apply low-level optimizations for maximum performance."""
         try:
-            from vllm_mlx.optimizations import (
-                configure_memory_optimization,
-                detect_hardware,
-            )
+            from vllm_mlx.optimizations import detect_hardware
 
             # Detect hardware and apply memory optimization
             self._hardware_info = detect_hardware()
             logger.info(f"Hardware detected: {self._hardware_info.chip_name}")
             logger.info(f"Memory: {self._hardware_info.total_memory_gb:.1f} GB")
             logger.info(f"Bandwidth: {self._hardware_info.memory_bandwidth_gbs} GB/s")
-
-            # Configure memory settings
-            configure_memory_optimization()
 
             # Compile the model forward pass for kernel fusion
             self._setup_compiled_forward()
@@ -191,18 +171,6 @@ class MLXModelRunner:
         except Exception as e:
             logger.warning(f"Failed to compile forward pass: {e}")
             self._compiled_forward = None
-
-    def _create_default_sampler(self) -> None:
-        """Create default sampler for generation."""
-        try:
-            from mlx_lm.sample_utils import make_sampler
-
-            self._sampler = make_sampler(
-                temp=0.7,
-                top_p=0.9,
-            )
-        except ImportError:
-            logger.warning("Could not create sampler, using defaults")
 
     def initialize_cache(self, num_blocks: int) -> None:
         """Initialize KV cache."""
@@ -265,120 +233,131 @@ class MLXModelRunner:
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> MLXModelRunnerOutput:
-        """
-        Execute model inference for scheduled requests.
+    ) -> ModelRunnerOutput | None:
+        """Run one scheduler step (vLLM >= 0.27 contract).
 
-        Args:
-            scheduler_output: Contains requests to process
-
-        Returns:
-            MLXModelRunnerOutput with generated tokens
+        New requests are prefilled and yield their first token; cached
+        (running) requests advance one decode step from their persistent
+        generator; finished requests are released.  When tokens were
+        produced the output is stashed and ``None`` returned, so the engine
+        collects it via ``sample_tokens`` -- the same two-phase protocol
+        vllm_swift uses.  Cleanup-only steps return the output directly.
         """
         if not self._loaded:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        start_time = time.time()
-        req_id_to_token_ids: dict[str, list[int]] = {}
-        total_tokens = 0
+        for req_id in scheduler_output.finished_req_ids:
+            self._release(req_id)
 
-        # Process new requests
+        req_ids: list[str] = []
+        sampled_token_ids: list[list[int]] = []
+
         for req_data in scheduler_output.scheduled_new_reqs:
             req_id = req_data.req_id
-            prompt_token_ids = req_data.prompt_token_ids
-
-            # Generate tokens for this request
-            generated_ids = self._generate_for_request(
-                prompt_token_ids=prompt_token_ids,
-                sampling_params=req_data.sampling_params,
-                max_tokens=1,  # Generate one token at a time for streaming
+            self._params[req_id] = req_data.sampling_params
+            self._gens[req_id] = self._start_request(
+                req_data.prompt_token_ids or [], req_data.sampling_params
             )
+            self._tokens[req_id] = []
+            req_ids.append(req_id)
+            sampled_token_ids.append(self._step_request(req_id))
 
-            req_id_to_token_ids[req_id] = generated_ids
-            total_tokens += len(generated_ids)
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id in cached.req_ids:
+            if req_id in cached.resumed_req_ids:
+                # Preempted and re-prefilled by the scheduler: the old
+                # generator's KV state is stale, rebuild from the full token
+                # history the scheduler sends for resumed requests.
+                self._resume_request(req_id, cached.all_token_ids.get(req_id))
+            req_ids.append(req_id)
+            sampled_token_ids.append(self._step_request(req_id))
 
-        # Process running requests (continue generation)
-        for req_id in scheduler_output.scheduled_running_reqs:
-            # For running requests, we continue generation
-            # This is simplified - in practice we'd use KV cache
-            generated_ids = self._continue_generation(req_id)
-            if generated_ids:
-                req_id_to_token_ids[req_id] = generated_ids
-                total_tokens += len(generated_ids)
+        output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            sampled_token_ids=sampled_token_ids,
+        )
+        if req_ids:
+            self._pending_output = output
+            return None
+        return output
 
-        generation_time = time.time() - start_time
+    def take_pending_output(self) -> ModelRunnerOutput | None:
+        """Hand the stashed step output to the worker's ``sample_tokens``."""
+        output = self._pending_output
+        self._pending_output = None
+        return output
 
-        return MLXModelRunnerOutput(
-            req_id_to_token_ids=req_id_to_token_ids,
-            num_tokens_generated=total_tokens,
-            generation_time_s=generation_time,
+    def _release(self, req_id: str) -> None:
+        self._gens.pop(req_id, None)
+        self._tokens.pop(req_id, None)
+        self._params.pop(req_id, None)
+
+    def _resume_request(self, req_id: str, all_token_ids: list[int] | None) -> None:
+        """Rebuild a preempted request's generator from its full token history."""
+        if not all_token_ids:
+            logger.error(f"Resumed request {req_id} without token history")
+            self._gens.pop(req_id, None)
+            return
+        params = self._params.get(req_id)
+        self._gens[req_id] = self._start_request(list(all_token_ids), params)
+        self._tokens.setdefault(req_id, [])
+
+    def _eos_token_id(self) -> int | None:
+        return getattr(self.tokenizer, "eos_token_id", None)
+
+    def _start_request(
+        self, prompt_token_ids: list[int], sampling_params: Any
+    ) -> Iterator:
+        """Create the persistent mlx-lm generator for one request."""
+        from mlx_lm.generate import generate_step
+        from mlx_lm.sample_utils import make_sampler
+
+        temp = float(getattr(sampling_params, "temperature", 1.0) or 0.0)
+        top_p_raw = getattr(sampling_params, "top_p", None)
+        # vLLM: 1.0 = disabled; mlx-lm: 0.0 = disabled.
+        top_p = 0.0 if top_p_raw is None or top_p_raw >= 1.0 else float(top_p_raw)
+        min_p = float(getattr(sampling_params, "min_p", 0.0) or 0.0)
+        top_k = int(getattr(sampling_params, "top_k", 0) or 0)
+        if top_k < 0:  # vLLM uses -1 / 0 for "disabled"
+            top_k = 0
+        sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
+        # vLLM's scheduler enforces max_tokens / stop conditions; keep the
+        # generator open for the whole context window.
+        return generate_step(
+            prompt=mx.array(prompt_token_ids),
+            model=self.model,
+            max_tokens=-1,
+            sampler=sampler,
         )
 
-    def _generate_for_request(
-        self,
-        prompt_token_ids: list[int],
-        sampling_params: Any,
-        max_tokens: int = 1,
-    ) -> list[int]:
+    def _step_request(self, req_id: str) -> list[int]:
+        """Advance one request by one token.
+
+        A request that can no longer generate (missing/exhausted generator or
+        an mlx-lm error) is terminated by emitting EOS: the scheduler only
+        stops a request on a sampled stop token -- an empty list leaves it
+        running forever (vllm/v1/core/sched/scheduler.py update_from_output).
         """
-        Generate tokens for a single request.
-
-        Uses optimizations when enabled:
-        - Compiled forward pass (kernel fusion)
-        - Prefill chunking for long prompts
-
-        Args:
-            prompt_token_ids: Input token IDs
-            sampling_params: Sampling parameters
-            max_tokens: Maximum tokens to generate
-
-        Returns:
-            List of generated token IDs
-        """
+        gen = self._gens.get(req_id)
+        if gen is None:
+            logger.error(f"No generator for request {req_id}; terminating it")
+            return self._terminate(req_id)
         try:
-            from mlx_lm.generate import generate_step
-            from mlx_lm.sample_utils import make_sampler
-
-            # Create sampler from sampling params
-            temp = getattr(sampling_params, "temperature", 0.7)
-            top_p = getattr(sampling_params, "top_p", 0.9)
-            sampler = make_sampler(temp=temp, top_p=top_p)
-
-            # Convert token IDs to MLX array
-            prompt = mx.array(prompt_token_ids)
-
-            generated_ids = []
-
-            # Generate tokens
-            for token_info in generate_step(
-                prompt=prompt,
-                model=self.model,
-                max_tokens=max_tokens,
-                sampler=sampler,
-            ):
-                if hasattr(token_info, "token"):
-                    generated_ids.append(token_info.token)
-                elif isinstance(token_info, tuple) and len(token_info) > 0:
-                    generated_ids.append(token_info[0])
-
-                if len(generated_ids) >= max_tokens:
-                    break
-
-            return generated_ids
-
+            token, _logprobs = next(gen)
+        except StopIteration:
+            return self._terminate(req_id)
         except Exception as e:
-            logger.error(f"Generation failed: {e}")
-            return []
+            logger.error(f"Generation failed for {req_id}: {e}")
+            return self._terminate(req_id)
+        tok = int(token.item()) if hasattr(token, "item") else int(token)
+        self._tokens[req_id].append(tok)
+        return [tok]
 
-    def _continue_generation(self, req_id: str) -> list[int]:
-        """
-        Continue generation for an existing request.
-
-        This is a placeholder - in a full implementation, we would
-        use cached KV states to continue generation efficiently.
-        """
-        # For now, return empty - full implementation would track state
-        return []
+    def _terminate(self, req_id: str) -> list[int]:
+        self._gens.pop(req_id, None)
+        eos = self._eos_token_id()
+        return [int(eos)] if eos is not None else []
 
     def decode_tokens(self, token_ids: list[int]) -> str:
         """Decode token IDs to text."""

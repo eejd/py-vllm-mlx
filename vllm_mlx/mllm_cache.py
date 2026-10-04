@@ -108,6 +108,15 @@ class MLLMPrefixCacheEntry:
                 size += self.vision_embeddings.nbytes
         if self.kv_cache is not None:
             for layer_cache in self.kv_cache:
+                # mlx-lm 0.32 layers report their own size; their ``.state``
+                # nests lists (recurrent layers) that a flat sum would skip.
+                try:
+                    layer_bytes = layer_cache.nbytes
+                except (AttributeError, NotImplementedError):
+                    layer_bytes = None
+                if isinstance(layer_bytes, int):
+                    size += layer_bytes
+                    continue
                 if hasattr(layer_cache, "state"):
                     state = layer_cache.state
                     if state is not None:
