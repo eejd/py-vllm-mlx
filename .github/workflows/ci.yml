@@ -107,6 +107,8 @@ jobs:
             tests/test_gemma4_openai_format.py \
             tests/test_gemma4_streaming_edge.py \
             tests/test_gemma4_tool_parser.py \
+            tests/test_gemma4_mllm_tool_roundtrip.py \
+            tests/test_streaming_tool_call_emit_once.py \
             tests/test_deepseek_v4_encoding.py \
             tests/test_deepseek_v4_reasoning.py \
             tests/test_deepseek_v4_tool_parser.py \
