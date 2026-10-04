@@ -54,6 +54,11 @@ _STRAY_TOKENS_RE = re.compile(r"</?tool_call>|</function>")
 
 _FUNCTION_OPEN = "<function"
 _FUNCTION_CLOSE = "</function>"
+# What actually starts an element. Prose may contain ``<function`` as part of something else
+# (``<functions>``), so only a full opening tag counts, and only a proper prefix of the
+# canonical tag is held back at the end of the stream.
+_OPEN_RE = re.compile(r'<function\s+name="')
+_OPEN_CANON = '<function name="'
 
 
 def _schema_types(schema: Any) -> set[str]:
@@ -110,9 +115,9 @@ def _build_call(name: str, body: str, request: dict[str, Any] | None) -> dict[st
 
 
 def _partial_open_suffix(text: str) -> int:
-    """Length of a trailing proper prefix of ``<function`` (``"<func"``), else 0."""
-    for n in range(min(len(_FUNCTION_OPEN) - 1, len(text)), 0, -1):
-        if text.endswith(_FUNCTION_OPEN[:n]):
+    """Length of a trailing proper prefix of the opening tag (``"<func"``), else 0."""
+    for n in range(min(len(_OPEN_CANON) - 1, len(text)), 0, -1):
+        if text.endswith(_OPEN_CANON[:n]):
             return n
     return 0
 
@@ -129,6 +134,10 @@ class MiniCPMToolParser(ToolParser):
     # The template renders assistant ``tool_calls`` and tool results natively.
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     STREAMING_MARKERS = (_FUNCTION_OPEN,)
+    # Receive every delta and be finalized at the end of every response, so an element the
+    # model never closed is resolved even when the last delta also completed another call
+    # (the server otherwise only finalizes after a delta that produced nothing).
+    REQUIRES_EAGER_STREAMING = True
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -159,6 +168,10 @@ class MiniCPMToolParser(ToolParser):
         self._last_end = 0
         self._seen_len = 0
         self._prose_sent = False
+        # Before any ``<function`` has appeared, streaming is plain prose and each delta
+        # is handled in O(1); ``_held`` is the partial-tag tail not yet handed out.
+        self._open_seen = False
+        self._held = 0
 
     def reset(self) -> None:
         super().reset()
@@ -212,6 +225,21 @@ class MiniCPMToolParser(ToolParser):
         a call is never re-sent. The server only routes deltas here once ``<function`` has
         appeared, so think text before it has already gone out as content.
         """
+        if not self._open_seen and self._seen_len == len(previous_text):
+            window = current_text[
+                max(0, len(previous_text) - len(_FUNCTION_OPEN) + 1) :
+            ]
+            if _FUNCTION_OPEN not in window:
+                held = _partial_open_suffix(current_text)
+                part = current_text[
+                    len(previous_text) - self._held : len(current_text) - held
+                ]
+                self._held, self._seen_len = held, len(current_text)
+                if part and (part.strip() or self._prose_sent):
+                    self._prose_sent = self._prose_sent or bool(part.strip())
+                    return {"content": part}
+                return None
+        self._open_seen = True
         self._sync(previous_text)
         prev_closed, prev_last_end = self._n_closed, self._last_end
         # A newly completed element must end inside this delta (plus the bytes a tag could
@@ -232,8 +260,10 @@ class MiniCPMToolParser(ToolParser):
         # up to a trailing piece that could still be the start of ``<function`` (held back
         # so a tag split across deltas never leaks as prose).
         def prose_end(text: str, last_end: int) -> int:
-            opened = text.find(_FUNCTION_OPEN, last_end)
-            return opened if opened != -1 else len(text) - _partial_open_suffix(text)
+            opened = _OPEN_RE.search(text, last_end)
+            if opened:
+                return opened.start()
+            return len(text) - _partial_open_suffix(text)
 
         handed = prose_end(previous_text, prev_last_end)
         end_now = prose_end(current_text, self._last_end)
@@ -282,7 +312,7 @@ class MiniCPMToolParser(ToolParser):
             return {"content": current_text[-held:]} if held else None
         body = _CDATA_SECTION_RE.sub("", tail.group(2))
         if (
-            _FUNCTION_OPEN in body
+            _OPEN_RE.search(body)
             or "<![CDATA[" in body
             or body.count("<param") != body.count("</param>")
         ):

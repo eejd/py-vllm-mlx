@@ -161,14 +161,26 @@ class Lfm2ToolParser(ToolParser):
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     # Lets the server route deltas here once the (non-special) start marker shows up.
     STREAMING_MARKERS = (TOOL_CALL_START,)
+    # Receive every delta and be finalized at the end of every response, so a block the
+    # model never closed is resolved even when the last delta also completed another one
+    # (the server otherwise only finalizes after a delta that produced nothing).
+    REQUIRES_EAGER_STREAMING = True
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
+        self._reset_stream_state()
+
+    def _reset_stream_state(self) -> None:
         self._prose_sent = False
+        # Before the start marker has appeared, streaming is plain prose and each delta is
+        # handled in O(1); ``_held`` is the partial-marker tail not yet handed out.
+        self._marker_seen = False
+        self._held = 0
+        self._seen_len = 0
 
     def reset(self) -> None:
         super().reset()
-        self._prose_sent = False
+        self._reset_stream_state()
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -226,6 +238,21 @@ class Lfm2ToolParser(ToolParser):
         seen once, and ``index`` is the absolute call position so a client that
         concatenates per index never sees a call twice.
         """
+        if not self._marker_seen and self._seen_len == len(previous_text):
+            window = current_text[
+                max(0, len(previous_text) - len(TOOL_CALL_START) + 1) :
+            ]
+            if TOOL_CALL_START not in window:
+                held = _partial_marker_suffix(current_text)
+                part = current_text[
+                    len(previous_text) - self._held : len(current_text) - held
+                ]
+                self._held, self._seen_len = held, len(current_text)
+                if part and (part.strip() or self._prose_sent):
+                    self._prose_sent = self._prose_sent or bool(part.strip())
+                    return {"content": part}
+                return None
+        self._marker_seen = True
         # Text the stream has already handed to the client. A trailing piece that could be
         # the start of the marker is held back until the next delta shows what it is, so a
         # marker split across deltas never leaks as prose.
