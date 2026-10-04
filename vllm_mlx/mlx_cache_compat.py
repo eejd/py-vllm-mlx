@@ -22,9 +22,12 @@ only places that translate.
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 from typing import Any
+
+import mlx.core as mx
 
 # Cache layers whose valid KV region is ``keys[..., :offset, :]`` and that can
 # be rebuilt from a plain ``(keys, values)`` pair. Anything else (rotating,
@@ -200,3 +203,25 @@ def prompt_cache_format() -> str:
         return "unknown"
     return "meta" if uses_meta_state(_BaseCache) else "state-v2"
 
+
+def clone_layer(layer: Any, max_tokens: int | None = None) -> Any:
+    """An independent copy of ``layer``, optionally cut to ``max_tokens``.
+
+    A plain KV layer gets fresh ``keys``/``values`` cut to its valid tokens
+    (and to ``max_tokens`` if smaller), so the clone never exposes the padded
+    tail of an mlx-lm 0.32 buffer nor tokens generated after the prompt. Any
+    other layer is rebuilt through its own state, which also gives a recurrent
+    layer its own array list instead of sharing the original's.
+    """
+    view = kv_view(layer)
+    if view is not None:
+        n = view[0].shape[-2]
+        if max_tokens is not None:
+            n = min(n, max_tokens)
+        clone = copy.copy(layer)
+        clone.keys = mx.array(view[0][..., :n, :])
+        clone.values = mx.array(view[1][..., :n, :])
+        clone.offset = n
+        return clone
+    state, meta = snapshot_state(layer)
+    return restore_from_state(type(layer), state, meta)

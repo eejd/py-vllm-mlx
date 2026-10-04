@@ -32,6 +32,7 @@ from .memory_cache import (
     MemoryCacheConfig,
     is_text_only_prefix_cache_request,
 )
+from .mlx_cache_compat import restore_from_state, uses_meta_state
 from .multimodal_processor import MultimodalProcessor
 from .mllm_specprefill import (
     SpecPrefillOutcome,
@@ -1193,8 +1194,14 @@ class MLLMBatchGenerator:
         if not callable(from_state):
             raise TypeError(f"Unsupported prefix cache layer: {type(cache).__name__}")
         state = cls._copy_cache_state(cache.state)
-        meta_state = cls._copy_cache_state(cache.meta_state)
-        copied = from_state(state, meta_state)
+        # mlx-lm 0.32 layers have no ``meta_state`` (and ``from_state`` takes
+        # one argument); mlx-vlm's still do. See mlx_cache_compat.
+        meta_state = (
+            cls._copy_cache_state(cache.meta_state)
+            if uses_meta_state(type(cache))
+            else None
+        )
+        copied = restore_from_state(type(cache), state, meta_state)
         if "step" in getattr(cache, "__dict__", {}):
             copied.step = cache.step
         return copied

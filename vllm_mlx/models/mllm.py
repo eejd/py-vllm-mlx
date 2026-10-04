@@ -34,6 +34,7 @@ import requests
 
 from vllm_mlx.engine.chat_template_safety import normalize_messages_for_chat_template
 from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
+from vllm_mlx.mlx_cache_compat import clone_layer
 
 logger = logging.getLogger(__name__)
 
@@ -2741,24 +2742,7 @@ class MLXMultimodalLM:
                 )
                 cached_prompt_cache = cache_entry.kv_cache
                 try:
-                    import copy
-
-                    prompt_cache = []
-                    for layer_cache in cached_prompt_cache:
-                        new_cache = copy.copy(layer_cache)
-                        if hasattr(layer_cache, "state"):
-                            state = layer_cache.state
-                            if state is not None:
-                                import mlx.core as mx
-
-                                if len(state) >= 2 and state[0] is not None:
-                                    new_cache.keys = mx.array(state[0])
-                                    new_cache.values = mx.array(state[1])
-                                    if len(state) >= 3:
-                                        new_cache.offset = state[2]
-                                    elif hasattr(layer_cache, "offset"):
-                                        new_cache.offset = layer_cache.offset
-                        prompt_cache.append(new_cache)
+                    prompt_cache = [clone_layer(c) for c in cached_prompt_cache]
                     skip_prompt_processing = True
                     logger.info(
                         f"[PREFIX CACHE] Skipping {prefix_match_len} token forward pass"
@@ -2805,46 +2789,15 @@ class MLXMultimodalLM:
             and prompt_cache
         ):
             try:
-                import copy
-
-                import mlx.core as mx
-
                 # Get prompt token count (before generation)
                 prompt_tokens_count = getattr(result, "prompt_tokens", 0)
 
                 # Deep copy the cache and trim to prompt tokens only
                 cache_to_store = []
                 for layer_cache in prompt_cache:
-                    new_cache = copy.copy(layer_cache)
-                    if hasattr(layer_cache, "state"):
-                        state = layer_cache.state
-                        if (
-                            state is not None
-                            and len(state) >= 2
-                            and state[0] is not None
-                        ):
-                            # Copy arrays
-                            keys = mx.array(state[0])
-                            values = mx.array(state[1])
-                            # Trim to prompt tokens only (not generated tokens)
-                            if (
-                                hasattr(layer_cache, "offset")
-                                and layer_cache.offset > prompt_tokens_count
-                            ):
-                                # For caches with offset tracking, slice to prompt length
-                                new_cache.keys = keys[:, :, :prompt_tokens_count, :]
-                                new_cache.values = values[:, :, :prompt_tokens_count, :]
-                                new_cache.offset = prompt_tokens_count
-                            else:
-                                new_cache.keys = keys
-                                new_cache.values = values
-                                if len(state) >= 3:
-                                    new_cache.offset = state[2]
-                                elif hasattr(layer_cache, "offset"):
-                                    new_cache.offset = min(
-                                        layer_cache.offset, prompt_tokens_count
-                                    )
-                    cache_to_store.append(new_cache)
+                    cache_to_store.append(
+                        clone_layer(layer_cache, max_tokens=prompt_tokens_count)
+                    )
 
                 self._cache_manager.store(
                     images=all_images,

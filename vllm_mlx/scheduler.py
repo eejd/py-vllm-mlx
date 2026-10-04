@@ -24,7 +24,7 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
-from .mlx_cache_compat import restore_from_state, snapshot_state
+from .mlx_cache_compat import copy_state, restore_from_state, snapshot_state
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
@@ -2747,10 +2747,10 @@ class Scheduler:
             # kept (and rejects the entry instead of storing an alias if it
             # cannot).
             for dst, src in zip(snapshot, raw_cache):
-                meta = getattr(src, "meta_state", None)
-                if meta is not None:
-                    dst.meta_state = meta
-                dst.state = src.state
+                # Per layer class, and child by child for CacheList: assigning
+                # a CacheList's state rebuilds its children by class name,
+                # which fails for model-defined child classes.
+                copy_state(dst, src)
             _t2 = _t.monotonic()
             logger.debug(
                 "[snapshot_timing] make=%.2fs mirror=%.2fs layers=%d",

@@ -240,3 +240,35 @@ class TestPagedPrefixCacheRoundTrip:
         scheduler = Scheduler.__new__(Scheduler)
         again = scheduler._reconstruct_cache_from_states(extracted)
         assert again is not None and again[0].offset == 8
+
+
+class TestCloneLayer:
+    def test_clone_cuts_the_padded_buffer(self):
+        src = _kv(lm_cache.KVCache)
+        clone = compat.clone_layer(src)
+        assert clone.keys.shape[2] == TOKENS  # not the 256-slot buffer
+        assert clone.offset == TOKENS
+        assert mx.array_equal(clone.keys, src.keys_and_values()[0])
+
+    def test_clone_trims_to_the_prompt(self):
+        clone = compat.clone_layer(_kv(lm_cache.KVCache), max_tokens=3)
+        assert clone.keys.shape[2] == clone.values.shape[2] == 3
+        assert clone.offset == 3
+
+    def test_clone_never_exceeds_what_is_cached(self):
+        clone = compat.clone_layer(_kv(lm_cache.KVCache), max_tokens=999)
+        assert clone.offset == TOKENS
+
+    def test_clone_does_not_alias_the_source_buffer(self):
+        src = _kv(lm_cache.KVCache)
+        clone = compat.clone_layer(src)
+        src.update_and_fetch(mx.ones((1, 1, 1, 8)), mx.ones((1, 1, 1, 8)))
+        assert clone.offset == TOKENS
+
+    def test_recurrent_clone_owns_its_array_list(self):
+        src = lm_cache.ArraysCache(1)
+        src[0] = mx.ones((1, 3))
+        clone = compat.clone_layer(src)
+        assert clone is not src and clone.cache is not src.cache
+        src[0] = mx.zeros((1, 3))  # the model overwrites the live state in place
+        assert mx.array_equal(clone.cache[0], mx.ones((1, 3)))
