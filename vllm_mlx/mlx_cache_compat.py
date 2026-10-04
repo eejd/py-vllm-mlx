@@ -1,0 +1,187 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Version-neutral access to prompt-cache layer state.
+
+Two cache contracts coexist in one vllm-mlx process, and neither can be told
+apart by looking at the mlx-lm version alone:
+
+* **legacy** -- mlx-vlm's own ``mlx_vlm.models.cache`` classes, and mlx-lm up to
+  0.31: ``meta_state`` exists, ``from_state(state, meta_state)`` takes two
+  arguments, and ``KVCache.state`` is the offset-sliced ``(keys, values)``.
+* **0.32** -- mlx-lm 0.32: no ``meta_state``, ``from_state(state)`` takes one
+  argument, and ``KVCache.state`` is the full ``(keys, values, offset)`` where
+  ``keys``/``values`` are the *padded* buffers (``keys.shape[2]`` is a
+  multiple of 256, not the token count).
+
+So every decision here is made per layer class, never per library version.
+The canonical form that leaves this module is the legacy one -- a
+``(state, meta_state)`` pair whose KV tensors are exactly ``offset`` tokens
+long -- because the paged prefix cache slices and concatenates it along the
+sequence axis. :func:`snapshot_state` and :func:`restore_from_state` are the
+only places that translate.
+"""
+
+from __future__ import annotations
+
+import functools
+import inspect
+from typing import Any
+
+# Cache layers whose valid KV region is ``keys[..., :offset, :]`` and that can
+# be rebuilt from a plain ``(keys, values)`` pair. Anything else (rotating,
+# quantized, chunked, recurrent, nested) round-trips through its own
+# ``state`` / ``from_state`` untouched.
+_PLAIN_KV_NAMES = frozenset({"KVCache", "ConcatenateKVCache", "BatchKVCache"})
+
+
+@functools.lru_cache(maxsize=None)
+def uses_meta_state(cls: type) -> bool:
+    """True if ``cls`` follows the legacy contract (``meta_state`` property)."""
+    return isinstance(getattr(cls, "meta_state", None), property)
+
+
+@functools.lru_cache(maxsize=None)
+def _from_state_arity(cls: type) -> int:
+    """Number of arguments ``cls.from_state`` takes after ``cls`` (0 if none)."""
+    fn = getattr(cls, "from_state", None)
+    if not callable(fn):
+        return 0
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return 0
+    return sum(
+        1
+        for p in params
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        and p.default is p.empty
+    )
+
+
+def is_plain_kv(layer: Any) -> bool:
+    """True for a single contiguous KV layer (not rotating/quantized/chunked)."""
+    return type(layer).__name__ in _PLAIN_KV_NAMES
+
+
+def kv_view(layer: Any) -> tuple[Any, Any] | None:
+    """The valid ``(keys, values)`` of a plain KV layer, or None.
+
+    "Valid" means exactly the cached tokens: the padded tail of the buffer
+    that mlx-lm 0.32 exposes through ``.state`` is not included. Returns None
+    for layers that are not a single contiguous KV region (rotating, recurrent,
+    nested, quantized) and for batch sizes other than one.
+    """
+    if not is_plain_kv(layer):
+        return None
+    keys = getattr(layer, "keys", None)
+    values = getattr(layer, "values", None)
+    if keys is None or values is None or not hasattr(keys, "shape"):
+        return None
+    if keys.shape[0] != 1:
+        return None
+    kav = getattr(layer, "keys_and_values", None)
+    if callable(kav):
+        return kav()
+    # Legacy contract: .state is already offset-sliced.
+    state = layer.state
+    if isinstance(state, (list, tuple)) and len(state) >= 2:
+        return state[0], state[1]
+    return None
+
+
+def snapshot_state(layer: Any) -> tuple[Any, Any]:
+    """Return the canonical ``(state, meta_state)`` of a cache layer.
+
+    ``meta_state`` is ``None`` for classes that do not have one. For a plain KV
+    layer the state is the exact-length ``(keys, values)`` pair with
+    ``meta_state == (str(offset),)`` on every contract, so the paged prefix
+    cache can slice it block by block.
+    """
+    cls = type(layer)
+    view = kv_view(layer)
+    if view is not None:
+        return (view[0], view[1]), (str(view[0].shape[2]),)
+    meta = layer.meta_state if uses_meta_state(cls) else None
+    return layer.state, meta
+
+
+def restore_from_state(cls: type, state: Any, meta_state: Any = None) -> Any:
+    """Rebuild a cache layer of ``cls`` from :func:`snapshot_state` output.
+
+    Raises ``TypeError`` when ``cls`` offers no way to take the state.
+    """
+    if cls.__name__ in _PLAIN_KV_NAMES and _is_kv_pair(state):
+        obj = _new_plain_kv(cls)
+        obj.keys, obj.values = state[0], state[1]
+        obj.offset = state[0].shape[2]
+        return obj
+    arity = _from_state_arity(cls)
+    if arity >= 2:
+        return cls.from_state(state, meta_state)
+    if arity == 1:
+        return cls.from_state(state)
+    raise TypeError(f"{cls.__name__} has no from_state")
+
+
+def _is_kv_pair(state: Any) -> bool:
+    return (
+        isinstance(state, (list, tuple))
+        and len(state) == 2
+        and all(hasattr(t, "shape") and len(t.shape) == 4 for t in state)
+    )
+
+
+def _new_plain_kv(cls: type) -> Any:
+    """A ``KVCache`` for any plain-KV class (a batch of one is a KVCache)."""
+    if cls.__name__ == "BatchKVCache":
+        from mlx_lm.models.cache import KVCache
+
+        return KVCache()
+    return cls()
+
+
+def recurrent_arrays(layer: Any) -> list[Any] | None:
+    """The state arrays of a recurrent (``ArraysCache``-style) layer, or None.
+
+    ``layer.cache`` is the list of arrays on every contract. ``.state`` is
+    not: in mlx-lm 0.32 it is ``(cache, left_padding, lengths)``.
+    """
+    inner = getattr(layer, "cache", None)
+    if isinstance(inner, list):
+        return inner
+    return None
+
+
+def set_recurrent_arrays(layer: Any, arrays: list[Any]) -> None:
+    """Replace the state arrays of a recurrent layer in place."""
+    layer.cache = list(arrays)
+
+
+def copy_state(dst: Any, src: Any) -> None:
+    """Make ``dst`` hold the same state as ``src`` (same class).
+
+    Nested containers are copied child by child. Assigning ``dst.state``
+    on a ``CacheList`` rebuilds its children through ``from_state`` by class
+    name, which raises ``KeyError`` for model-defined child classes.
+    """
+    children_src = getattr(src, "caches", None)
+    if children_src is not None:
+        for d, s in zip(dst.caches, children_src):
+            copy_state(d, s)
+        return
+    if uses_meta_state(type(src)):
+        dst.meta_state = src.meta_state
+    dst.state = src.state
+
+
+def prompt_cache_format() -> str:
+    """``"meta"`` for the legacy ``save_prompt_cache`` file layout, else ``"state-v2"``.
+
+    Persisted prompt caches written under one layout cannot be read under the
+    other, so the format is recorded with them and mismatches are discarded.
+    """
+    try:
+        from mlx_lm.models.cache import _BaseCache
+    except ImportError:
+        return "unknown"
+    return "meta" if uses_meta_state(_BaseCache) else "state-v2"
+
