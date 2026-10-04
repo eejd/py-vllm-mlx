@@ -1,4 +1,4 @@
-# Local patches carried on `eejd/integration`
+# Local patches carried on `main`
 
 This line is upstream `waybarrios/vllm-mlx` main plus the changes below. One row per local
 change: what it is, where it came from, its upstream status, and when we can drop it.
@@ -33,7 +33,7 @@ Base: upstream `80e7fde` (2026-10-03, 57 commits past v0.5.0).
 | Change | Disposition |
 |--------|-------------|
 | `--mllm` + continuous-batching guard (old main 547a4fa) | Upstream #601 closed unmerged: guard is incomplete because BatchedEngine auto-detects MLLM. Not carried |
-| MLLM tool metadata (36625e5), replayed tool-call arg normalization (77a7ad2) from old main | Not carried; verified covered by upstream #608/#611 code. The 14 regression tests from 77a7ad2 pass unchanged on this line, and the real Gemma 4 chat template renders identically with and without the `name` field 36625e5 also forwarded (the template never reads it). **Residual gap, not carried:** 36625e5 also forwarded `reasoning` and legacy `tool_responses`; the Gemma 4 template reads both (`reasoning` or `reasoning_content`; `tool_responses` is its legacy non-OpenAI assistant-embedded form), upstream's builder forwards only `reasoning_content`. Matters only for clients that send those field names (eejd/py-vllm-mlx#12) |
+| MLLM tool metadata (36625e5), replayed tool-call arg normalization (77a7ad2) from old main | Not carried; verified covered by upstream #608/#611 code. The 14 regression tests from 77a7ad2 pass unchanged on this line, and the real Gemma 4 chat template renders identically with and without the `name` field 36625e5 also forwarded (the template never reads it). **Residual gap, not carried:** 36625e5 also forwarded `reasoning` and legacy `tool_responses`; the Gemma 4 template reads both (`reasoning` or `reasoning_content`; `tool_responses` is its legacy non-OpenAI assistant-embedded form), upstream's builder forwards only `reasoning_content`. Matters only for clients that send those field names (eejd/py-vllm-mlx#14) |
 
 ## Known gaps on this line (measured; causes marked where not established)
 
