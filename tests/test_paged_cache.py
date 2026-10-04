@@ -163,6 +163,18 @@ class TestPagedCacheManager:
         # Block should be back in free queue
         assert manager.free_blocks == initial_free
 
+    def test_free_block_batch_is_callable_and_updates_free_count(self):
+        """Bulk release must not be shadowed by the free-block count property."""
+        from vllm_mlx.paged_cache import PagedCacheManager
+
+        manager = PagedCacheManager(block_size=64, max_blocks=10)
+        blocks = [manager.allocate_block(), manager.allocate_block()]
+        assert manager.free_blocks == 7
+
+        manager.free_block_batch(blocks)
+
+        assert manager.free_blocks == 9
+
     def test_reference_counting(self):
         """Test reference counting."""
         from vllm_mlx.paged_cache import PagedCacheManager
@@ -773,8 +785,8 @@ class TestBlockAwarePrefixCache:
         assert isinstance(reconstructed[1], ArraysCache)
         assert reconstructed[0].state[0].tolist() == kv_keys.tolist()
         assert reconstructed[0].state[1].tolist() == kv_values.tolist()
-        assert reconstructed[1].state[0].tolist() == linear_state[0].tolist()
-        assert reconstructed[1].state[1].tolist() == linear_state[1].tolist()
+        assert reconstructed[1].cache[0].tolist() == linear_state[0].tolist()
+        assert reconstructed[1].cache[1].tolist() == linear_state[1].tolist()
 
     def test_rejects_hybrid_prefix_without_boundary_snapshot(self):
         from mlx_lm.models.cache import ArraysCache, KVCache
@@ -904,9 +916,9 @@ class TestBlockAwarePrefixCache:
         # Reconstruct A: should use A's recurrent state (ones), not B's (twos)
         recon_a = cache.reconstruct_cache(bt_a)
         assert recon_a is not None
-        assert recon_a[1].state[0].tolist() == recurrent_a[0].tolist()
+        assert recon_a[1].cache[0].tolist() == recurrent_a[0].tolist()
 
         # Reconstruct B: should use B's recurrent state (twos)
         recon_b = cache.reconstruct_cache(bt_b)
         assert recon_b is not None
-        assert recon_b[1].state[0].tolist() == recurrent_b[0].tolist()
+        assert recon_b[1].cache[0].tolist() == recurrent_b[0].tolist()

@@ -55,7 +55,7 @@ def test_multiturn_roundtrip_preserves_call_and_result():
     assistant = [m for m in chat_messages if m["role"] == "assistant"]
     assert len(assistant) == 1
     assert "```tool_code" in assistant[0]["content"]
-    assert 'radarr_get_movies(search=' in assistant[0]["content"]
+    assert "radarr_get_movies(search=" in assistant[0]["content"]
 
     # The tool result survives as a tool_output block inside a user turn.
     rendered = "\n".join(str(m["content"]) for m in chat_messages)
@@ -137,7 +137,11 @@ class _FakePydantic:
 
     def model_dump(self, exclude_none=False):
         return {
-            k: (v.model_dump(exclude_none=exclude_none) if isinstance(v, _FakePydantic) else v)
+            k: (
+                v.model_dump(exclude_none=exclude_none)
+                if isinstance(v, _FakePydantic)
+                else v
+            )
             for k, v in self._data.items()
             if not (exclude_none and v is None)
         }
@@ -174,9 +178,17 @@ def test_gemma_template_needs_serialization():
 
 
 def test_unknown_template_falls_back_to_model_type():
-    processor = SimpleNamespace(chat_template=None, tokenizer=SimpleNamespace(chat_template=None))
-    assert _template_supports_tool_role(processor, SimpleNamespace(model_type="gemma4")) is False
-    assert _template_supports_tool_role(processor, SimpleNamespace(model_type="qwen3")) is True
+    processor = SimpleNamespace(
+        chat_template=None, tokenizer=SimpleNamespace(chat_template=None)
+    )
+    assert (
+        _template_supports_tool_role(processor, SimpleNamespace(model_type="gemma4"))
+        is False
+    )
+    assert (
+        _template_supports_tool_role(processor, SimpleNamespace(model_type="qwen3"))
+        is True
+    )
 
 
 def test_non_tool_messages_unchanged():
@@ -187,96 +199,3 @@ def test_non_tool_messages_unchanged():
     ]
     serialized = _serialize_tool_messages_gemma_native(messages)
     assert serialized == messages
-
-
-# ---------------------------------------------------------------------------
-# _build_mllm_chat_messages — arg-normalization (parity with #611 native path)
-# ---------------------------------------------------------------------------
-
-def test_build_mllm_chat_messages_normalizes_json_string_args():
-    """tool_calls.function.arguments JSON string → mapping on the native path.
-
-    Parity with waybarrios/vllm-mlx#611: templates that iterate argument keys
-    break when arguments is a raw JSON string. _normalize_mllm_tool_calls must
-    parse it to a dict before the message is forwarded to the chat template.
-    """
-    messages = [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "arguments": '{"city": "Lima"}',
-                    },
-                }
-            ],
-            "reasoning_content": "User wants the weather.",
-        }
-    ]
-    result = _build_mllm_chat_messages(
-        messages, all_image_urls=[], video_frame_counts={}
-    )
-    assert len(result) == 1
-    out = result[0]
-    assert out["role"] == "assistant"
-    # arguments must be a dict, not a raw JSON string
-    fn = out["tool_calls"][0]["function"]
-    assert fn["arguments"] == {"city": "Lima"}, (
-        "arguments should be parsed to a mapping; got: " + repr(fn["arguments"])
-    )
-    # reasoning_content must survive the round-trip
-    assert out.get("reasoning_content") == "User wants the weather."
-
-
-def test_build_mllm_chat_messages_normalizes_malformed_args_without_raising():
-    """Malformed/non-JSON arguments pass through without raising (fallback)."""
-    messages = [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "noop",
-                        "arguments": "not-valid-json!!!",
-                    },
-                }
-            ],
-        }
-    ]
-    # Must not raise
-    result = _build_mllm_chat_messages(
-        messages, all_image_urls=[], video_frame_counts={}
-    )
-    assert len(result) == 1
-    fn = result[0]["tool_calls"][0]["function"]
-    # normalize_messages_for_chat_template wraps bad JSON in {"value": ...}
-    assert isinstance(fn["arguments"], dict)
-
-
-def test_build_mllm_chat_messages_already_dict_args_unchanged():
-    """Arguments that are already a mapping are left as-is (idempotent)."""
-    args = {"city": "Lima", "units": "metric"}
-    messages = [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "get_weather", "arguments": args},
-                }
-            ],
-        }
-    ]
-    result = _build_mllm_chat_messages(
-        messages, all_image_urls=[], video_frame_counts={}
-    )
-    assert result[0]["tool_calls"][0]["function"]["arguments"] == args

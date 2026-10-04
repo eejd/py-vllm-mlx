@@ -228,6 +228,10 @@ def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():
     class _Tokenizer:
         clean_up_tokenization_spaces = False
 
+        def encode(self, text, **_kwargs):
+            # mlx-lm >= 0.32's NaiveStreamingDetokenizer probes encode("a ,b").
+            return [ord(char) for char in text]
+
         def decode(self, tokens):
             return "".join(str(token) for token in tokens)
 

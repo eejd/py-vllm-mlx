@@ -1,0 +1,373 @@
+# SPDX-License-Identifier: Apache-2.0
+"""mlx_cache_compat across the cache contracts that coexist in one process."""
+
+import mlx.core as mx
+import pytest
+from mlx_lm.models import cache as lm_cache
+
+from vllm_mlx import mlx_cache_compat as compat
+
+try:
+    from mlx_vlm.models import cache as vlm_cache
+except ImportError:  # pragma: no cover
+    vlm_cache = None
+
+TOKENS = 5
+
+# mlx-lm 0.32 dropped meta_state and exposes padded ``.state`` buffers; both
+# contracts are supported, so tests of 0.32-only behaviour are skipped on 0.31.
+LM_IS_032 = not compat.uses_meta_state(lm_cache._BaseCache)
+only_lm_032 = pytest.mark.skipif(not LM_IS_032, reason="mlx-lm 0.32 contract only")
+
+
+def _kv(cls, tokens=TOKENS):
+    c = cls()
+    k = mx.arange(tokens * 8, dtype=mx.float32).reshape(1, 1, tokens, 8)
+    c.update_and_fetch(k, k + 1000)
+    return c
+
+
+class _LegacyMetaKV:
+    """A 0.31-contract cache: meta_state property and two-argument from_state."""
+
+    def __init__(self):
+        self.keys = self.values = None
+        self.offset = 0
+
+    @property
+    def state(self):
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self.offset = self.keys.shape[2]
+
+    @property
+    def meta_state(self):
+        return (str(self.offset),)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset = int(v[0])
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls()
+        obj.keys, obj.values = state
+        obj.offset = int(meta_state[0])
+        return obj
+
+
+class TestContractDetection:
+    def test_installed_mlx_lm_contract_is_detected_from_the_class(self):
+        assert compat.uses_meta_state(lm_cache.KVCache) == hasattr(
+            lm_cache.KVCache, "meta_state"
+        )
+        arity = 1 if LM_IS_032 else 2
+        assert compat._from_state_arity(lm_cache.KVCache) == arity
+
+    def test_legacy_fake_has_meta_state(self):
+        assert compat.uses_meta_state(_LegacyMetaKV)
+        assert compat._from_state_arity(_LegacyMetaKV) == 2
+
+    @pytest.mark.skipif(vlm_cache is None, reason="mlx_vlm not installed")
+    def test_vlm_cache_follows_legacy_contract(self):
+        assert compat.uses_meta_state(vlm_cache.KVCache)
+        assert compat._from_state_arity(vlm_cache.KVCache) == 2
+
+
+class TestKVView:
+    def test_the_valid_tokens_are_returned(self):
+        k, v = compat.kv_view(_kv(lm_cache.KVCache))
+        assert k.shape[2] == v.shape[2] == TOKENS
+
+    @only_lm_032
+    def test_padded_buffer_is_cut_to_the_valid_tokens(self):
+        c = _kv(lm_cache.KVCache)
+        assert c.state[0].shape[2] > TOKENS  # the 0.32 buffer is padded
+        assert compat.kv_view(c)[0].shape[2] == TOKENS
+
+    def test_batch_kv_of_one(self):
+        b = lm_cache.BatchKVCache([0])
+        x = mx.ones((1, 1, TOKENS, 8))
+        b.update_and_fetch(x, x)
+        k, _ = compat.kv_view(b)
+        assert k.shape[2] == TOKENS
+
+    def test_batch_of_two_is_not_viewable(self):
+        b = lm_cache.BatchKVCache([0, 0])
+        x = mx.ones((2, 1, TOKENS, 8))
+        b.update_and_fetch(x, x)
+        assert compat.kv_view(b) is None
+
+    def test_non_plain_layers_have_no_view(self):
+        assert compat.kv_view(lm_cache.RotatingKVCache(max_size=16)) is None
+        assert compat.kv_view(lm_cache.ArraysCache(2)) is None
+
+    def test_empty_layer(self):
+        assert compat.kv_view(lm_cache.KVCache()) is None
+
+
+class TestSnapshotRestore:
+    def test_plain_kv_roundtrip_matches_original_tokens(self):
+        src = _kv(lm_cache.KVCache)
+        state, meta = compat.snapshot_state(src)
+        assert state[0].shape[2] == TOKENS
+        assert meta == (str(TOKENS),)
+        out = compat.restore_from_state(lm_cache.KVCache, state, meta)
+        assert out.offset == TOKENS
+        assert mx.array_equal(compat.kv_view(out)[0], compat.kv_view(src)[0])
+        assert mx.array_equal(compat.kv_view(out)[1], compat.kv_view(src)[1])
+
+    def test_batch_kv_restores_as_plain_kv(self):
+        b = lm_cache.BatchKVCache([0])
+        x = mx.ones((1, 1, TOKENS, 8))
+        b.update_and_fetch(x, x)
+        state, meta = compat.snapshot_state(b)
+        out = compat.restore_from_state(type(b), state, meta)
+        assert type(out) is lm_cache.KVCache
+        assert out.offset == TOKENS
+
+    def test_legacy_contract_layer_roundtrips(self):
+        src = _LegacyMetaKV()
+        src.state = (mx.ones((1, 1, TOKENS, 8)), mx.ones((1, 1, TOKENS, 8)))
+        state, meta = compat.snapshot_state(src)
+        out = compat.restore_from_state(_LegacyMetaKV, state, meta)
+        assert out.offset == TOKENS
+
+    @pytest.mark.skipif(vlm_cache is None, reason="mlx_vlm not installed")
+    def test_vlm_kv_roundtrip(self):
+        src = _kv(vlm_cache.KVCache)
+        state, meta = compat.snapshot_state(src)
+        assert state[0].shape[2] == TOKENS
+        out = compat.restore_from_state(vlm_cache.KVCache, state, meta)
+        assert out.offset == TOKENS
+
+    def test_recurrent_layer_roundtrips_through_its_own_state(self):
+        a = lm_cache.ArraysCache(2)
+        a[0] = mx.ones((1, 3))
+        a[1] = mx.zeros((1, 2))
+        state, meta = compat.snapshot_state(a)
+        out = compat.restore_from_state(lm_cache.ArraysCache, state, meta)
+        assert mx.array_equal(out.cache[0], a.cache[0])
+        assert mx.array_equal(out.cache[1], a.cache[1])
+
+    def test_class_without_from_state_raises(self):
+        class _Bare:
+            pass
+
+        with pytest.raises(TypeError):
+            compat.restore_from_state(_Bare, ())
+
+
+class TestRecurrentArrays:
+    def test_cache_list_is_the_array_list(self):
+        a = lm_cache.ArraysCache(2)
+        a[0] = mx.ones((1, 3))
+        assert compat.recurrent_arrays(a) is a.cache
+
+    @only_lm_032
+    def test_state_is_not_the_array_list_on_032(self):
+        a = lm_cache.ArraysCache(2)
+        assert len(a.state) == 3  # (cache, left_padding, lengths)
+
+    def test_kv_layer_has_none(self):
+        assert compat.recurrent_arrays(_kv(lm_cache.KVCache)) is None
+
+    def test_set_replaces_in_place(self):
+        a = lm_cache.ArraysCache(2)
+        compat.set_recurrent_arrays(a, [mx.ones((1, 1)), None])
+        assert a.cache[1] is None and a.cache[0].shape == (1, 1)
+
+
+class TestCopyState:
+    def test_plain_kv(self):
+        src, dst = _kv(lm_cache.KVCache), lm_cache.KVCache()
+        compat.copy_state(dst, src)
+        assert dst.offset == TOKENS
+
+    def test_cache_list_copies_children_without_rebuilding_them(self):
+        src = lm_cache.CacheList(_kv(lm_cache.KVCache), lm_cache.ArraysCache(1))
+        dst = lm_cache.CacheList(lm_cache.KVCache(), lm_cache.ArraysCache(1))
+        compat.copy_state(dst, src)
+        assert dst.caches[0].offset == TOKENS
+
+    def test_cache_list_with_a_model_defined_child(self):
+        class _ModelOwnedCache(lm_cache.KVCache):
+            """Not in mlx_lm.models.cache's namespace, so the CacheList state
+            setter (which looks classes up by name) cannot rebuild it."""
+
+        child = _kv(_ModelOwnedCache)
+        src = lm_cache.CacheList(child)
+        dst = lm_cache.CacheList(_ModelOwnedCache())
+        compat.copy_state(dst, src)
+        assert dst.caches[0].offset == TOKENS
+
+
+def test_prompt_cache_format_matches_installed_mlx_lm():
+    expected = "meta" if compat.uses_meta_state(lm_cache._BaseCache) else "state-v2"
+    assert compat.prompt_cache_format() == expected
+
+
+class TestPagedPrefixCacheRoundTrip:
+    """The paged prefix cache stored nothing for mlx-lm 0.32 layers: extraction
+    required ``meta_state``, which 0.32 caches no longer have, so every request
+    silently missed."""
+
+    def _scheduler_extract(self, layers):
+        from vllm_mlx.scheduler import Scheduler
+
+        return Scheduler._extract_cache_states(Scheduler.__new__(Scheduler), layers)
+
+    def test_extraction_is_not_empty_and_cuts_the_padded_buffer(self):
+        kv = _kv(lm_cache.KVCache)
+        extracted = self._scheduler_extract([kv])
+        assert len(extracted) == 1
+        state = extracted[0]["state"]
+        assert state[0].shape[2] == TOKENS  # not the 256-slot buffer
+
+    def test_store_and_reconstruct_hybrid_model(self):
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+        from vllm_mlx.scheduler import Scheduler
+
+        tokens = list(range(8))
+        kv = _kv(lm_cache.KVCache, tokens=8)
+        rec = lm_cache.ArraysCache(2)
+        rec[0] = mx.arange(6, dtype=mx.float32).reshape(1, 6)
+        rec[1] = mx.arange(4, dtype=mx.float32).reshape(1, 4)
+
+        extracted = self._scheduler_extract([kv, rec])
+        assert len(extracted) == 2
+
+        manager = PagedCacheManager(block_size=4, max_blocks=10)
+        prefix = BlockAwarePrefixCache(model=None, paged_cache_manager=manager)
+        table = prefix.store_cache("r1", tokens, extracted)
+        rebuilt = prefix.reconstruct_cache(table)
+
+        assert rebuilt is not None
+        assert rebuilt[0].offset == 8
+        assert mx.array_equal(compat.kv_view(rebuilt[0])[0], compat.kv_view(kv)[0])
+        assert mx.array_equal(rebuilt[1].cache[0], rec.cache[0])
+        assert mx.array_equal(rebuilt[1].cache[1], rec.cache[1])
+
+        scheduler = Scheduler.__new__(Scheduler)
+        again = scheduler._reconstruct_cache_from_states(extracted)
+        assert again is not None and again[0].offset == 8
+
+
+class TestCloneLayer:
+    def test_clone_cuts_the_padded_buffer(self):
+        src = _kv(lm_cache.KVCache)
+        clone = compat.clone_layer(src)
+        assert clone.keys.shape[2] == TOKENS  # not the 256-slot buffer
+        assert clone.offset == TOKENS
+        assert mx.array_equal(clone.keys, compat.kv_view(src)[0])
+
+    def test_clone_trims_to_the_prompt(self):
+        clone = compat.clone_layer(_kv(lm_cache.KVCache), max_tokens=3)
+        assert clone.keys.shape[2] == clone.values.shape[2] == 3
+        assert clone.offset == 3
+
+    def test_clone_never_exceeds_what_is_cached(self):
+        clone = compat.clone_layer(_kv(lm_cache.KVCache), max_tokens=999)
+        assert clone.offset == TOKENS
+
+    def test_clone_does_not_alias_the_source_buffer(self):
+        src = _kv(lm_cache.KVCache)
+        clone = compat.clone_layer(src)
+        src.update_and_fetch(mx.ones((1, 1, 1, 8)), mx.ones((1, 1, 1, 8)))
+        assert clone.offset == TOKENS
+
+    def test_recurrent_clone_owns_its_array_list(self):
+        src = lm_cache.ArraysCache(1)
+        src[0] = mx.ones((1, 3))
+        clone = compat.clone_layer(src)
+        assert clone is not src and clone.cache is not src.cache
+        src[0] = mx.zeros((1, 3))  # the model overwrites the live state in place
+        assert mx.array_equal(clone.cache[0], mx.ones((1, 3)))
+
+
+class TestRollbackSnapshot:
+    def test_recurrent_layer_is_restored_after_the_model_advances_it(self):
+        a = lm_cache.ArraysCache(2)
+        a[0] = mx.ones((1, 3))
+        a[1] = mx.full((1, 2), 5.0)
+        snap = compat.snapshot_for_rollback(a)
+        a[0] = mx.zeros((1, 3))  # the verify pass advances recurrent state
+        a[1] = mx.zeros((1, 2))
+        compat.restore_from_rollback(a, snap)
+        assert mx.array_equal(a.cache[0], mx.ones((1, 3)))
+        assert mx.array_equal(a.cache[1], mx.full((1, 2), 5.0))
+
+    def test_rotating_layer_is_restored_and_still_usable(self):
+        r = lm_cache.RotatingKVCache(max_size=16)
+        x = mx.ones((1, 1, 4, 8))
+        r.update_and_fetch(x, x)
+        before = int(r.offset)
+        snap = compat.snapshot_for_rollback(r)
+        r.update_and_fetch(x, x)
+        assert int(r.offset) != before
+        compat.restore_from_rollback(r, snap)
+        assert int(r.offset) == before
+        # The cursors must still be plain ints: mx.array scalars cannot slice,
+        # so the next decode step after a rollback would raise.
+        assert isinstance(r.offset, int)
+        assert isinstance(r.max_size, int)
+        r.update_and_fetch(mx.ones((1, 1, 1, 8)), mx.ones((1, 1, 1, 8)))
+        assert int(r.offset) == before + 1
+
+    def test_full_rotating_window_is_restored_and_still_usable(self):
+        """The case that reaches this path in practice: a full window is the
+        one that ``is_trimmable()`` reports False for."""
+        r = lm_cache.RotatingKVCache(max_size=4)
+        x = mx.ones((1, 1, 4, 8))
+        r.update_and_fetch(x, x)
+        assert not r.is_trimmable()
+        snap = compat.snapshot_for_rollback(r)
+        r.update_and_fetch(mx.ones((1, 1, 2, 8)), mx.ones((1, 1, 2, 8)))
+        compat.restore_from_rollback(r, snap)
+        r.update_and_fetch(mx.ones((1, 1, 1, 8)), mx.ones((1, 1, 1, 8)))
+
+    def test_cache_list_children_are_restored_individually(self):
+        kv = _kv(lm_cache.KVCache)
+        rec = lm_cache.ArraysCache(1)
+        rec[0] = mx.ones((1, 3))
+        cl = lm_cache.CacheList(kv, rec)
+        snap = compat.snapshot_for_rollback(cl)
+
+        kv.update_and_fetch(mx.ones((1, 1, 2, 8)), mx.ones((1, 1, 2, 8)))
+        rec[0] = mx.zeros((1, 3))
+        compat.restore_from_rollback(cl, snap)
+
+        assert cl.caches[0].offset == TOKENS
+        assert mx.array_equal(cl.caches[1].cache[0], mx.ones((1, 3)))
+
+    def test_quantized_layer_keeps_its_nested_structure(self):
+        q = lm_cache.QuantizedKVCache(group_size=64, bits=4)
+        x = mx.random.normal((1, 2, 8, 64))
+        q.update_and_fetch(x, x)
+        snap = compat.snapshot_for_rollback(q)
+        offset = q.offset
+        q.update_and_fetch(x, x)
+        compat.restore_from_rollback(q, snap)
+        assert q.offset == offset
+        q.update_and_fetch(x, x)
+
+
+def test_ssd_dispatch_routes_a_real_arrays_cache_to_the_arrays_serializer():
+    from vllm_mlx.ssd_cache import ArraysCacheSerializer, get_serializer_for_layer
+
+    a = lm_cache.ArraysCache(1)
+    a[0] = mx.ones((1, 3))
+    assert isinstance(get_serializer_for_layer(a), ArraysCacheSerializer)
+
+
+def test_arrays_cache_is_priced_once():
+    from vllm_mlx.memory_cache import estimate_kv_cache_memory
+
+    a = lm_cache.ArraysCache(1, left_padding=[0])
+    a[0] = mx.ones((1, 4))
+    mx.eval(a[0], a.left_padding)
+    assert estimate_kv_cache_memory([a]) == a[0].nbytes + a.left_padding.nbytes

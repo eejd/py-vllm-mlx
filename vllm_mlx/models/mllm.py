@@ -34,6 +34,7 @@ import requests
 
 from vllm_mlx.engine.chat_template_safety import normalize_messages_for_chat_template
 from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
+from vllm_mlx.mlx_cache_compat import clone_layer
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +248,9 @@ def _build_ordered_mllm_message_content(
             video_frame_count=remaining_video_frames,
         )
 
-    if role == "assistant":
+    # Text-only assistant turns stay strings for template compatibility, but
+    # image turns must retain their placeholders alongside the image payloads.
+    if role == "assistant" and not any(part["type"] == "image" for part in built_parts):
         text = "".join(text_parts)
         return text, bool(text)
 
@@ -259,8 +262,7 @@ def _normalize_mllm_tool_calls(tool_calls: list) -> list:
 
     Mirrors ``_normalize_tool_call_arguments_for_template`` in
     ``vllm_mlx/engine/batched.py``: JSON argument strings become mappings so
-    templates that iterate argument keys render correctly (parity with
-    waybarrios/vllm-mlx#611 on the native-template path).
+    templates that iterate argument keys render correctly.
     """
     plain_calls = [_normalize_content_part(call) for call in tool_calls]
     normalized = normalize_messages_for_chat_template(
@@ -288,28 +290,31 @@ def _build_mllm_chat_messages(
             all_image_urls=all_image_urls,
             video_frame_count=video_frame_counts.get(msg_idx, 0),
         )
-        # Preserve tool round-trip metadata so a tool-aware chat template (e.g. Gemma-4's
-        # native template, loaded by mlx-vlm >=0.6.3) can render assistant tool_calls and
-        # role:"tool" results. Without this, _template_supports_tool_role() returning True
-        # (the native path) silently drops tool state → repeated calls / rounds_exhausted.
-        out_msg: dict = {"role": role}
-        has_tool_meta = False
-        for key in ("tool_calls", "tool_call_id", "tool_responses", "name",
-                    "reasoning", "reasoning_content"):
-            if msg.get(key) is not None:
-                value = msg[key]
-                if key == "tool_calls" and isinstance(value, list) and value:
-                    value = _normalize_mllm_tool_calls(value)
-                out_msg[key] = value
-                if key in ("tool_calls", "tool_call_id", "tool_responses"):
-                    has_tool_meta = True
+        chat_message = {"role": role, "content": content}
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                # Keep tool-call turns even when text content is empty so
+                # templates render the assistant -> tool exchange (issue #608).
+                chat_message["tool_calls"] = _normalize_mllm_tool_calls(tool_calls)
+                reasoning_content = msg.get("reasoning_content")
+                if reasoning_content:
+                    chat_message["reasoning_content"] = reasoning_content
+                has_content = True
+        elif role == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                chat_message["tool_call_id"] = tool_call_id
+                # Tools may legitimately return empty output; keep the message
+                # anyway so the assistant tool_call still has its anchor and
+                # template forward-scans pair calls to responses (issue #608).
+                if not has_content:
+                    chat_message["content"] = ""
+                    has_content = True
+
         if has_content:
-            out_msg["content"] = content
-        elif role == "tool" or has_tool_meta:
-            out_msg["content"] = content  # keep the turn even when content is ""
-        else:
-            continue  # genuinely empty non-tool message — drop (unchanged behaviour)
-        chat_messages.append(out_msg)
+            chat_messages.append(chat_message)
     return chat_messages
 
 
@@ -442,11 +447,7 @@ def _template_supports_tool_role(processor: object, config: object) -> bool:
         tokenizer = getattr(processor, "tokenizer", None)
         template = getattr(tokenizer, "chat_template", None)
     if isinstance(template, str) and template:
-        return (
-            "tool_calls" in template
-            or "'tool'" in template
-            or '"tool"' in template
-        )
+        return "tool_calls" in template or "'tool'" in template or '"tool"' in template
     # Unknown template: assume support except for the Gemma family.
     model_type = str(getattr(config, "model_type", "") or "").lower()
     return "gemma" not in model_type
@@ -472,6 +473,139 @@ class MLLMOutput:
     completion_tokens: int = 0
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+
+
+def _chunk_text(chunk) -> str:
+    return chunk.text if hasattr(chunk, "text") else str(chunk)
+
+
+def _generation_kwargs_with_stop(
+    kwargs: dict,
+    stop: list[str] | None,
+) -> dict:
+    if not stop:
+        return kwargs
+    generation_kwargs = dict(kwargs)
+    generation_kwargs["stop"] = stop
+    return generation_kwargs
+
+
+def _until_stop_sequence(chunks, stop: list[str] | None):
+    if not stop:
+        yield from chunks
+        return
+
+    accumulated_text = ""
+    for chunk in chunks:
+        accumulated_text += _chunk_text(chunk)
+        yield chunk
+        if any(stop_seq in accumulated_text for stop_seq in stop):
+            break
+
+
+def _stream_mllm_generated_outputs(
+    *,
+    stream_generate_fn,
+    model,
+    processor,
+    formatted_prompt: str,
+    images,
+    audio,
+    max_tokens: int,
+    temperature: float,
+    prompt_cache,
+    draft_kwargs: dict,
+    generation_kwargs: dict,
+    stop: list[str] | None,
+    draft_metrics,
+):
+    token_count = 0
+    last_chunk = None
+    chunks = stream_generate_fn(
+        model,
+        processor,
+        formatted_prompt,
+        images,
+        audio=audio,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        prompt_cache=prompt_cache,
+        **draft_kwargs,
+        **generation_kwargs,
+    )
+    for chunk in _until_stop_sequence(chunks, stop):
+        last_chunk = chunk
+        token_count += 1
+        yield MLLMOutput(
+            text=_chunk_text(chunk),
+            finish_reason=None,
+            prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+            completion_tokens=token_count,
+        )
+
+    yield MLLMOutput(
+        text="",
+        finish_reason="stop",
+        prompt_tokens=getattr(last_chunk, "prompt_tokens", 0) if last_chunk else 0,
+        completion_tokens=token_count,
+        **draft_metrics(),
+    )
+
+
+def load_assistant_drafter(model_path: str):
+    """Load an mlx-vlm assistant/MTP drafter for speculative decoding.
+
+    Dispatches by the drafter checkpoint's own ``config.json`` ``model_type``
+    (via ``mlx_vlm.utils.load_model``, the same generic loader mlx-vlm uses
+    for its own regular models) instead of assuming a single fixed
+    architecture. This covers the MTP drafter families mlx-vlm ships under
+    ``mlx_vlm.speculative.drafters`` (``gemma4_assistant``, ``qwen3_5_mtp``,
+    ``deepseek_v4_mtp``, ...) with one code path. Other speculative modes such
+    as Eagle3 and DFlash require generation paths vllm-mlx does not expose yet.
+
+    Deliberately uses ``load_model`` rather than ``mlx_vlm.utils.load``:
+    standalone assistant/MTP drafters are small predictor heads, not
+    full checkpoints, and typically don't ship their own tokenizer/processor
+    files (they reuse the target model's) — ``load`` would additionally try
+    to load a processor and fail or misbehave for such a checkpoint.
+    """
+    path = Path(model_path)
+    config_path = path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Assistant drafter config not found: {config_path}")
+    if not sorted(path.glob("*.safetensors")):
+        raise FileNotFoundError(f"Assistant drafter weights not found: {path}")
+
+    try:
+        from mlx_vlm.speculative.drafters import resolve_drafter_kind
+        from mlx_vlm.utils import load_model
+    except ImportError as exc:
+        raise ImportError(
+            "Assistant/MTP drafter support requires mlx-vlm to be installed."
+        ) from exc
+
+    try:
+        mlx_vlm_version = version("mlx-vlm")
+    except PackageNotFoundError:
+        mlx_vlm_version = "unknown"
+
+    model_type = json.loads(config_path.read_text(encoding="utf-8")).get("model_type")
+    resolved_kind = resolve_drafter_kind(path)
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Assistant drafter model_type={model_type!r} requires draft kind "
+            f"{resolved_kind!r}; vllm-mlx currently supports only 'mtp'."
+        )
+    logger.info(
+        "Loading %s assistant drafter from %s using mlx-vlm %s",
+        model_type or "unknown-architecture",
+        model_path,
+        mlx_vlm_version,
+    )
+
+    model = load_model(path)
+    model.eval()
+    return model
 
 
 def load_gemma4_assistant_drafter(model_path: str):
@@ -515,6 +649,128 @@ def load_gemma4_assistant_drafter(model_path: str):
     model.load_weights(list(weights.items()))
     mx.eval(model.parameters())
     model.eval()
+    return model
+
+
+class MTPDrafterLoadError(RuntimeError):
+    """Raised when a registered MTP drafter architecture is unavailable."""
+
+
+_GEMMA4_ASSISTANT_MODEL_TYPES = {
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+}
+
+
+def _read_mtp_drafter_model_type(config_path: Path) -> str:
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid MTP drafter config JSON: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"MTP drafter config must be a JSON object: {config_path}")
+
+    candidates = [config.get("model_type"), config.get("speculators_model_type")]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        candidates.append(text_config.get("model_type"))
+
+    model_types = [
+        value.strip().casefold()
+        for value in candidates
+        if isinstance(value, str) and value.strip()
+    ]
+    drafter_types = {
+        model_type
+        for model_type in model_types
+        if model_type.endswith("_mtp") or model_type in _GEMMA4_ASSISTANT_MODEL_TYPES
+    }
+    if len(drafter_types) > 1:
+        raise ValueError(
+            f"MTP drafter config has conflicting model types: {config_path}"
+        )
+    if drafter_types:
+        return drafter_types.pop()
+    if model_types:
+        return model_types[0]
+    raise ValueError(f"MTP drafter config has no valid model_type: {config_path}")
+
+
+def _resolve_mtp_drafter_path(path_or_repo: str) -> Path:
+    path = Path(path_or_repo)
+    if path.exists():
+        return path
+    try:
+        from mlx_vlm.utils import get_model_path
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "Resolving an MTP drafter repository requires mlx-vlm"
+        ) from exc
+    return Path(get_model_path(path_or_repo))
+
+
+def load_mtp_drafter(model_path: str, target_model=None):
+    """Load a local or Hugging Face MTP drafter without assuming Gemma layout."""
+    resolved_path = _resolve_mtp_drafter_path(model_path)
+    config_path = resolved_path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"MTP drafter config not found: {config_path}")
+    model_type = _read_mtp_drafter_model_type(config_path)
+    if model_type in _GEMMA4_ASSISTANT_MODEL_TYPES:
+        model = load_gemma4_assistant_drafter(str(resolved_path))
+        if target_model is not None:
+            try:
+                from mlx_vlm.speculative.drafters import (
+                    validate_drafter_compatibility,
+                )
+            except ImportError:
+                # Preserve compatibility with mlx-vlm releases that predate
+                # the shared validator; this is the existing Gemma loader.
+                pass
+            else:
+                validate_drafter_compatibility(target_model, model, "mtp")
+        return model
+
+    try:
+        from mlx_vlm.speculative.drafters import load_drafter
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+
+    logger.info(
+        "Loading registered MTP drafter model_type=%s from %s",
+        model_type,
+        resolved_path,
+    )
+    try:
+        loaded = load_drafter(str(resolved_path), kind="mtp", lazy=False)
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+    if not isinstance(loaded, tuple) or len(loaded) != 2:
+        raise ValueError("mlx-vlm load_drafter() must return (model, resolved_kind)")
+    model, resolved_kind = loaded
+    if model is None:
+        raise ValueError("mlx-vlm load_drafter() returned no model")
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Configured MTP drafter resolved to unsupported kind {resolved_kind!r}"
+        )
+    if target_model is not None:
+        try:
+            from mlx_vlm.speculative.drafters import (
+                validate_drafter_compatibility,
+            )
+        except ImportError as exc:
+            raise MTPDrafterLoadError(
+                "This MTP drafter requires an mlx-vlm build with the registered "
+                f"{model_type!r} architecture."
+            ) from exc
+        validate_drafter_compatibility(target_model, model, resolved_kind)
     return model
 
 
@@ -817,7 +1073,9 @@ def _download_media(
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
 
-    logger.info(f"Downloading {media_type} from: {url}")
+    # URLs may contain credentials or signed query parameters. Keep request
+    # targets out of normal logs while retaining useful operation context.
+    logger.info("Downloading remote %s", media_type)
 
     try:
         head_response = _request_with_safe_redirects(
@@ -1040,6 +1298,106 @@ def process_audio_input(audio: str | dict) -> str:
         return audio
 
     raise ValueError(f"Cannot process audio: {audio[:50]}...")
+
+
+def _video_has_audio_track(video_path: str) -> bool:
+    """Return True if ffprobe finds an audio stream in the video."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffprobe"):
+        return True  # assume yes; extraction will fail loudly if not
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-loglevel",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                video_path,
+            ],
+            capture_output=True,
+            timeout=30,
+            text=True,
+        )
+        return bool(r.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        return True
+
+
+def _model_has_sound_encoder(model) -> bool:
+    """Whether a loaded model exposes a usable sound encoder.
+
+    Uses ``getattr(..., None) is not None`` rather than ``hasattr`` so model
+    wrappers that declare ``sound_encoder`` in ``__init__`` but leave it as
+    ``None`` until the first encoder pass are correctly treated as not yet
+    enabled. A bare ``hasattr`` check would spuriously enable A/V fusion
+    against a missing encoder and crash the processor downstream.
+    """
+    return getattr(model, "sound_encoder", None) is not None
+
+
+def extract_audio_from_video(video_path: str) -> str | None:
+    """Extract the audio track from a video file as 16 kHz mono WAV.
+
+    Returns the path to the WAV (registered with the temp manager so it's
+    cleaned up automatically), or None if the video has no audio or ffmpeg
+    is unavailable.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        logger.warning(
+            "ffmpeg not found; cannot fuse audio from video_url. "
+            "Install ffmpeg to enable A/V fusion on omni models."
+        )
+        return None
+    if not _video_has_audio_track(video_path):
+        return None
+
+    fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="vllmmlx_va_")
+    os.close(fd)
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                out_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=600,
+        )
+        if r.returncode != 0 or os.path.getsize(out_path) == 0:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            return None
+        return _temp_manager.register(out_path)
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.warning(f"Audio extraction from video failed: {e}")
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        return None
 
 
 # Cache for base64 images to avoid re-saving the same image
@@ -1279,6 +1637,7 @@ class MLXMultimodalLM:
         draft_model: str | None = None,
         draft_kind: str | None = None,
         draft_block_size: int | None = None,
+        default_draft_enabled: bool = False,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -1300,6 +1659,7 @@ class MLXMultimodalLM:
         self.draft_model_path = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
+        self.default_draft_enabled = default_draft_enabled
 
         self.model = None
         self.processor = None
@@ -1307,6 +1667,7 @@ class MLXMultimodalLM:
         self._draft_model = None
         self._loaded = False
         self._video_native = False
+        self._video_native_with_audio = False
 
         # Initialize MLLM prefix cache manager (with vision embedding caching)
         self._cache_manager: MLLMPrefixCacheManager | None = None
@@ -1334,9 +1695,20 @@ class MLXMultimodalLM:
             self._video_native = hasattr(
                 self.model.config, "video_token_id"
             ) or hasattr(self.model.config, "video_token_index")
+            # Omni models expose a sound_encoder; for these, a video_url
+            # without a paired audio_url should auto-extract the video's
+            # audio track so the model can fuse A/V in one forward pass.
+            # Decoupled from _video_native because some omni models (e.g.
+            # Nemotron-H Omni) don't expose video_token_id at config level
+            # and run through the frames-as-images fallback path.
+            self._video_native_with_audio = _model_has_sound_encoder(self.model)
             logger.info(f"MLLM loaded successfully: {self.model_name}")
             if self._video_native:
                 logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
+            if self._video_native_with_audio:
+                logger.info(
+                    "Omni model detected: video_url will auto-extract audio for A/V fusion"
+                )
 
         except ImportError:
             raise ImportError(
@@ -1349,7 +1721,7 @@ class MLXMultimodalLM:
 
     def _load_draft_model(self):
         if self.draft_kind == "mtp":
-            return load_gemma4_assistant_drafter(self.draft_model_path)
+            return load_mtp_drafter(self.draft_model_path, target_model=self.model)
 
         from mlx_vlm.utils import load
 
@@ -1357,15 +1729,15 @@ class MLXMultimodalLM:
         return draft_model
 
     def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
-        """Return mlx-vlm drafter kwargs when the request explicitly opts in.
+        """Return mlx-vlm drafter kwargs when the request enables the drafter.
 
         ``call_kwargs`` is the outbound mlx-vlm kwargs dict. This method removes
         vllm-mlx drafter control keys before the dict is forwarded so caller
         passthrough values cannot conflict with the configured server drafter.
         """
-        draft_requested = False
+        draft_requested = self.default_draft_enabled
         if call_kwargs is not None:
-            draft_requested = bool(call_kwargs.pop("mllm_draft", False))
+            draft_requested = bool(call_kwargs.pop("mllm_draft", draft_requested))
             for key in _DRAFT_KWARG_NAMES:
                 call_kwargs.pop(key, None)
         if not draft_requested or self._draft_model is None:
@@ -1429,31 +1801,18 @@ class MLXMultimodalLM:
 
     def _prepare_images(self, images: list) -> list[str]:
         """Process remote/base64 image inputs into local temp file paths."""
-        processed = []
-        for img in images:
-            try:
-                path = process_image_input(img)
-                processed.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to process image: {e}")
-        return processed
+        return [process_image_input(image) for image in images]
 
     def _prepare_audio(self, audio_inputs: list) -> list[str]:
         """Process audio inputs and return local file paths."""
-        processed = []
-        for audio_input in audio_inputs:
-            try:
-                path = process_audio_input(audio_input)
-                processed.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to process audio: {e}")
-        return processed
+        return [process_audio_input(audio_input) for audio_input in audio_inputs]
 
     def _prepare_video(
         self,
         video_input: str | dict,
         fps: float = DEFAULT_FPS,
         max_frames: int = MAX_FRAMES,
+        resolved_path: str | None = None,
     ) -> list[str]:
         """
         Process video input and extract frames.
@@ -1467,12 +1826,16 @@ class MLXMultimodalLM:
             video_input: Video in any supported format
             fps: Frames per second to extract
             max_frames: Maximum frames to extract
+            resolved_path: Optional pre-resolved local path. Callers that
+                already ran process_video_input (e.g. for parallel audio
+                extraction) pass it here to avoid re-downloading / re-decoding.
 
         Returns:
             List of paths to extracted frame images
         """
-        # Process video input (download if URL, decode if base64)
-        video_path = process_video_input(video_input)
+        # Reuse caller's resolved path when supplied; otherwise resolve here
+        # (downloads if URL, decodes if base64).
+        video_path = resolved_path or process_video_input(video_input)
 
         # Extract frames
         frames = extract_video_frames_smart(
@@ -1594,14 +1957,32 @@ class MLXMultimodalLM:
             native_messages, return_video_kwargs=True
         )
 
+        # Collect audio paths emitted by the translation step
+        # (explicit audio_url, or auto-extracted from video_url for omni
+        # models).
+        audio_inputs: list[str] = []
+        for nmsg in native_messages:
+            ncontent = nmsg.get("content", [])
+            if not isinstance(ncontent, list):
+                continue
+            for nitem in ncontent:
+                if isinstance(nitem, dict) and nitem.get("type") == "audio":
+                    apath = nitem.get("audio")
+                    if apath:
+                        audio_inputs.append(apath)
+
         # Process through HF processor to get input_ids, pixel_values, grid_thw
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
+        # and (for omni models) sound_clips / input_features.
+        processor_kwargs: dict = {
+            "text": [text],
+            "images": image_inputs,
+            "videos": video_inputs,
+            "padding": True,
+            "return_tensors": "pt",
+        }
+        if audio_inputs:
+            processor_kwargs["audio"] = audio_inputs
+        inputs = self.processor(**processor_kwargs)
 
         input_ids = mx.array(inputs["input_ids"])
         pixel_values = inputs.get(
@@ -1616,6 +1997,26 @@ class MLXMultimodalLM:
             gen_kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
         if inputs.get("image_grid_thw", None) is not None:
             gen_kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+
+        # Forward audio embeddings/clips from the processor so the omni
+        # model's sound encoder gets fed alongside the visual stream.
+        for audio_key in (
+            "sound_clips",
+            "input_features",
+            "feature_attention_mask",
+            "audio_feature_lengths",
+            "sound_feature_lengths",
+            "sound_attention_mask",
+        ):
+            val = inputs.get(audio_key, None)
+            if val is not None:
+                gen_kwargs[audio_key] = val
+        if audio_inputs:
+            logger.info(
+                f"Native video: forwarding audio ({len(audio_inputs)} clip(s)) "
+                f"to omni model via "
+                f"{[k for k in gen_kwargs if k in ('sound_clips', 'input_features')]}"
+            )
 
         gen_kwargs["input_ids"] = input_ids
         gen_kwargs["pixel_values"] = pixel_values
@@ -1700,6 +2101,24 @@ class MLXMultimodalLM:
                 translated.append({"role": role, "content": str(content)})
                 continue
 
+            # Pre-pass: does this message have an explicit audio_url/audio
+            # block? If so, we skip auto-extracting audio from a video_url to
+            # honor the caller's explicit choice.
+            has_explicit_audio = False
+            for item in content:
+                if hasattr(item, "model_dump"):
+                    probe = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    probe = {k: v for k, v in item.dict().items() if v is not None}
+                else:
+                    probe = item
+                if isinstance(probe, dict) and probe.get("type", "") in (
+                    "audio",
+                    "audio_url",
+                ):
+                    has_explicit_audio = True
+                    break
+
             new_content = []
             for item in content:
                 if hasattr(item, "model_dump"):
@@ -1758,6 +2177,35 @@ class MLXMultimodalLM:
                             "max_frames": video_max_frames,
                         }
                     )
+                    # For omni-capable models, pull the video's audio track
+                    # alongside frames so the model can fuse A/V in one
+                    # forward pass. We extract from the already-resolved local
+                    # path (no raw user URL handed to ffmpeg → avoids URL-
+                    # protocol SSRF via ffmpeg's network demuxers).
+                    if not has_explicit_audio and getattr(
+                        self, "_video_native_with_audio", False
+                    ):
+                        extracted = extract_audio_from_video(video_path)
+                        if extracted is not None:
+                            new_content.append({"type": "audio", "audio": extracted})
+
+                elif item_type in ("audio", "audio_url"):
+                    if item_type == "audio_url":
+                        aud_url = item.get("audio_url", {})
+                        if isinstance(aud_url, str):
+                            audio_source = aud_url
+                        elif isinstance(aud_url, dict):
+                            audio_source = aud_url.get("url", "")
+                        else:
+                            continue
+                    else:
+                        audio_source = item.get("audio", item.get("url", ""))
+
+                    if not audio_source:
+                        continue
+
+                    audio_path = process_audio_input(audio_source)
+                    new_content.append({"type": "audio", "audio": audio_path})
 
                 else:
                     new_content.append(item)
@@ -1897,7 +2345,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
@@ -2021,7 +2469,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             **self._draft_generation_kwargs(kwargs),
             **kwargs,
         ):
@@ -2104,18 +2552,50 @@ class MLXMultimodalLM:
 
         # Fallback: extract frames and treat as individual images
         _msg_video_frame_counts: dict[int, int] = {}
+        _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
         all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
+            has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
             for vid_input in vid_inputs:
+                # Resolve the video to a local path ONCE per input. Both
+                # audio extraction (when this is an omni model with no
+                # explicit audio block) and frame extraction need a local
+                # file; resolving twice would re-download remote URLs and
+                # re-decode base64. Resolving up front also keeps user-
+                # supplied raw URLs out of ffmpeg's URL-protocol demuxers
+                # (avoids SSRF via http://, rtsp://, etc.).
+                try:
+                    resolved_video_path = process_video_input(vid_input)
+                except Exception as exc:
+                    logger.warning(f"Could not resolve video: {exc}")
+                    resolved_video_path = None
+
+                if (
+                    resolved_video_path
+                    and self._video_native_with_audio
+                    and not has_explicit_audio
+                ):
+                    extracted_audio = extract_audio_from_video(resolved_video_path)
+                    if extracted_audio:
+                        _msg_extra_audio.setdefault(msg_idx, []).append(extracted_audio)
+
                 frames = self._prepare_video(
-                    vid_input, fps=video_fps, max_frames=video_max_frames
+                    vid_input,
+                    fps=video_fps,
+                    max_frames=video_max_frames,
+                    resolved_path=resolved_video_path,
                 )
                 all_video_frames.extend(frames)
                 total_frames += len(frames)
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
+
+        # Merge auto-extracted audio into the per-message audio map so the
+        # chat-template token-counting loop downstream sees the right count.
+        for msg_idx, extra in _msg_extra_audio.items():
+            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
 
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
@@ -2258,24 +2738,7 @@ class MLXMultimodalLM:
                 )
                 cached_prompt_cache = cache_entry.kv_cache
                 try:
-                    import copy
-
-                    prompt_cache = []
-                    for layer_cache in cached_prompt_cache:
-                        new_cache = copy.copy(layer_cache)
-                        if hasattr(layer_cache, "state"):
-                            state = layer_cache.state
-                            if state is not None:
-                                import mlx.core as mx
-
-                                if len(state) >= 2 and state[0] is not None:
-                                    new_cache.keys = mx.array(state[0])
-                                    new_cache.values = mx.array(state[1])
-                                    if len(state) >= 3:
-                                        new_cache.offset = state[2]
-                                    elif hasattr(layer_cache, "offset"):
-                                        new_cache.offset = layer_cache.offset
-                        prompt_cache.append(new_cache)
+                    prompt_cache = [clone_layer(c) for c in cached_prompt_cache]
                     skip_prompt_processing = True
                     logger.info(
                         f"[PREFIX CACHE] Skipping {prefix_match_len} token forward pass"
@@ -2303,7 +2766,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             verbose=False,
             prompt_cache=prompt_cache,
             skip_prompt_processing=skip_prompt_processing,
@@ -2322,46 +2785,15 @@ class MLXMultimodalLM:
             and prompt_cache
         ):
             try:
-                import copy
-
-                import mlx.core as mx
-
                 # Get prompt token count (before generation)
                 prompt_tokens_count = getattr(result, "prompt_tokens", 0)
 
                 # Deep copy the cache and trim to prompt tokens only
                 cache_to_store = []
                 for layer_cache in prompt_cache:
-                    new_cache = copy.copy(layer_cache)
-                    if hasattr(layer_cache, "state"):
-                        state = layer_cache.state
-                        if (
-                            state is not None
-                            and len(state) >= 2
-                            and state[0] is not None
-                        ):
-                            # Copy arrays
-                            keys = mx.array(state[0])
-                            values = mx.array(state[1])
-                            # Trim to prompt tokens only (not generated tokens)
-                            if (
-                                hasattr(layer_cache, "offset")
-                                and layer_cache.offset > prompt_tokens_count
-                            ):
-                                # For caches with offset tracking, slice to prompt length
-                                new_cache.keys = keys[:, :, :prompt_tokens_count, :]
-                                new_cache.values = values[:, :, :prompt_tokens_count, :]
-                                new_cache.offset = prompt_tokens_count
-                            else:
-                                new_cache.keys = keys
-                                new_cache.values = values
-                                if len(state) >= 3:
-                                    new_cache.offset = state[2]
-                                elif hasattr(layer_cache, "offset"):
-                                    new_cache.offset = min(
-                                        layer_cache.offset, prompt_tokens_count
-                                    )
-                    cache_to_store.append(new_cache)
+                    cache_to_store.append(
+                        clone_layer(layer_cache, max_tokens=prompt_tokens_count)
+                    )
 
                 self._cache_manager.store(
                     images=all_images,
@@ -2446,6 +2878,7 @@ class MLXMultimodalLM:
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
+        stop = kwargs.pop("stop", None)
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
         # Honor chat_template_kwargs on the MLLM path (parity with the text path in
@@ -2487,18 +2920,43 @@ class MLXMultimodalLM:
 
         # Fallback: frames as images
         _msg_video_frame_counts: dict[int, int] = {}
+        _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
         all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
+            has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
             for vid_input in vid_inputs:
+                # Resolve once; reused for audio extraction and frame prep.
+                # See the matching block in chat() for rationale.
+                try:
+                    resolved_video_path = process_video_input(vid_input)
+                except Exception as exc:
+                    logger.warning(f"Could not resolve video: {exc}")
+                    resolved_video_path = None
+
+                if (
+                    resolved_video_path
+                    and self._video_native_with_audio
+                    and not has_explicit_audio
+                ):
+                    extracted_audio = extract_audio_from_video(resolved_video_path)
+                    if extracted_audio:
+                        _msg_extra_audio.setdefault(msg_idx, []).append(extracted_audio)
+
                 frames = self._prepare_video(
-                    vid_input, fps=video_fps, max_frames=video_max_frames
+                    vid_input,
+                    fps=video_fps,
+                    max_frames=video_max_frames,
+                    resolved_path=resolved_video_path,
                 )
                 all_video_frames.extend(frames)
                 total_frames += len(frames)
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
+
+        for msg_idx, extra in _msg_extra_audio.items():
+            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
 
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
@@ -2589,41 +3047,22 @@ class MLXMultimodalLM:
                 prompt_cache = None
 
         # Stream generate tokens with cache
-        accumulated_text = ""
-        token_count = 0
         draft_accept_start = self._reset_draft_metrics()
-
-        for chunk in stream_generate(
-            self.model,
-            self.processor,
-            formatted_prompt,
-            all_images if all_images else None,
+        generation_kwargs = _generation_kwargs_with_stop(kwargs, stop)
+        yield from _stream_mllm_generated_outputs(
+            stream_generate_fn=stream_generate,
+            model=self.model,
+            processor=self.processor,
+            formatted_prompt=formatted_prompt,
+            images=all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             prompt_cache=prompt_cache,
-            **self._draft_generation_kwargs(kwargs),
-            **kwargs,
-        ):
-            token_count += 1
-            # chunk is a GenerationResult with .text attribute containing the new token
-            new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-            accumulated_text += new_text
-
-            yield MLLMOutput(
-                text=new_text,  # Just the new token for streaming
-                finish_reason=None,
-                prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                completion_tokens=token_count,
-            )
-
-        # Final yield with finish_reason
-        yield MLLMOutput(
-            text="",
-            finish_reason="stop",
-            prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
-            completion_tokens=token_count,
-            **self._draft_metrics_since(draft_accept_start),
+            draft_kwargs=self._draft_generation_kwargs(generation_kwargs),
+            generation_kwargs=generation_kwargs,
+            stop=stop,
+            draft_metrics=lambda: self._draft_metrics_since(draft_accept_start),
         )
 
     def describe_image(

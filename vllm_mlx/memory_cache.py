@@ -25,12 +25,24 @@ Example:
 from __future__ import annotations
 
 import bisect
+import copy
 import logging
 import math
 import threading
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
+from .mlx_cache_compat import prompt_cache_format, recurrent_arrays
+
+
+def is_text_only_prefix_cache_request(request: Any) -> bool:
+    """Return whether a request can safely use the token-only prefix cache."""
+    return (
+        bool(getattr(request, "is_text_only", False))
+        and getattr(request, "input_ids", None) is not None
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +50,9 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
-_MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
 # Bump this when the cache on-disk format or KV semantics change.
 # Loading a cache with a different version is rejected automatically.
-_CACHE_PERSIST_VERSION = 3
+_CACHE_PERSIST_VERSION = 4
 
 
 def _get_available_memory() -> int:
@@ -88,6 +99,25 @@ def _array_memory(arr) -> int:
     return 0
 
 
+def _nested_array_memory(value: Any) -> int:
+    """Sum ``_array_memory`` over an arbitrarily nested state structure.
+
+    Cache ``state`` payloads are not always a flat ``(keys, values)`` pair:
+    CacheList yields a list of sub-cache states and PoolingCache yields
+    ``(buf_kv, buf_gate, pooled)`` with possible ``None`` members. Unpacking
+    those as two values raised, was swallowed, and the entry was accounted as
+    zero bytes — so the dashboard showed 0% cache memory and, far worse, the
+    byte-based LRU eviction never fired for such models.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, dict):
+        return sum(_nested_array_memory(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_nested_array_memory(v) for v in value)
+    return _array_memory(value)
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -111,10 +141,10 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
         # Handle different cache object types
         # Check dict first since dicts have .keys() method that would match below
         if isinstance(layer_cache, dict) and "state" in layer_cache:
-            # Extracted state dict
-            keys, values = layer_cache["state"]
-            total_bytes += _array_memory(keys)
-            total_bytes += _array_memory(values)
+            # Extracted state dict.  The payload may be a flat (keys, values)
+            # pair or an arbitrarily nested container/mapping — walk it
+            # recursively like the .state-property branch below.
+            total_bytes += _nested_array_memory(layer_cache["state"])
         # Handle QuantizedKVCache: keys/values are tuples of (data, scales, biases)
         elif hasattr(layer_cache, "keys") and isinstance(
             getattr(layer_cache, "keys", None), (list, tuple)
@@ -124,23 +154,55 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
             for arr in layer_cache.values:
                 total_bytes += _array_memory(arr)
             continue
+        elif hasattr(layer_cache, "caches") and isinstance(
+            getattr(layer_cache, "caches", None), (list, tuple)
+        ):
+            # Container caches (CacheList): price the children the same way
+            # storage snapshots them — recursively, per child class.  Walking
+            # the container's .state instead would price sliced views while
+            # detachment copies the children's raw buffers.
+            total_bytes += estimate_kv_cache_memory(list(layer_cache.caches))
+        elif (
+            hasattr(layer_cache, "keys")
+            and hasattr(layer_cache, "values")
+            and not callable(getattr(layer_cache, "keys", None))
+        ):
+            # keys/values-carrying caches (KVCache, RotatingKVCache,
+            # ChunkedKVCache, batch variants).  Price the RAW buffers: that
+            # is exactly what detachment copies.  Pricing the offset-sliced
+            # .state view here under-counts ring/chunked layers whose padded
+            # buffer cannot be sliced without breaking their semantics —
+            # measured 20-30% resident-vs-accounted drift, enough to breach
+            # the byte cap.
+            total_bytes += _array_memory(layer_cache.keys)
+            total_bytes += _array_memory(layer_cache.values)
+            # Batch variants carry per-row metadata arrays (offset is an
+            # mx.array there); detachment copies them, so price them too.
+            for attr in ("left_padding", "lengths", "offset"):
+                extra = getattr(layer_cache, attr, None)
+                if extra is not None and hasattr(extra, "shape"):
+                    total_bytes += _array_memory(extra)
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
-            # Cache with state property returning (keys, values)
+            # Stateful caches without keys/values (ArraysCache, MambaCache).
+            # Walk the state recursively: the payload may nest containers or
+            # mappings, and the old two-way unpack silently measured those
+            # as 0.
+            # Recurrent layers are priced from their array list: on mlx-lm 0.32
+            # ``.state`` is ``(cache, left_padding, lengths)``, which would
+            # count the metadata arrays here and again below.
             try:
-                keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
+                arrays = recurrent_arrays(layer_cache)
+                total_bytes += _nested_array_memory(
+                    arrays if arrays is not None else layer_cache.state
+                )
             except (TypeError, ValueError):
                 pass
-        elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
-            # Standard KVCache with keys/values attributes (not dict)
-            keys_attr = layer_cache.keys
-            values_attr = layer_cache.values
-            # Ensure these are arrays, not methods
-            if not callable(keys_attr):
-                total_bytes += _array_memory(keys_attr)
-            if not callable(values_attr):
-                total_bytes += _array_memory(values_attr)
+            # Detachment also copies these metadata arrays on state-carrying
+            # layers; price them so accounting equals snapshot residency.
+            for attr in ("left_padding", "lengths"):
+                extra = getattr(layer_cache, attr, None)
+                if extra is not None and hasattr(extra, "shape"):
+                    total_bytes += _array_memory(extra)
 
     return total_bytes
 
@@ -219,6 +281,10 @@ class CacheStats:
     current_memory_bytes: int = 0
     max_memory_bytes: int = 0
     entry_count: int = 0
+    # Entries refused by store() (over-limit, undetachable, or pipeline
+    # failure).  Fail-closed trades a leak for a cache miss; this makes
+    # those misses observable instead of silent.
+    store_rejections: int = 0
 
     @property
     def hit_rate(self) -> float:
@@ -242,6 +308,7 @@ class CacheStats:
             "max_memory_mb": round(self.max_memory_bytes / _BYTES_PER_MB, 2),
             "memory_utilization": round(self.memory_utilization, 4),
             "entry_count": self.entry_count,
+            "store_rejections": self.store_rejections,
         }
 
 
@@ -252,16 +319,52 @@ class _CacheEntry:
     tokens: tuple[int, ...]
     cache: list[Any]
     memory_bytes: int
+    auxiliary: dict[str, Any] | None = None
 
     @classmethod
-    def create(cls, tokens: list[int], cache: list[Any]) -> _CacheEntry:
+    def create(
+        cls,
+        tokens: list[int],
+        cache: list[Any],
+        auxiliary: dict[str, Any] | None = None,
+    ) -> _CacheEntry:
         """Create a cache entry with memory estimation."""
         memory = estimate_kv_cache_memory(cache)
+        if auxiliary:
+            memory += sum(getattr(value, "nbytes", 0) for value in auxiliary.values())
         return cls(
             tokens=tuple(tokens),
             cache=cache,
             memory_bytes=memory,
+            auxiliary=auxiliary,
         )
+
+
+def _is_cache_layer_trimmable(layer_cache: Any) -> bool:
+    """Return whether a cache layer can safely be rewound for partial reuse."""
+    if isinstance(layer_cache, _QuantizedCacheWrapper):
+        if "max_size" in layer_cache.orig_attrs:
+            return False
+        return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
+
+    # _trim_cache_offset does not currently rewind container children.
+    if hasattr(layer_cache, "caches"):
+        return False
+
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    if callable(is_trimmable):
+        try:
+            return bool(is_trimmable())
+        except Exception:
+            logger.debug(
+                "Failed to check cache layer trimmability for %s",
+                type(layer_cache).__name__,
+                exc_info=True,
+            )
+            return False
+
+    # Compatibility fallback for simple KV-like cache implementations.
+    return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
 
 
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
@@ -449,8 +552,11 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
     """Trim KV arrays to their actual used size (offset) before storage.
 
     KV arrays are often pre-allocated larger than needed (e.g. 4096 slots
-    when only 100 are used).  This slices them down to ``offset`` and
-    evaluates the result so the original large buffer can be freed.
+    when only 100 are used).  This slices them down to ``offset`` LAZILY:
+    the slices materialize in ``_detach_cache_for_storage``'s single
+    batched eval, and only for entries the size preflight has accepted.
+    Evaluating here would defeat the preflight — a rejected over-limit
+    entry would still incur an entry-sized allocation.
 
     Args:
         cache: List of cache layer objects (KVCache or other types).
@@ -462,11 +568,9 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
     if not any(_needs_kv_trim(layer) for layer in cache):
         return cache
 
-    import mlx.core as mx
     from mlx_lm.models.cache import KVCache
 
     trimmed = []
-    eval_targets = []
     for layer in cache:
         if isinstance(layer, KVCache) and layer.keys is not None:
             offset = layer.offset
@@ -477,15 +581,286 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
             tc.keys = layer.keys[:, :, :offset, :]
             tc.values = layer.values[:, :, :offset, :]
             tc.offset = offset
-            eval_targets.extend([tc.keys, tc.values])
             trimmed.append(tc)
         else:
             trimmed.append(layer)
 
-    if eval_targets:
-        mx.eval(*eval_targets)
-
     return trimmed
+
+
+class UndetachableCacheError(Exception):
+    """Raised when a cache entry cannot be safely detached for storage.
+
+    ``store()`` treats this as a rejection: storing the entry by reference
+    would reintroduce the aliasing / lazy-graph retention leak, so the safe
+    response is to not store it at all (a skipped store costs one cache
+    miss; a leaked store pins live batch buffers until eviction).
+    """
+
+
+def _bears_arrays(value: Any, _seen: set[int] | None = None) -> bool:
+    """True if ``value`` (object or nested container) holds any array,
+    duck-typed as having both ``shape`` and ``dtype``.  Used to decide
+    whether an unrecognized cache layer is safe to pass through unchanged
+    (nothing to pin) or must fail the store (unknown retention risk)."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return False
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return True
+    if _seen is None:
+        _seen = set()
+    if id(value) in _seen:
+        return False
+    _seen.add(id(value))
+    if isinstance(value, dict):
+        return any(_bears_arrays(v, _seen) for v in value.values())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_bears_arrays(v, _seen) for v in value)
+    # Object attributes: instance dict plus any __slots__ up the MRO.
+    # vars() (not dir()) so properties are never executed here.
+    attrs = list(vars(value).values()) if hasattr(value, "__dict__") else []
+    for klass in type(value).__mro__:
+        slots = getattr(klass, "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if hasattr(value, name):
+                attrs.append(getattr(value, name))
+    return any(_bears_arrays(v, _seen) for v in attrs)
+
+
+def _collect_mx_array_ids(
+    value: Any, mx: Any, out: set[int], _seen: set[int] | None = None
+) -> None:
+    """Collect ``id()`` of every real ``mx.array`` reachable from ``value``.
+
+    Same traversal as ``_bears_arrays`` (containers, instance dicts,
+    ``__slots__``; properties are never executed).  Only genuine MLX arrays
+    are collected: duck-typed array-likes pass through detachment by
+    reference deliberately and must not trip the identity postcondition."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return
+    if isinstance(value, mx.array):
+        out.add(id(value))
+        return
+    if _seen is None:
+        _seen = set()
+    if id(value) in _seen:
+        return
+    _seen.add(id(value))
+    if isinstance(value, dict):
+        for v in value.values():
+            _collect_mx_array_ids(v, mx, out, _seen)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for v in value:
+            _collect_mx_array_ids(v, mx, out, _seen)
+        return
+    attrs = list(vars(value).values()) if hasattr(value, "__dict__") else []
+    for klass in type(value).__mro__:
+        slots = getattr(klass, "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if hasattr(value, name):
+                attrs.append(getattr(value, name))
+    for v in attrs:
+        _collect_mx_array_ids(v, mx, out, _seen)
+
+
+def _detach_cache_for_storage(
+    cache: list[Any], _eval_targets: list[Any] | None = None
+) -> list[Any]:
+    """Materialize and detach cache arrays before storage.
+
+    Per-request caches handed to ``store()`` are built from lazy slices of
+    live batch arrays (``extract_cache`` / ``_trim_cache_offset``), and
+    hybrid layers such as ``ArraysCache`` expose their mutable state
+    container by reference via ``.state``.  Storing those references has two
+    failure modes:
+
+    - the stored entry aliases containers/buffers the batch generator keeps
+      mutating (same class of bug as the SimpleEngine snapshot aliasing,
+      #575), and
+    - unevaluated arrays retain their entire lazy computation graph, pinning
+      every upstream batch-wide buffer.  Under sustained traffic this leaks
+      Metal buffer handles roughly proportional to generated tokens per
+      stored entry, until the process hits the device resource limit
+      (``[metal::malloc] Resource limit (N) exceeded``) and aborts.
+
+    Force a compact, evaluated copy of every MLX array so the stored entry owns
+    exactly its own data and nothing else.
+
+    Fail-closed: raises ``UndetachableCacheError`` if any layer cannot be
+    safely snapshotted — either an unrecognized layer type that carries
+    arrays, or a recognized layer whose snapshot fails.  Array-free unknown
+    layers pass through unchanged (nothing to pin).
+    """
+    try:
+        import mlx.core as mx
+    except ImportError:
+        # No-MLX environments (e.g. the CI unit-test lane) have no MLX
+        # arrays to materialize; container/attribute snapshotting below
+        # still applies, arrays pass through _detach unchanged.
+        mx = None
+
+    # Recursive calls (CacheList children) share the caller's target list
+    # so the whole entry still materializes in one batched eval.
+    is_root = _eval_targets is None
+    eval_targets: list[Any] = [] if is_root else _eval_targets
+
+    def _detach(arr: Any) -> Any:
+        # Only real MLX arrays are detached: they alone carry a lazy graph
+        # and Metal buffers.  Duck-typed array-likes (test doubles, numpy)
+        # have nothing to pin and pass through unchanged.
+        if mx is None or not isinstance(arr, mx.array):
+            return arr
+        # ``arr + 0`` guarantees a freshly allocated buffer.  mx.contiguous
+        # is documented to copy only when necessary and may share the input
+        # buffer for an already-row-contiguous input, which would let the
+        # stored snapshot alias live storage.  ``+ 0`` promotes bool to
+        # int32, so cast back — the cast reads the already-fresh buffer, the
+        # allocation guarantee holds either way.
+        out = arr + 0
+        if out.dtype != arr.dtype:
+            out = out.astype(arr.dtype)
+        eval_targets.append(out)
+        return out
+
+    def _detach_container(value: Any) -> Any:
+        if isinstance(value, tuple):
+            return tuple(_detach_container(v) for v in value)
+        if isinstance(value, list):
+            return [_detach_container(v) for v in value]
+        if isinstance(value, dict):
+            # Nested mapping state (e.g. {"ssm": array}) — rebuild the
+            # mapping so the snapshot owns its container, preserving the
+            # mapping type.  A mapping type whose constructor rejects an
+            # iterable of pairs raises and fails the store closed.
+            return type(value)((k, _detach_container(v)) for k, v in value.items())
+        if (
+            value is not None
+            and not (hasattr(value, "shape") and hasattr(value, "dtype"))
+            and _bears_arrays(value)
+        ):
+            # A non-array object (or unsupported container, e.g. a set)
+            # smuggling arrays inside a state payload: copying around it
+            # would alias whatever it holds.  Fail closed.
+            raise UndetachableCacheError(
+                f"state payload holds arrays inside an unsupported "
+                f"{type(value).__name__}"
+            )
+        return _detach(value)
+
+    def _detach_layer(layer: Any) -> Any:
+        if layer is None:
+            return layer
+        if isinstance(layer, dict):
+            if "state" in layer:
+                snap_dict = dict(layer)
+                snap_dict["state"] = _detach_container(layer["state"])
+                rest = {k: v for k, v in snap_dict.items() if k != "state"}
+                if _bears_arrays(rest):
+                    raise UndetachableCacheError(
+                        "dict layer carries arrays outside its 'state' field"
+                    )
+                return snap_dict
+            if _bears_arrays(layer):
+                raise UndetachableCacheError(
+                    "dict layer without 'state' carries arrays"
+                )
+            return layer
+        # copy.copy (not __new__ + __dict__.update) so classes using
+        # __slots__ (e.g. _QuantizedCacheWrapper) snapshot correctly too.
+        if hasattr(layer, "keys") and not callable(getattr(layer, "keys")):
+            # KVCache / RotatingKVCache / _QuantizedCacheWrapper style.
+            snap = copy.copy(layer)
+            snap.keys = _detach_container(layer.keys)
+            snap.values = _detach_container(layer.values)
+            # Batch variants also carry per-row metadata arrays that the
+            # batch generator rebinds (offset is an mx.array there).
+            for attr in ("left_padding", "lengths", "offset"):
+                extra = getattr(snap, attr, None)
+                if extra is not None and hasattr(extra, "shape"):
+                    setattr(snap, attr, _detach(extra))
+            return snap
+        if hasattr(layer, "caches") and isinstance(
+            getattr(layer, "caches"), (list, tuple)
+        ):
+            # Container caches (e.g. ``CacheList``): their ``state`` setter
+            # writes through to the child caches in place, so going through
+            # the setter would mutate the caller's children.  Snapshot the
+            # children recursively instead.
+            snap = copy.copy(layer)
+            children = _detach_cache_for_storage(
+                list(layer.caches), _eval_targets=eval_targets
+            )
+            snap.caches = (
+                tuple(children) if isinstance(layer.caches, tuple) else children
+            )
+            return snap
+        if hasattr(layer, "state"):
+            # Hybrid state-container layers (e.g. ``ArraysCache``): ``.state``
+            # returns the live mutable list — clone the container and detach
+            # its arrays instead of aliasing it.
+            snap = copy.copy(layer)
+            snap.state = _detach_container(layer.state)
+            for attr in ("left_padding", "lengths"):
+                if getattr(snap, attr, None) is not None:
+                    setattr(snap, attr, _detach(getattr(snap, attr)))
+            return snap
+        if _bears_arrays(layer):
+            raise UndetachableCacheError(
+                f"unrecognized cache layer type {type(layer).__name__} "
+                "carries arrays"
+            )
+        return layer
+
+    detached: list[Any] = []
+    for layer in cache:
+        try:
+            detached.append(_detach_layer(layer))
+        except UndetachableCacheError:
+            raise
+        except Exception as e:
+            raise UndetachableCacheError(
+                f"failed to snapshot {type(layer).__name__}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+
+    if is_root and mx is not None:
+        # Verified postcondition, not assumed branch coverage: no MLX array
+        # in the snapshot may be the same object as one in the live input.
+        # Branch dispatch above is heuristic (every mlx_lm ``_BaseCache``
+        # subclass inherits a default ``state`` property returning ``[]``,
+        # so the state branch matches layers whose arrays live elsewhere
+        # and would "detach" an empty state, aliasing the rest).  Checking
+        # object identity after the fact closes that hole for any layer
+        # shape, present or future.
+        live_ids: set[int] = set()
+        snap_ids: set[int] = set()
+        for layer in cache:
+            _collect_mx_array_ids(layer, mx, live_ids)
+        for layer in detached:
+            _collect_mx_array_ids(layer, mx, snap_ids)
+        if live_ids & snap_ids:
+            raise UndetachableCacheError(
+                "snapshot still aliases live cache arrays (layer carries "
+                "arrays its state/keys view does not expose)"
+            )
+
+    if is_root and eval_targets:
+        try:
+            mx.eval(*eval_targets)
+        except Exception as e:
+            # e.g. stream-affinity RuntimeError when arrays belong to a
+            # stream whose thread has exited.  store() must reject, not
+            # raise — several call sites have no enclosing try.
+            raise UndetachableCacheError(
+                f"failed to materialize snapshot: {type(e).__name__}: {e}"
+            ) from e
+
+    return detached
 
 
 class _QuantizedCacheWrapper:
@@ -679,12 +1054,18 @@ class MemoryAwarePrefixCache:
         self._max_memory = self._config.compute_memory_limit()
         self._current_memory = 0
         self._memory_lock = threading.RLock()
+        # Serializes the entry-sized snapshot copy in store().  Separate
+        # from _memory_lock so accounting stays responsive during the GPU
+        # copy, while concurrent stores still materialize one at a time —
+        # N simultaneous entry-sized copies would multiply peak memory by N.
+        self._copy_lock = threading.Lock()
 
         # Statistics
         self._stats = CacheStats(max_memory_bytes=self._max_memory)
 
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
+        self._last_matched_key: tuple[int, ...] | None = None
 
         # Optional SSD cold tier (set via set_ssd_tier())
         self._ssd_tier = None
@@ -703,8 +1084,10 @@ class MemoryAwarePrefixCache:
         matches, and longest-common-prefix (LCP) matches.  Uses a sorted key
         index for O(log N) lookup instead of scanning all entries.
 
-        Returns the cached KV state directly (no copy) since MLX arrays
-        are immutable and safe to share.
+        Returns the independently owned stored state directly. Callers must
+        clone its cache wrappers before replay because some MLX cache buffers
+        support in-place updates even though the stored backing is detached
+        from the request that created it.
 
         Args:
             tokens: Input token sequence.
@@ -714,6 +1097,7 @@ class MemoryAwarePrefixCache:
             - cache: Cached KV state if found, None otherwise
             - remaining_tokens: Tokens that still need processing
         """
+        self._last_matched_key = None
         if not tokens:
             self._stats.misses += 1
             self._last_match_type = "miss"
@@ -732,6 +1116,7 @@ class MemoryAwarePrefixCache:
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
             self._last_match_type = "exact"
+            self._last_matched_key = tokens_key
             cache_out = (
                 _dequantize_cache(entry.cache)
                 if self._config.kv_quantize
@@ -792,8 +1177,7 @@ class MemoryAwarePrefixCache:
             excess = n_cached - n_requested
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_super.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_super.cache
             )
 
             if excess > 0 and has_non_trimmable:
@@ -807,6 +1191,7 @@ class MemoryAwarePrefixCache:
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
+                self._last_matched_key = best_super.tokens
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
                     if self._config.kv_quantize
@@ -818,6 +1203,7 @@ class MemoryAwarePrefixCache:
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
+                self._last_matched_key = best_super.tokens
                 cache_out = (
                     _dequantize_cache(best_super.cache)
                     if self._config.kv_quantize
@@ -832,6 +1218,7 @@ class MemoryAwarePrefixCache:
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             self._last_match_type = "prefix"
+            self._last_matched_key = best_match.tokens
             cache_out = (
                 _dequantize_cache(best_match.cache)
                 if self._config.kv_quantize
@@ -886,8 +1273,7 @@ class MemoryAwarePrefixCache:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_lcp_entry.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_lcp_entry.cache
             )
             logger.debug(
                 f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "
@@ -916,6 +1302,7 @@ class MemoryAwarePrefixCache:
                     f"trimmed={excess} remaining={len(remaining)}"
                 )
                 self._last_match_type = "lcp"
+                self._last_matched_key = best_lcp_entry.tokens
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
                     if self._config.kv_quantize
@@ -928,50 +1315,38 @@ class MemoryAwarePrefixCache:
 
         return None, tokens
 
-    def store(
-        self, tokens: list[int], cache: list[Any], evict_prefixes: bool = True
-    ) -> bool:
-        """
-        Store KV cache for future reuse.
+    def prepare_store(
+        self,
+        tokens: list[int],
+        cache: list[Any],
+        auxiliary: dict[str, Any] | None = None,
+    ) -> _CacheEntry | None:
+        """Detach and account an entry without publishing it.
 
-        This method stores the cache reference directly (no copy) and
-        tracks memory usage. If memory limit is exceeded, LRU entries
-        are evicted until there's room.
-
-        Args:
-            tokens: Token sequence that was processed.
-            cache: The computed KV cache to store.
-            evict_prefixes: If True, evict existing entries whose token
-                sequence is a strict prefix of ``tokens``.  Set to False
-                when storing prompt+output entries to preserve prompt-only
-                entries created by prompt_cache_save (those are the entries
-                that future requests will actually match).
-
-        Returns:
-            True if stored successfully, False if rejected.
+        Hybrid recurrent caches cannot be rewound after generation starts,
+        while ordinary ``KVCache`` buffers are updated in place.  Callers can
+        therefore prepare an immutable entry at the exact prefill boundary,
+        continue the request, and publish that already-detached entry only
+        after the remaining prefill succeeds.
         """
         if not tokens or not cache:
-            return False
+            return None
         if len(tokens) < self._config.min_prefix_tokens:
             logger.debug(
                 "[cache_store] skipped short prefix: tokens=%s min_prefix_tokens=%s",
                 len(tokens),
                 self._config.min_prefix_tokens,
             )
-            return False
+            return None
 
+        tokens_key = tuple(tokens)
         with self._memory_lock:
-            tokens_key = tuple(tokens)
+            existing = self._entries.get(tokens_key)
+            if existing is not None:
+                return existing
 
-            # If already cached, just update LRU order (skip expensive trim/quantize)
-            if tokens_key in self._entries:
-                self._entries.move_to_end(tokens_key)
-                return True
-
-            # Trim oversized KV arrays to actual used size
+        try:
             cache = _trim_to_offset(cache)
-
-            # Quantize if enabled and sequence is long enough
             if (
                 self._config.kv_quantize
                 and len(tokens) >= self._config.kv_min_quantize_tokens
@@ -979,69 +1354,167 @@ class MemoryAwarePrefixCache:
                 cache = _quantize_cache(
                     cache, self._config.kv_bits, self._config.kv_group_size
                 )
-
-            # Create entry and estimate memory
-            entry = _CacheEntry.create(tokens, cache)
-
-            # Check if single entry exceeds limit
-            if entry.memory_bytes > self._max_memory:
+            projected_bytes = estimate_kv_cache_memory(cache)
+            if projected_bytes > self._max_memory:
+                self._stats.store_rejections += 1
                 logger.warning(
-                    f"Cache entry too large: {entry.memory_bytes / _BYTES_PER_MB:.1f}MB "
+                    f"Cache entry too large: "
+                    f"{projected_bytes / _BYTES_PER_MB:.1f}MB "
                     f"exceeds limit {self._max_memory / _BYTES_PER_MB:.1f}MB"
                 )
-                return False
+                return None
 
-            # Prefix-subset eviction: remove entries whose token sequence
-            # is a strict prefix of the new entry.  Uses sorted index for
-            # O(log N + K) lookup instead of O(N) scan.
-            if evict_prefixes and self._sorted_keys:
-                to_remove = []
-                idx = bisect.bisect_left(self._sorted_keys, tokens_key)
-                # Scan backwards — prefixes of tokens_key are immediately before idx
-                for i in range(idx - 1, -1, -1):
-                    key = self._sorted_keys[i]
-                    klen = len(key)
-                    if klen >= len(tokens_key):
-                        continue
-                    if tokens_key[:klen] == key:
-                        to_remove.append(key)
-                    elif key[0] != tokens_key[0]:
-                        break
-                for key in to_remove:
-                    old = self._entries.pop(key)
-                    self._current_memory -= old.memory_bytes
-                    self._stats.evictions += 1
-                    self._remove_from_sorted(key)
-                    logger.debug(
-                        f"[prefix_evict] removed {len(key)} tokens, "
-                        f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
-                        f"new_entry={len(tokens_key)} tokens"
+            with self._copy_lock:
+                cache = _detach_cache_for_storage(cache)
+                detached_auxiliary = None
+                if auxiliary:
+                    import mlx.core as mx
+
+                    detached_auxiliary = {
+                        key: value + 0 if isinstance(value, mx.array) else value
+                        for key, value in auxiliary.items()
+                    }
+                    mx.eval(
+                        *(
+                            value
+                            for value in detached_auxiliary.values()
+                            if isinstance(value, mx.array)
+                        )
                     )
-                if to_remove:
-                    self._stats.entry_count = len(self._entries)
-                    self._stats.current_memory_bytes = self._current_memory
+            entry = _CacheEntry.create(tokens, cache, detached_auxiliary)
+            if entry.memory_bytes > self._max_memory:
+                self._stats.store_rejections += 1
+                logger.warning(
+                    "Cache entry too large after auxiliary accounting: "
+                    "%.1fMB exceeds limit %.1fMB",
+                    entry.memory_bytes / _BYTES_PER_MB,
+                    self._max_memory / _BYTES_PER_MB,
+                )
+                return None
+            return entry
+        except UndetachableCacheError as e:
+            self._stats.store_rejections += 1
+            logger.warning("[cache_store] rejecting entry: %s", e)
+            return None
+        except Exception as e:
+            self._stats.store_rejections += 1
+            logger.warning("[cache_store] rejecting entry: %s: %s", type(e).__name__, e)
+            return None
 
-            # Evict until we have room
-            while (
-                self._current_memory + entry.memory_bytes > self._max_memory
-                or len(self._entries) >= self._config.max_entries
-            ) and self._entries:
-                self._evict_lru()
+    def commit_prepared(
+        self,
+        entry: _CacheEntry,
+        evict_prefixes: bool = True,
+        *,
+        commit_lock: Any = None,
+        commit_guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Atomically publish an entry returned by :meth:`prepare_store`.
 
-            # Store entry
-            self._entries[tokens_key] = entry
-            self._current_memory += entry.memory_bytes
-            bisect.insort(self._sorted_keys, tokens_key)
-            self._stats.entry_count = len(self._entries)
-            self._stats.current_memory_bytes = self._current_memory
+        ``commit_lock`` is acquired inside ``_memory_lock``. Callers must not
+        call cache methods while holding the caller-supplied ``commit_lock``.
+        """
+        tokens_key = entry.tokens
+        commit_context = commit_lock if commit_lock is not None else nullcontext()
+        try:
+            with self._memory_lock, commit_context:
+                if commit_guard is not None and not commit_guard():
+                    return False
+                if entry.memory_bytes > self._max_memory:
+                    self._stats.store_rejections += 1
+                    logger.warning(
+                        "[cache_store] rejecting oversized prepared entry: "
+                        "%.1fMB exceeds limit %.1fMB",
+                        entry.memory_bytes / _BYTES_PER_MB,
+                        self._max_memory / _BYTES_PER_MB,
+                    )
+                    return False
+                if tokens_key in self._entries:
+                    self._entries.move_to_end(tokens_key)
+                    return True
+
+                if evict_prefixes and self._sorted_keys:
+                    to_remove = []
+                    idx = bisect.bisect_left(self._sorted_keys, tokens_key)
+                    for i in range(idx - 1, -1, -1):
+                        key = self._sorted_keys[i]
+                        klen = len(key)
+                        if klen >= len(tokens_key):
+                            continue
+                        if tokens_key[:klen] == key:
+                            to_remove.append(key)
+                        elif key[0] != tokens_key[0]:
+                            break
+                    for key in to_remove:
+                        old = self._entries.pop(key)
+                        self._current_memory -= old.memory_bytes
+                        self._stats.evictions += 1
+                        self._remove_from_sorted(key)
+                        logger.debug(
+                            "[prefix_evict] removed %s tokens, freed %.2fMB, "
+                            "new_entry=%s tokens",
+                            len(key),
+                            old.memory_bytes / _BYTES_PER_MB,
+                            len(tokens_key),
+                        )
+
+                while (
+                    self._current_memory + entry.memory_bytes > self._max_memory
+                    or len(self._entries) >= self._config.max_entries
+                ) and self._entries:
+                    self._evict_lru()
+
+                self._entries[tokens_key] = entry
+                self._current_memory += entry.memory_bytes
+                bisect.insort(self._sorted_keys, tokens_key)
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
+        except Exception as e:
+            self._stats.store_rejections += 1
+            logger.warning(
+                "[cache_store] rejecting commit: %s: %s", type(e).__name__, e
+            )
+            return False
 
         logger.debug(
-            f"Stored cache: {len(tokens)} tokens, "
+            f"Stored cache: {len(tokens_key)} tokens, "
             f"{entry.memory_bytes / _BYTES_PER_MB:.2f}MB, "
             f"total={self._current_memory / _BYTES_PER_MB:.1f}MB"
         )
-
         return True
+
+    def clone_for_replay(self, cache: list[Any]) -> list[Any] | None:
+        """Return independently owned backing for a mutating model replay."""
+        try:
+            with self._copy_lock:
+                return _detach_cache_for_storage(cache)
+        except Exception as exc:
+            logger.warning(
+                "[cache_fetch] replay clone rejected: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def fetch_exact_auxiliary(self, tokens: list[int]) -> dict[str, Any] | None:
+        """Return auxiliary data only when an exact resident entry owns it."""
+        with self._memory_lock:
+            entry = self._entries.get(tuple(tokens))
+            if entry is None or entry.auxiliary is None:
+                return None
+            return dict(entry.auxiliary)
+
+    def store(
+        self,
+        tokens: list[int],
+        cache: list[Any],
+        evict_prefixes: bool = True,
+    ) -> bool:
+        """Detach, account, and atomically publish a reusable cache entry."""
+        entry = self.prepare_store(tokens, cache)
+        if entry is None:
+            return False
+        return self.commit_prepared(entry, evict_prefixes=evict_prefixes)
 
     def _remove_from_sorted(self, key: tuple[int, ...]) -> None:
         """Remove a key from the sorted index using bisect for O(log N)."""
@@ -1077,26 +1550,32 @@ class MemoryAwarePrefixCache:
             f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )
 
-    def remove(self, tokens: list[int]) -> bool:
+    def remove(self, tokens: list[int], *, include_ssd: bool = False) -> bool:
         """
         Remove a specific cache entry.
 
         Args:
             tokens: Token sequence to remove.
+            include_ssd: Also remove the same entry from the attached SSD tier.
 
         Returns:
             True if entry was found and removed.
         """
+        tokens_key = tuple(tokens)
+        removed = False
         with self._memory_lock:
-            tokens_key = tuple(tokens)
             entry = self._entries.pop(tokens_key, None)
             if entry is not None:
                 self._current_memory -= entry.memory_bytes
                 self._remove_from_sorted(tokens_key)
                 self._stats.entry_count = len(self._entries)
                 self._stats.current_memory_bytes = self._current_memory
-                return True
-            return False
+                removed = True
+
+        if include_ssd and self._ssd_tier is not None:
+            removed = self._ssd_tier.remove(tokens_key) or removed
+
+        return removed
 
     def clear(self) -> None:
         """Clear all cached entries."""
@@ -1190,12 +1669,14 @@ class MemoryAwarePrefixCache:
         if candidate is not None:
             candidate["match_type"] = "exact"
             candidate["matched_tokens"] = len(tokens)
+            candidate["matched_key"] = tokens_key
             return candidate
 
         prefix = self._ssd_tier.lookup_ssd_prefix(tokens_key)
         if prefix is not None:
             prefix["match_type"] = "prefix"
             prefix["matched_tokens"] = prefix["num_tokens"]
+            prefix["matched_key"] = tokens_key[: prefix["num_tokens"]]
             return prefix
 
         return None
@@ -1236,6 +1717,9 @@ class MemoryAwarePrefixCache:
 
         index = {
             "version": _CACHE_PERSIST_VERSION,
+            # save_prompt_cache writes a different file layout on mlx-lm 0.32
+            # (no meta_state) than on 0.31; neither can read the other's.
+            "cache_format": prompt_cache_format(),
             "model_fingerprint": self._model_fingerprint,
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
@@ -1313,12 +1797,6 @@ class MemoryAwarePrefixCache:
 
         t0 = _time.monotonic()
 
-        try:
-            from mlx_lm.models.cache import load_prompt_cache
-        except ImportError:
-            logger.warning("[cache_persist] mlx_lm not available, cannot load")
-            return 0
-
         with open(index_path) as f:
             index = json.load(f)
 
@@ -1328,6 +1806,23 @@ class MemoryAwarePrefixCache:
                 f"[cache_persist] version mismatch: disk={version} "
                 f"current={_CACHE_PERSIST_VERSION}, discarding stale cache"
             )
+            return 0
+
+        # Files written before the format was recorded came from mlx-lm <= 0.31.
+        disk_format = index.get("cache_format", "meta")
+        current_format = prompt_cache_format()
+        if disk_format != current_format:
+            logger.warning(
+                f"[cache_persist] cache format mismatch: disk={disk_format} "
+                f"current={current_format} (written by a different mlx-lm "
+                f"generation), discarding unreadable cache"
+            )
+            return 0
+
+        try:
+            from mlx_lm.models.cache import load_prompt_cache
+        except ImportError:
+            logger.warning("[cache_persist] mlx_lm not available, cannot load")
             return 0
 
         disk_fp = index.get("model_fingerprint", "")

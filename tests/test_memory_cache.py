@@ -198,6 +198,36 @@ class TestArrayMemory:
         expected = 2 * (1 * 8 * 100 * 64 * 2)
         assert estimate_kv_cache_memory([layer]) == expected
 
+    def test_estimate_handles_nested_cachelist_state(self):
+        """Regression: DeepSeek-V4's CacheList.state nests three sub-states.
+
+        The old two-way unpack raised ValueError, was swallowed, and the whole
+        entry counted as 0 bytes — so the dashboard's Prefix Cache bar stayed
+        at 0% and byte-based LRU eviction never fired for such models.
+        """
+
+        class NestedStateCache:
+            def __init__(self):
+                rot = (
+                    MockShapeArray(shape=(1, 8, 128, 64), dtype_size=2),
+                    MockShapeArray(shape=(1, 8, 128, 64), dtype_size=2),
+                )
+                pool_a = (
+                    MockShapeArray(shape=(1, 3, 512), dtype_size=2),
+                    MockShapeArray(shape=(1, 3, 128), dtype_size=2),
+                    MockShapeArray(shape=(1, 40, 512), dtype_size=2),
+                )
+                pool_b = (None, None, None)  # empty PoolingCache members
+                self.state = [rot, pool_a, pool_b]
+
+        expected = (
+            2 * (1 * 8 * 128 * 64 * 2)
+            + (1 * 3 * 512 * 2)
+            + (1 * 3 * 128 * 2)
+            + (1 * 40 * 512 * 2)
+        )
+        assert estimate_kv_cache_memory([NestedStateCache()]) == expected
+
 
 class TestEstimateKvCacheMemory:
     """Tests for estimate_kv_cache_memory function."""
@@ -235,6 +265,14 @@ class TestCacheEntry:
         assert entry.cache is cache
         assert entry.memory_bytes == 200
 
+    def test_create_entry_accounts_for_auxiliary_arrays(self):
+        cache = [MockKVCache(100, 100)]
+        entry = _CacheEntry.create(
+            [1, 2, 3], cache, auxiliary={"last_logits": MockArray(64)}
+        )
+
+        assert entry.memory_bytes == 264
+
 
 class TestMemoryAwarePrefixCache:
     """Tests for MemoryAwarePrefixCache."""
@@ -268,6 +306,35 @@ class TestMemoryAwarePrefixCache:
         assert len(cache) == 0
         assert cache.memory_limit_mb == 100.0
 
+    def test_prepare_store_rejects_auxiliary_over_memory_limit(
+        self, small_cache, mock_kv_cache
+    ):
+        entry = small_cache.prepare_store(
+            [1, 2, 3],
+            mock_kv_cache(512 * 1024),
+            auxiliary={"last_logits": MockArray(600 * 1024)},
+        )
+
+        assert entry is None
+        assert len(small_cache) == 0
+        stats = small_cache.get_stats()
+        assert stats["store_rejections"] == 1
+        assert stats["current_memory_mb"] == 0
+
+    def test_commit_rejects_oversized_prepared_entry(self, small_cache):
+        entry = _CacheEntry(
+            tokens=(1, 2, 3),
+            cache=[],
+            memory_bytes=2 * 1024 * 1024,
+            auxiliary=None,
+        )
+
+        assert small_cache.commit_prepared(entry) is False
+        assert len(small_cache) == 0
+        stats = small_cache.get_stats()
+        assert stats["store_rejections"] == 1
+        assert stats["current_memory_mb"] == 0
+
     def test_store_and_fetch_exact_match(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3, 4, 5]
         kv = mock_kv_cache(1000)
@@ -278,8 +345,92 @@ class TestMemoryAwarePrefixCache:
 
         # Fetch exact match
         result, remaining = small_cache.fetch(tokens)
-        assert result is kv  # Same reference, no copy
+        # store() snapshots layer containers so stored entries never alias
+        # live caches; the underlying arrays are shared (or detached copies
+        # for real MLX arrays).
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
         assert remaining == []
+
+    def test_prepared_kv_entry_is_not_contaminated_by_live_suffix(self, small_cache):
+        mx = pytest.importorskip("mlx.core")
+        KVCache = pytest.importorskip("mlx_lm.models.cache").KVCache
+
+        live = KVCache()
+        first_keys = mx.array([[[[1.0], [2.0], [3.0]]]])
+        first_values = mx.array([[[[11.0], [12.0], [13.0]]]])
+        live.update_and_fetch(first_keys, first_values)
+
+        prepared = small_cache.prepare_store([1, 2, 3], [live])
+        assert prepared is not None
+
+        live.update_and_fetch(
+            mx.array([[[[4.0], [5.0]]]]),
+            mx.array([[[[14.0], [15.0]]]]),
+        )
+        assert small_cache.commit_prepared(prepared)
+
+        stored, remaining = small_cache.fetch([1, 2, 3])
+        assert remaining == []
+        assert stored[0].offset == 3
+        assert stored[0].keys.shape[2] == 3
+        assert stored[0].keys.tolist() == first_keys.tolist()
+        assert stored[0].values.tolist() == first_values.tolist()
+
+    def test_prepared_hybrid_entry_owns_arrays_and_state_containers(self, small_cache):
+        mx = pytest.importorskip("mlx.core")
+        cache_module = pytest.importorskip("mlx_lm.models.cache")
+
+        live_arrays = cache_module.ArraysCache(size=1)
+        prompt_state = mx.array([[1.0, 2.0, 3.0]])
+        live_arrays[0] = prompt_state
+        live_kv = cache_module.KVCache()
+        prompt_keys = mx.array([[[[1.0], [2.0], [3.0]]]])
+        prompt_values = prompt_keys + 10
+        live_kv.update_and_fetch(prompt_keys, prompt_values)
+
+        prepared = small_cache.prepare_store(
+            [1, 2, 3],
+            [live_arrays, live_kv],
+        )
+        assert prepared is not None
+
+        live_arrays[0] = mx.array([[9.0, 9.0, 9.0]])
+        live_kv.update_and_fetch(
+            mx.array([[[[4.0]]]]),
+            mx.array([[[[14.0]]]]),
+        )
+        assert small_cache.commit_prepared(prepared)
+
+        stored, remaining = small_cache.fetch([1, 2, 3])
+        assert remaining == []
+        assert stored[0] is not live_arrays
+        assert stored[0].state is not live_arrays.state
+        assert stored[0][0] is not prompt_state
+        assert stored[0][0].tolist() == [[1.0, 2.0, 3.0]]
+        assert stored[1] is not live_kv
+        assert stored[1].keys is not live_kv.keys
+        assert stored[1].keys.tolist() == prompt_keys.tolist()
+        assert stored[1].values.tolist() == prompt_values.tolist()
+
+    def test_commit_guard_rejects_before_prefix_eviction(
+        self, small_cache, mock_kv_cache
+    ):
+        base = [1, 2]
+        candidate = [1, 2, 3]
+        assert small_cache.store(base, mock_kv_cache(1000))
+
+        prepared = small_cache.prepare_store(candidate, mock_kv_cache(1000))
+        assert prepared is not None
+        assert not small_cache.commit_prepared(
+            prepared,
+            commit_lock=threading.Lock(),
+            commit_guard=lambda: False,
+        )
+
+        assert tuple(base) in small_cache._entries
+        assert tuple(candidate) not in small_cache._entries
 
     def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
         cache = MemoryAwarePrefixCache(
@@ -311,8 +462,56 @@ class TestMemoryAwarePrefixCache:
         long_tokens = [1, 2, 3, 4, 5, 6]
         result, remaining = small_cache.fetch(long_tokens)
 
-        assert result is kv
+        assert result is not kv  # snapshot, not alias
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
         assert remaining == [4, 5, 6]
+
+    def test_fetch_retains_the_actual_supersequence_key(
+        self, small_cache, mock_kv_cache, monkeypatch
+    ):
+        stored_tokens = [1, 2, 3, 4]
+        kv = mock_kv_cache(1000)
+        small_cache.store(stored_tokens, kv)
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._trim_cache_offset",
+            lambda cache, _trim_by: cache,
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._is_cache_layer_trimmable",
+            lambda _layer: True,
+        )
+
+        result, remaining = small_cache.fetch([1, 2, 3])
+
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
+        assert remaining == []
+        assert small_cache._last_matched_key == tuple(stored_tokens)
+
+    def test_fetch_retains_the_actual_lcp_key(
+        self, small_cache, mock_kv_cache, monkeypatch
+    ):
+        stored_tokens = [1, 2, 3, 9]
+        kv = mock_kv_cache(1000)
+        small_cache.store(stored_tokens, kv)
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._trim_cache_offset",
+            lambda cache, _trim_by: cache,
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._is_cache_layer_trimmable",
+            lambda _layer: True,
+        )
+
+        result, remaining = small_cache.fetch([1, 2, 3, 8])
+
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
+        assert remaining == [8]
+        assert small_cache._last_matched_key == tuple(stored_tokens)
 
     def test_fetch_miss(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3]
@@ -390,6 +589,31 @@ class TestMemoryAwarePrefixCache:
         assert small_cache.remove(tokens) is True
         assert len(small_cache) == 0
         assert small_cache.remove(tokens) is False  # Already removed
+
+    def test_remove_can_evict_the_same_key_from_ssd(self, small_cache, mock_kv_cache):
+        tokens = [1, 2, 3]
+        ssd_tier = MagicMock()
+        ssd_tier.remove.return_value = True
+        small_cache.set_ssd_tier(ssd_tier)
+        small_cache.store(tokens, mock_kv_cache(1000))
+
+        assert small_cache.remove(tokens, include_ssd=True) is True
+        assert tokens not in small_cache
+        ssd_tier.remove.assert_called_once_with(tuple(tokens))
+
+    def test_ssd_prefix_candidate_includes_the_actual_key(self, small_cache):
+        ssd_tier = MagicMock()
+        ssd_tier.lookup_ssd.return_value = None
+        ssd_tier.lookup_ssd_prefix.return_value = {
+            "num_tokens": 3,
+            "memory_bytes": 128,
+            "file_path": "entry",
+        }
+        small_cache.set_ssd_tier(ssd_tier)
+
+        candidate = small_cache.check_ssd([1, 2, 3, 4, 5])
+
+        assert candidate["matched_key"] == (1, 2, 3)
 
     def test_clear(self, small_cache, mock_kv_cache):
         for i in range(3):
@@ -525,3 +749,24 @@ class TestGetAvailableMemory:
             # Should return 0 when psutil not available
             # Note: This test may not work as expected due to import caching
             pass
+
+
+def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
+    """Caches written before safe MLLM rewind must not survive an upgrade."""
+    import json
+
+    (tmp_path / "index.json").write_text(
+        json.dumps({"version": 3, "model_fingerprint": "", "entries": []})
+    )
+    cache = MemoryAwarePrefixCache(MagicMock(), MemoryCacheConfig(max_memory_mb=1))
+
+    with patch.dict(
+        "sys.modules",
+        {
+            "mlx_lm": None,
+            "mlx_lm.models": None,
+            "mlx_lm.models.cache": None,
+        },
+    ):
+        assert cache.load_from_disk(str(tmp_path)) == 0
+    assert "version mismatch: disk=3 current=4" in caplog.text

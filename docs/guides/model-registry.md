@@ -25,6 +25,10 @@ Keep single-model serving when you want the smallest operational surface and the
 vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --host 0.0.0.0 --port 8000
 ```
 
+Use `--memory-budget-gb` to override `manager.memory_budget_gb` (or the legacy
+`manager.memory_budget`) for a particular launch. The CLI value takes precedence
+over the YAML value and can supply the budget when the YAML field is absent.
+
 You can still use global serve flags such as:
 
 - `--api-key`
@@ -53,6 +57,7 @@ Example:
 ```yaml
 manager:
   memory_budget_gb: 100
+  idle_unload_seconds: 300
   contention_policy:
     strategy: wait_then_preempt
     wait_timeout_s: 45
@@ -84,14 +89,118 @@ models:
 
 Total resident-model budget for the registry manager.
 
-This is the eviction budget, not the full system RAM size. Leave headroom for:
+**This budget counts model weights only.** It is the number the manager compares
+against when deciding whether a new model fits or an idle one must be evicted.
+It does not include, and does not reserve room for:
 
 - KV cache
-- request batching
+- activations during prefill and decode
 - OS / filesystem cache
 - other colocated services
 
 On a 128 GB machine, a practical starting point is often `80-100 GB`.
+
+For different host or launch profiles, pass `--memory-budget-gb` instead of
+maintaining duplicate registry files. The override remains a weights-only
+budget and does not change the Metal allocation ceiling described below.
+
+### `idle_unload_seconds`
+
+Automatically unload a model after it has had no active requests for this many
+seconds. Values less than or equal to `0` disable idle unloading.
+
+If this setting is omitted, registry mode inherits
+`--auto-unload-idle-seconds`; that flag defaults to `0`. A value in the YAML
+file takes precedence over the CLI fallback. Preloaded models are also eligible
+for idle unloading after their preload lease is released.
+
+### Budget vs. the Metal allocation ceiling
+
+The manager budget and the MLX allocation ceiling are two separate numbers, and
+the budget does not derive from the ceiling. The ceiling is installed at engine
+start from `--gpu-memory-utilization`:
+
+```
+allocation_ceiling = gpu_memory_utilization x device_working_set_size
+```
+
+The weights *plus* the KV cache *plus* activations all have to fit under that
+ceiling, while the budget only accounts for the weights. If the budget is set
+above what is actually allocatable, the manager's arithmetic says N models fit,
+it keeps them all resident, and MLX hits the ceiling — so you get a hard
+out-of-memory failure instead of the graceful eviction the budget exists to
+provide.
+
+The invariant to maintain is:
+
+```
+memory_budget_gb  <=  gpu_memory_utilization x device_RAM
+                      - KV/activation headroom
+                      - prefix cache actually resident
+```
+
+The server reconciles the two process-wide terms at startup and logs them
+together with the prefix-cache setting:
+
+```
+Registry memory budget: 68.0 GB of model weights; Metal allocation ceiling
+64.0 GB (50% of 128.0 GB, from serve default); prefix-cache maximum
+20.0 GB per memory-aware prefix-cache engine (--cache-memory-mb, 2 of 3 entries)
+```
+
+The entry count follows the cache path each model will use. With
+`--use-paged-cache`, text engines use the paged cache and are excluded from this
+count. MLLM engines still construct a memory-aware prefix cache, so their
+per-engine `--cache-memory-mb` maximum remains included. For an unresolved
+remote model ID, set `mllm: true` on the registry entry so the startup report
+can include its cache without relying on a model-name heuristic.
+
+If an entry enables continuous batching while the global serve default leaves
+it disabled, the report uses the same scheduler defaults as the engine,
+including the default 20% memory-aware cache limit.
+
+When the weights budget alone does not fit below the ceiling, startup warns:
+
+```
+WARNING models-config manager.memory_budget_gb (68.0 GB) exceeds the Metal
+allocation ceiling (64.0 GB). ...
+```
+
+This is a diagnostic, not a clamp — the server still starts with the budget you
+configured. It is also a *necessary, not sufficient* condition: passing the
+check does not mean you will not run out of memory, because the KV cache,
+prefix cache and activations all come out of the same ceiling and are
+workload-dependent. Treat the ceiling as an upper bound and leave real margin
+below it.
+
+Notes on how the check is computed:
+
+- The Metal limit is installed only by continuous-batching entries — that is the
+  one path calling `mx.set_memory_limit`, and simple-mode entries are not even
+  constructed with a `gpu_memory_utilization`. The check therefore considers
+  only the effective utilization of continuous-batching entries, taking the
+  *lowest*, since each such load re-installs the process-wide limit. A
+  `gpu_memory_utilization` set on a simple-mode entry has no effect on the
+  ceiling and is ignored here.
+- A registry with no continuous-batching entries gets **no** attributed ceiling:
+  nothing installs one, so the report says so rather than deriving a figure from
+  a value that is never applied. The serve default likewise only competes when
+  some continuous-batching entry actually inherits it.
+- The conflict check compares **only** the weights budget against the ceiling,
+  because both are process-wide totals and therefore directly comparable.
+- `--cache-memory-mb` is **not** subtracted from the ceiling. It is a per-engine
+  maximum: it is cloned into each resident continuous-batching engine and
+  allocated lazily, and simple-mode entries never receive it at all. Subtracting
+  it once would understate capacity with one resident model and overstate it
+  with several, so it is reported next to the ceiling rather than folded into
+  it. It is reported only when it can actually bind: for continuous-batching
+  entries using the memory-aware prefix cache. Text entries using
+  `--use-paged-cache` are excluded, while MLLM entries remain included because
+  they still construct the memory-aware prefix cache.
+- A separate warning fires when `--cache-memory-mb` alone is at or above the
+  ceiling, which is a configuration error in its own right.
+- On hosts where MLX cannot report a Metal working-set size, the check reports
+  that the budget could not be reconciled and issues no warning.
 
 ### `contention_policy`
 
@@ -128,10 +237,22 @@ Optional:
 - `specprefill`
 - `specprefill_threshold`
 - `specprefill_keep_pct`
+- `specprefill_backbone_pct`
 - `specprefill_draft_model`
 - `stream_interval`
 - `gpu_memory_utilization`
 - `estimated_memory_gb`
+
+For continuous-batching multimodal routes, SpecPrefill is opt-in and currently
+supports exact Qwen3-VL and Qwen3.5 dense and MoE runtime modules. It preserves
+visual placeholders, fused media embeddings, deep-stack visual state, and
+request-local MRoPE positions. Media requests use fresh request-local caches:
+token-only prefix keys cannot identify the media or restore its MRoPE delta.
+Unsupported models, installed native MTP, request-enabled external assistants,
+interleaved chunked prefill, rotating caches, audio, and unavailable drafts use
+normal dense media prefill. When SpecPrefill is requested, the final OpenAI chat
+response reports the decision in `generation_metadata.specprefill_engaged` and
+`generation_metadata.specprefill_reason`.
 
 ## Sizing Rules
 
@@ -141,6 +262,18 @@ For deterministic eviction behavior:
 - non-local model ids should set `estimated_memory_gb`
 
 If a registry entry points at a non-local source and no `estimated_memory_gb` is provided, startup will reject the config. This prevents the manager from making bad eviction decisions from guesswork.
+
+Both sizing paths are **weight estimates, not total runtime memory**:
+
+- for a local source, the estimate is the summed on-disk size of the entry's
+  `.safetensors` / `.gguf` files
+- for a declared model id, the estimate is the operator-supplied
+  `estimated_memory_gb`
+
+Neither includes KV cache or activations, so a model's real peak footprint is
+larger than the number the manager charges against `memory_budget_gb`. Size the
+budget with that gap in mind — see
+[Budget vs. the Metal allocation ceiling](#budget-vs-the-metal-allocation-ceiling).
 
 ## Request Routing
 
@@ -174,6 +307,13 @@ Registry-backed responses include the configured model ids and current state suc
 - `unloaded`
 - `preempting`
 
+Each model entry also includes `last_used_at` when it is loaded. For the
+effective idle timeout together with all model states, inspect `/v1/status`:
+
+```bash
+curl http://localhost:8000/v1/status
+```
+
 ### Verify a cold-load path
 
 ```bash
@@ -204,6 +344,8 @@ Then repeat with a second model id to verify:
 
 - Bad or missing `estimated_memory_gb` on non-local sources: config load failure
 - Too-small `memory_budget_gb`: repeated capacity failures or unnecessary preemption
+- Too-large `memory_budget_gb` relative to `--gpu-memory-utilization`: MLX
+  out-of-memory instead of eviction (the startup log warns about this)
 - Over-aggressive `preempt` policy: active requests get cancelled during model swaps
 - Too many `preload: true` entries: startup load storm and immediate budget pressure
 

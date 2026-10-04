@@ -67,6 +67,23 @@ class TestGemma4ToolParserExtract:
         assert args0 == {"pattern": "README*.md"}
         assert args1 == {"pattern": "CONTRIBUTING.md"}
 
+    def test_multiple_tool_calls_in_separate_blocks(self):
+        """Gemma 4's chat template renders parallel calls as separate blocks."""
+        output = (
+            "<|tool_call>"
+            'call:glob{pattern:<|"|>README*.md<|"|>}'
+            "<tool_call|>"
+            "<|tool_call>"
+            'call:glob{pattern:<|"|>CONTRIBUTING.md<|"|>}'
+            "<tool_call|>"
+        )
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert [json.loads(tc["arguments"]) for tc in result.tool_calls] == [
+            {"pattern": "README*.md"},
+            {"pattern": "CONTRIBUTING.md"},
+        ]
+
     def test_content_before_tool_call(self):
         output = 'Let me read that file for you.\n<|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}<tool_call|>'
         result = self.parser.extract_tool_calls(output)
@@ -254,10 +271,7 @@ class TestGemma4ToolParserFallbackForms:
         assert args == {"code": "f(x) + g(y)"}
 
     def test_tool_code_block_with_content_before(self):
-        output = (
-            "Let me look that up.\n"
-            "```tool_code\nget_weather(city=\"Paris\")\n```"
-        )
+        output = "Let me look that up.\n" '```tool_code\nget_weather(city="Paris")\n```'
         result = self.parser.extract_tool_calls(output)
         assert result.tools_called is True
         assert result.content == "Let me look that up."
@@ -314,7 +328,9 @@ class TestGemma4ToolParserFallbackForms:
 
     def test_e2b_unfenced_tool_code_assignment_mixed_args(self):
         """Unfenced assignment with multiple kwargs of mixed types."""
-        output = 'tool_code = search_movies(query="Interstellar", limit=5)\nprint(tool_code)'
+        output = (
+            'tool_code = search_movies(query="Interstellar", limit=5)\nprint(tool_code)'
+        )
         result = self.parser.extract_tool_calls(output)
         assert result.tools_called is True
         assert result.tool_calls[0]["name"] == "search_movies"

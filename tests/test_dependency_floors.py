@@ -1,8 +1,11 @@
-"""Dependency floor contracts for upstream model support."""
+"""Dependency compatibility contracts for upstream model support."""
 
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
+from packaging.requirements import Requirement
 
 try:
     import tomllib
@@ -32,13 +35,34 @@ def _has_minimum(requirement: str, minimum: str) -> bool:
     return _version_tuple(version) >= _version_tuple(minimum)
 
 
-def test_mlx_vlm_floor_includes_step37_flash_support_and_followups():
+def test_mlx_vlm_floor_includes_loader_guard_and_step37_flash():
     dependencies = _project_dependencies()
 
-    assert _has_minimum(dependencies["mlx-vlm"], "0.6.2")
+    assert _has_minimum(dependencies["mlx-vlm"], "0.6.5")
 
 
 def test_mlx_lm_floor_matches_current_mlx_vlm_runtime_requirement():
     dependencies = _project_dependencies()
 
     assert _has_minimum(dependencies["mlx-lm"], "0.31.3")
+
+
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    [
+        ("0.31.2", False),
+        ("0.31.3", True),
+        ("0.31.4", True),
+        ("0.32.0", True),
+        ("0.32.1", True),
+        ("0.33.0", False),
+    ],
+)
+def test_mlx_lm_version_range_matches_the_cache_contracts_we_handle(
+    version: str, supported: bool
+) -> None:
+    """0.31.x (``meta_state``) and 0.32.x (padded ``state``) are both handled
+    by ``vllm_mlx.mlx_cache_compat``; anything newer is unverified."""
+    requirement = Requirement(_project_dependencies()["mlx-lm"])
+
+    assert requirement.specifier.contains(version) is supported

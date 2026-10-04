@@ -38,6 +38,31 @@ that envelope fall back to the normal scheduler path instead of using MTP. This
 keeps sampling correctness ahead of throughput until the MLLM verifier is
 sampler-aware.
 
+An external mlx-vlm assistant drafter can be configured for either simple or
+continuous-batching mode:
+
+```bash
+vllm-mlx serve TARGET_MODEL \
+  --mllm \
+  --continuous-batching \
+  --mllm-draft-model ASSISTANT_MODEL \
+  --mllm-draft-kind mtp \
+  --default-mllm-draft
+```
+
+`--default-mllm-draft` enables the assistant when a chat or completion request
+does not specify an override. Send `"mllm_draft": false` to opt out for one
+request, or `true` to opt in when the server default is disabled. Batched
+assistant drafters currently require `--mllm-draft-kind mtp`. `/v1/status`
+shows the configured model and default after startup. In continuous-batching
+mode, it also adds runtime acceptance counters as requests run.
+
+Injected Qwen3.5 and Qwen3.6 MTP checkpoints use the established post-norm
+backbone state by default. A checkpoint qualified for pre-norm input can opt in
+by setting `mtp_hidden_state_mode` to `pre_norm` in its `text_config`. Leave the
+setting unset for existing checkpoints. Unknown values fall back to post-norm
+and emit a warning.
+
 Thinking/logits processors stay active by default for the whole request. The
 experimental retirement-to-MTP handoff is opt-in via
 `VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME=1`; leave it unset unless you have

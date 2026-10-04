@@ -6,6 +6,7 @@ Utility functions for text processing and model detection.
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 from .models import Message
@@ -561,7 +562,7 @@ def _content_to_text(content) -> str:
 
 
 def extract_multimodal_content(
-    messages: list[Message],
+    messages: Sequence[Message | dict],
     preserve_native_format: bool = False,
 ) -> tuple[list[dict], list[str], list[str], list[str]]:
     """
@@ -574,7 +575,7 @@ def extract_multimodal_content(
     - Tool response messages (role="tool")
 
     Args:
-        messages: List of Message objects
+        messages: Message objects or OpenAI-format dictionaries
         preserve_native_format: If True, preserve native tool message format
             (role="tool", tool_calls field) instead of converting to text.
             Required for models with native tool support in chat templates
@@ -635,6 +636,15 @@ def extract_multimodal_content(
             tool_calls = getattr(msg, "tool_calls", None)
 
         if role == "assistant" and tool_calls:
+            if isinstance(content, list):
+                # Reuse the multimodal path without tool calls before the
+                # formatting branch below consumes only text and continues.
+                _, message_images, message_videos, message_audios = (
+                    extract_multimodal_content([{"role": role, "content": content}])
+                )
+                images.extend(message_images)
+                videos.extend(message_videos)
+                audios.extend(message_audios)
             if preserve_native_format:
                 # Preserve native tool_calls format
                 tool_calls_list = []

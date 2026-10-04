@@ -8,6 +8,8 @@ from vllm_mlx/api/utils.py. No MLX dependency.
 
 import json
 
+import pytest
+
 from vllm_mlx.api.models import ContentPart, ImageUrl, Message
 from vllm_mlx.api.utils import (
     MLLM_PATTERNS,
@@ -97,6 +99,24 @@ class TestCleanOutputText:
         assert "</think>" in result
         assert "42" in result
         assert "<|im_start|>" not in result
+
+    def test_gpt_oss_commentary_final_returns_final_text(self):
+        text = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|message|>{"loc": "SF"}'
+            "<|channel|>final<|message|>Done<|return|>"
+        )
+        assert clean_output_text(text) == "Done"
+        assert "<|channel|>" not in clean_output_text(text)
+        assert "<|message|>" not in clean_output_text(text)
+
+    def test_gpt_oss_commentary_call_returns_args_json(self):
+        text = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|message|>{"loc": "SF"}<|call|>'
+        )
+        assert clean_output_text(text) == '{"loc": "SF"}'
+        assert "<|call|>" not in clean_output_text(text)
 
 
 class TestSpecialTokensPattern:
@@ -640,6 +660,60 @@ class TestExtractMultimodalContent:
         assert isinstance(result[0]["content"], str)
         assert "Checking now." in result[0]["content"]
         assert "tool_calls" in result[0]
+
+    @pytest.mark.parametrize("preserve_native", [False, True])
+    @pytest.mark.parametrize("as_model", [False, True])
+    def test_assistant_tool_calls_preserve_media(self, preserve_native, as_model):
+        """Tool-call formatting must not skip media or change its order."""
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "before.png"}}],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Inspecting."},
+                    {"type": "image_url", "image_url": {"url": "first.png"}},
+                    {"type": "text", "text": "Checking."},
+                    {"type": "image_url", "image_url": {"url": "second.png"}},
+                    {"type": "video_url", "video_url": {"url": "clip.mp4"}},
+                    {"type": "audio_url", "audio_url": {"url": "voice.wav"}},
+                ],
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "zoom", "arguments": '{"scale": 2}'},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "after.png"}}],
+            },
+        ]
+        if as_model:
+            messages = [Message(**message) for message in messages]
+
+        processed, images, videos, audios = extract_multimodal_content(
+            messages, preserve_native_format=preserve_native
+        )
+
+        assert images == ["before.png", "first.png", "second.png", "after.png"]
+        assert videos == ["clip.mp4"]
+        assert audios == ["voice.wav"]
+        assert processed[1]["role"] == "assistant"
+        if preserve_native:
+            assert processed[1]["content"] == "Inspecting.\nChecking."
+            assert processed[1]["tool_calls"][0]["function"] == {
+                "name": "zoom",
+                "arguments": {"scale": 2},
+            }
+        else:
+            assert processed[1]["content"] == (
+                'Inspecting.\nChecking.\n[Calling tool: zoom({"scale": 2})]'
+            )
 
 
 class TestContentToText:

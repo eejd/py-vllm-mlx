@@ -20,6 +20,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _compilation_times():
+    """Zero compilation times in vLLM's own type when it exists (>= 0.27)."""
+    try:
+        from vllm.v1.worker.worker_base import CompilationTimes
+    except ImportError:  # older vLLM: return value is ignored
+        return None
+    return CompilationTimes(language_model=0.0, encoder=0.0)
+
+
 class MLXWorker:
     """
     Worker implementation for MLX-based inference on Apple Silicon.
@@ -84,7 +93,7 @@ class MLXWorker:
             logger.info(f"MLX default device: {default_device}")
 
             # Get device info
-            from vllm_mlx.plugin import get_mlx_device_info
+            from vllm_mlx_plugin.plugin import get_mlx_device_info
 
             info = get_mlx_device_info()
             logger.info(
@@ -92,7 +101,7 @@ class MLXWorker:
             )
 
             # Initialize model runner
-            from vllm_mlx.model_runner import MLXModelRunner
+            from vllm_mlx_plugin.model_runner import MLXModelRunner
 
             self.model_runner = MLXModelRunner(self.vllm_config)
 
@@ -153,16 +162,48 @@ class MLXWorker:
         logger.info(f"Initialized cache: {num_gpu_blocks} GPU blocks")
 
     def get_kv_cache_spec(self) -> dict:
-        """Get KV cache specification."""
-        if self.model_runner:
-            return self.model_runner.get_kv_cache_spec()
-        return {}
+        """Return the KV cache spec in vLLM's own types.
 
-    def compile_or_warm_up_model(self) -> None:
-        """Warm up model for inference."""
+        vLLM >= 0.27 requires ``dict[layer_name, KVCacheSpec]`` (a plain
+        ``{"num_blocks": ...}`` dict is rejected by the KV-cache planner).
+        MLX manages the real cache; a uniform FullAttentionSpec per layer lets
+        vLLM's scheduler track capacity and block allocation.
+        """
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        config = getattr(getattr(self.model_runner, "model", None), "config", None)
+        num_layers = getattr(config, "num_hidden_layers", 32)
+        head_size = getattr(config, "head_dim", 64)
+        num_kv_heads = getattr(
+            config, "num_key_value_heads", getattr(config, "num_attention_heads", 1)
+        )
+        block_size = self.cache_config.block_size
+        return {
+            f"layers.{i}.self_attn": FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=torch.float16,
+            )
+            for i in range(num_layers)
+        }
+
+    def initialize_from_config(self, kv_cache_config) -> None:
+        """vLLM >= 0.27 entry point: size the cache from the planner's result."""
+        num_blocks = getattr(kv_cache_config, "num_blocks", 0)
+        self.initialize_cache(num_blocks, 0)
+
+    def compile_or_warm_up_model(self):
+        """Warm up model for inference.
+
+        vLLM >= 0.27 expects a ``CompilationTimes`` back (the executor reads
+        ``.language_model`` / ``.encoder`` off every worker's result); older
+        releases ignore the return value.
+        """
         if self.model_runner:
             self.model_runner.warm_up()
         logger.info("Model warm-up complete")
+        return _compilation_times()
 
     def execute_model(
         self,
@@ -181,6 +222,34 @@ class MLXWorker:
             raise RuntimeError("Model not loaded")
 
         return self.model_runner.execute_model(scheduler_output)
+
+    def reset_mm_cache(self) -> None:
+        """vLLM >= 0.27 worker hook; MLX keeps no vLLM-side multimodal cache."""
+
+    def sample_tokens(self, grammar_output=None):
+        """vLLM >= 0.27 two-phase step: return the output stashed by execute_model."""
+        if self.model_runner is None:
+            return None
+        return self.model_runner.take_pending_output()
+
+    # -- vLLM >= 0.27 worker RPC surface (collective_rpc targets) ----------
+    def get_supported_tasks(self) -> tuple:
+        return ("generate",)
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.model_config.max_model_len = max_model_len
+
+    def reset_encoder_cache(self) -> None:
+        """MLX keeps no vLLM-side encoder cache."""
+
+    def reset_prefix_cache(self) -> None:
+        """Prefix caching is managed inside the MLX engine."""
+
+    def execute_dummy_batch(self) -> None:
+        """No-op: nothing to keep in lockstep on a single-device backend."""
+
+    def take_draft_token_ids(self):
+        return None
 
     def get_model(self):
         """Get the underlying model."""
