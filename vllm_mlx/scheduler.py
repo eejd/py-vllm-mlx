@@ -24,7 +24,12 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
-from .mlx_cache_compat import copy_state, restore_from_state, snapshot_state
+from .mlx_cache_compat import (
+    copy_state,
+    restore_from_state,
+    set_recurrent_arrays,
+    snapshot_state,
+)
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
@@ -3791,7 +3796,7 @@ class Scheduler:
                             if dt is not None:
                                 state_arrays[i] = state_arrays[i].astype(dt)
                     layer_obj = ArraysCache(len(state_arrays))
-                    layer_obj.state = state_arrays
+                    set_recurrent_arrays(layer_obj, state_arrays)
                     result.append(layer_obj)
                 else:
                     logger.warning(

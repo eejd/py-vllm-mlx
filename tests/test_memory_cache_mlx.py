@@ -67,7 +67,7 @@ class TestTrimCacheOffset:
         tc = _trim_cache_offset([layer], 500 - 60)[0]
 
         # cache.state is what KV-shared layers read directly.
-        keys_view, _ = tc.state
+        keys_view = tc.state[0]  # (keys, values) or (keys, values, offset)
         assert keys_view.shape[-2] == 60
         # No "7.0" tokens anywhere — private content was excluded.
         assert float(mx.max(keys_view).item()) == 1.0
@@ -466,7 +466,7 @@ class TestDequantizeCacheSlice:
         result = _dequantize_cache(trimmed)
 
         tc = result[0]
-        keys_view, _ = tc.state
+        keys_view = tc.state[0]  # (keys, values) or (keys, values, offset)
         assert keys_view.shape[-2] == 64
         # Dequantized values are approximate (quantization error), but should
         # be close to 1.0 (the shared prefix), never near 7.0 (the private data).

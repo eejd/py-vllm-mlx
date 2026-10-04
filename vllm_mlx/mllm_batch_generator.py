@@ -32,7 +32,12 @@ from .memory_cache import (
     MemoryCacheConfig,
     is_text_only_prefix_cache_request,
 )
-from .mlx_cache_compat import restore_from_state, uses_meta_state
+from .mlx_cache_compat import (
+    restore_from_rollback,
+    restore_from_state,
+    snapshot_for_rollback,
+    uses_meta_state,
+)
 from .multimodal_processor import MultimodalProcessor
 from .mllm_specprefill import (
     SpecPrefillOutcome,
@@ -3195,9 +3200,7 @@ def install_mtp_mllm(
             for _ci, _c in enumerate(cache):
                 if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
                     if hasattr(_c, "state"):
-                        _rnn_snapshots[_ci] = [
-                            mx.array(s) if s is not None else None for s in _c.state
-                        ]
+                        _rnn_snapshots[_ci] = snapshot_for_rollback(_c)
 
             # Verify [primary, draft]
             verify_input = mx.concatenate(
@@ -3322,7 +3325,7 @@ def install_mtp_mllm(
                         ):
                             c.trim(2)
                     for _ci, _snap in _rnn_snapshots.items():
-                        cache[_ci].state = _snap
+                        restore_from_rollback(cache[_ci], _snap)
                     rerun_out = language_model(
                         (replay_tokens if sampled_reject else primary_tokens[:, None]),
                         cache=cache,

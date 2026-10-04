@@ -27,8 +27,6 @@ import functools
 import inspect
 from typing import Any
 
-import mlx.core as mx
-
 # Cache layers whose valid KV region is ``keys[..., :offset, :]`` and that can
 # be rebuilt from a plain ``(keys, values)`` pair. Anything else (rotating,
 # quantized, chunked, recurrent, nested) round-trips through its own
@@ -160,12 +158,18 @@ def _new_plain_kv(cls: type) -> Any:
 def recurrent_arrays(layer: Any) -> list[Any] | None:
     """The state arrays of a recurrent (``ArraysCache``-style) layer, or None.
 
-    ``layer.cache`` is the list of arrays on every contract. ``.state`` is
-    not: in mlx-lm 0.32 it is ``(cache, left_padding, lengths)``.
+    ``layer.cache`` is the list of arrays on every real contract. ``.state``
+    is not: in mlx-lm 0.32 it is ``(cache, left_padding, lengths)``.
     """
     inner = getattr(layer, "cache", None)
     if isinstance(inner, list):
         return inner
+    # Duck-typed legacy layer: ``.state`` is the bare list. A container
+    # (``CacheList``) also has a list ``.state``, so it is excluded.
+    if getattr(layer, "caches", None) is None:
+        state = getattr(layer, "state", None)
+        if isinstance(state, list):
+            return state
     return None
 
 
@@ -215,6 +219,8 @@ def clone_layer(layer: Any, max_tokens: int | None = None) -> Any:
     """
     view = kv_view(layer)
     if view is not None:
+        import mlx.core as mx
+
         n = view[0].shape[-2]
         if max_tokens is not None:
             n = min(n, max_tokens)
@@ -225,3 +231,29 @@ def clone_layer(layer: Any, max_tokens: int | None = None) -> Any:
         return clone
     state, meta = snapshot_state(layer)
     return restore_from_state(type(layer), state, meta)
+
+
+def snapshot_for_rollback(layer: Any) -> tuple[str, list[Any]]:
+    """Capture a layer that cannot be trimmed so it can be restored later.
+
+    Speculative verification advances every layer by two tokens; layers that
+    cannot ``trim`` (recurrent state, rotating windows) are put back from this
+    snapshot instead. Recurrent layers are captured through their array list,
+    because ``ArraysCache.state`` in mlx-lm 0.32 is ``(cache, left_padding,
+    lengths)`` and its first element is a list, not an array.
+    """
+    import mlx.core as mx
+
+    arrays = recurrent_arrays(layer)
+    if arrays is not None:
+        return "arrays", [mx.array(a) if a is not None else None for a in arrays]
+    return "state", [mx.array(s) if s is not None else None for s in layer.state]
+
+
+def restore_from_rollback(layer: Any, snapshot: tuple[str, list[Any]]) -> None:
+    """Put back what :func:`snapshot_for_rollback` captured."""
+    kind, data = snapshot
+    if kind == "arrays":
+        set_recurrent_arrays(layer, data)
+    else:
+        layer.state = data

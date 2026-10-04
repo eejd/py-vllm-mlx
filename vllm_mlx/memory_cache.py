@@ -33,6 +33,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
+from .mlx_cache_compat import recurrent_arrays
 
 
 def is_text_only_prefix_cache_request(request: Any) -> bool:
@@ -186,8 +187,14 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
             # Walk the state recursively: the payload may nest containers or
             # mappings, and the old two-way unpack silently measured those
             # as 0.
+            # Recurrent layers are priced from their array list: on mlx-lm 0.32
+            # ``.state`` is ``(cache, left_padding, lengths)``, which would
+            # count the metadata arrays here and again below.
             try:
-                total_bytes += _nested_array_memory(layer_cache.state)
+                arrays = recurrent_arrays(layer_cache)
+                total_bytes += _nested_array_memory(
+                    arrays if arrays is not None else layer_cache.state
+                )
             except (TypeError, ValueError):
                 pass
             # Detachment also copies these metadata arrays on state-carrying

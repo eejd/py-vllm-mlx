@@ -272,3 +272,44 @@ class TestCloneLayer:
         assert clone is not src and clone.cache is not src.cache
         src[0] = mx.zeros((1, 3))  # the model overwrites the live state in place
         assert mx.array_equal(clone.cache[0], mx.ones((1, 3)))
+
+
+class TestRollbackSnapshot:
+    def test_recurrent_layer_is_restored_after_the_model_advances_it(self):
+        a = lm_cache.ArraysCache(2)
+        a[0] = mx.ones((1, 3))
+        a[1] = mx.full((1, 2), 5.0)
+        snap = compat.snapshot_for_rollback(a)
+        a[0] = mx.zeros((1, 3))  # the verify pass advances recurrent state
+        a[1] = mx.zeros((1, 2))
+        compat.restore_from_rollback(a, snap)
+        assert mx.array_equal(a.cache[0], mx.ones((1, 3)))
+        assert mx.array_equal(a.cache[1], mx.full((1, 2), 5.0))
+
+    def test_rotating_layer_is_restored(self):
+        r = lm_cache.RotatingKVCache(max_size=16)
+        x = mx.ones((1, 1, 4, 8))
+        r.update_and_fetch(x, x)
+        before = r.offset
+        snap = compat.snapshot_for_rollback(r)
+        r.update_and_fetch(x, x)
+        assert r.offset != before
+        compat.restore_from_rollback(r, snap)
+        assert int(r.offset) == before
+
+
+def test_ssd_dispatch_routes_a_real_arrays_cache_to_the_arrays_serializer():
+    from vllm_mlx.ssd_cache import ArraysCacheSerializer, get_serializer_for_layer
+
+    a = lm_cache.ArraysCache(1)
+    a[0] = mx.ones((1, 3))
+    assert isinstance(get_serializer_for_layer(a), ArraysCacheSerializer)
+
+
+def test_arrays_cache_is_priced_once():
+    from vllm_mlx.memory_cache import estimate_kv_cache_memory
+
+    a = lm_cache.ArraysCache(1, left_padding=[0])
+    a[0] = mx.ones((1, 4))
+    mx.eval(a[0], a.left_padding)
+    assert estimate_kv_cache_memory([a]) == a[0].nbytes + a.left_padding.nbytes
