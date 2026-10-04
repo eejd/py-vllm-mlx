@@ -269,3 +269,130 @@ class TestMiniCPMFinalize:
 
     def test_plain_text_is_left_alone(self):
         assert self.parser.finalize_streaming("hello") is None
+
+
+class TestMiniCPMCdataBoundaries:
+    """A CDATA value may contain the tags that would otherwise end an element."""
+
+    def setup_method(self):
+        self.parser = MiniCPMToolParser()
+
+    def test_cdata_value_containing_the_function_close_tag(self):
+        text = (
+            '<function name="run"><param name="code">'
+            '<![CDATA[x = "</function>"]]></param></function>'
+        )
+        result = self.parser.extract_tool_calls(text)
+        assert _args(result.tool_calls[0]) == {"code": 'x = "</function>"'}
+        assert result.content is None
+
+    def test_cdata_value_containing_the_param_close_tag(self):
+        text = (
+            '<function name="run"><param name="code">'
+            '<![CDATA[x = "</param>"]]></param></function>'
+        )
+        result = self.parser.extract_tool_calls(text)
+        assert _args(result.tool_calls[0]) == {"code": 'x = "</param>"'}
+
+    def test_two_cdata_params_in_one_element(self):
+        text = (
+            '<function name="f"><param name="a"><![CDATA[1 < 2]]></param>'
+            '<param name="b"><![CDATA[</function>]]></param></function>'
+        )
+        result = self.parser.extract_tool_calls(text)
+        assert _args(result.tool_calls[0]) == {"a": "1 < 2", "b": "</function>"}
+
+    def test_unterminated_cdata_does_not_hang_or_call(self):
+        text = '<function name="f"><param name="a">' + "<![CDATA[x " * 200
+        result = self.parser.extract_tool_calls(text)
+        assert result.tools_called is False
+
+    def test_streaming_a_cdata_value_with_a_close_tag_emits_one_call(self):
+        text = (
+            '<function name="run"><param name="code">'
+            '<![CDATA[x = "</function>"]]></param></function>'
+        )
+        for size in (1, 5, 10_000):
+            self.parser.reset()
+            acc, calls = "", []
+            for i in range(0, len(text), size):
+                delta = text[i : i + size]
+                previous, acc = acc, acc + delta
+                out = self.parser.extract_tool_calls_streaming(previous, acc, delta)
+                calls += (out or {}).get("tool_calls", [])
+            assert [c["index"] for c in calls] == [0], size
+            assert json.loads(calls[0]["function"]["arguments"]) == {
+                "code": 'x = "</function>"'
+            }
+
+
+class TestMiniCPMStrayClosingTags:
+    """A closing tag with no element must not shift the index of later calls."""
+
+    def setup_method(self):
+        self.parser = MiniCPMToolParser()
+
+    def _stream(self, text, size):
+        self.parser.reset()
+        acc, calls = "", []
+        for i in range(0, len(text), size):
+            delta = text[i : i + size]
+            previous, acc = acc, acc + delta
+            out = self.parser.extract_tool_calls_streaming(previous, acc, delta)
+            calls += (out or {}).get("tool_calls", [])
+        return calls
+
+    def test_stray_close_before_a_call(self):
+        text = "</function>stray" + _call("get_weather", city="Paris")
+        for size in (1, 3, 7, 50, 10_000):
+            calls = self._stream(text, size)
+            assert [c["index"] for c in calls] == [0], size
+            assert calls[0]["function"]["name"] == "get_weather"
+
+    def test_two_stray_closes_before_a_call(self):
+        text = "</function></function>" + _call("f", x="1") + _call("g", y="2")
+        for size in (1, 4, 10_000):
+            calls = self._stream(text, size)
+            assert [(c["index"], c["function"]["name"]) for c in calls] == [
+                (0, "f"),
+                (1, "g"),
+            ], size
+
+    def test_stray_close_is_not_content_in_the_non_streaming_result(self):
+        result = self.parser.extract_tool_calls("</function>" + _call("f", x="1"))
+        assert result.tools_called is True
+        assert result.content is None
+
+
+class TestMiniCPMFinalizeAmbiguity:
+    def setup_method(self):
+        self.parser = MiniCPMToolParser()
+
+    def test_two_open_elements_are_not_merged_into_one_call(self):
+        text = (
+            '<function name="f"><param name="x">1</param>'
+            '<function name="g"><param name="y">2</param>'
+        )
+        assert self.parser.finalize_streaming(text) is None
+
+    def test_unclosed_cdata_is_not_emitted(self):
+        text = '<function name="f"><param name="x"><![CDATA[abc'
+        assert self.parser.finalize_streaming(text) is None
+
+
+class TestMiniCPMProseAfterACall:
+    def test_word_separators_after_a_call_survive_token_sized_deltas(self):
+        parser = MiniCPMToolParser()
+        parser.reset()
+        text = _call("f", x="1") + " Mid " + _call("g", y="2") + " End."
+        for size in (1, 2, 3):
+            parser.reset()
+            acc, content, calls = "", "", []
+            for i in range(0, len(text), size):
+                delta = text[i : i + size]
+                previous, acc = acc, acc + delta
+                out = parser.extract_tool_calls_streaming(previous, acc, delta)
+                content += (out or {}).get("content", "")
+                calls += (out or {}).get("tool_calls", [])
+            assert [c["index"] for c in calls] == [0, 1], size
+            assert content.split() == ["Mid", "End."], (size, content)

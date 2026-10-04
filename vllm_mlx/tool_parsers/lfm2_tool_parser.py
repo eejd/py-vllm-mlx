@@ -94,35 +94,37 @@ def _parse_payload(payload: str) -> list[tuple[str, dict[str, Any]]] | None:
                 return None
             try:
                 args[kw.arg] = _literal(kw.value)
-            except (ValueError, TypeError, SyntaxError, RecursionError):
+            except (ValueError, TypeError, SyntaxError, RecursionError, MemoryError):
                 return None
         calls.append((name, args))
     return calls
 
 
-def _split(text: str) -> list[tuple[str, str, bool]]:
-    """Split text into ``("text", s, True)`` / ``("block", payload, closed)`` segments.
+def _split(text: str) -> list[tuple[str, int, int, str, bool]]:
+    """Split text into ``(kind, start, end, body, closed)`` segments.
 
-    ``closed`` is False only for a trailing block that has not seen its end
-    marker yet.
+    ``kind`` is ``"text"`` or ``"block"``. ``start``/``end`` are offsets into ``text``;
+    a block spans its start marker through its end marker, and ``body`` is its payload.
+    ``closed`` is False only for a trailing block that has not seen its end marker yet.
     """
-    segments: list[tuple[str, str, bool]] = []
+    segments: list[tuple[str, int, int, str, bool]] = []
     pos = 0
     while True:
         start = text.find(TOOL_CALL_START, pos)
         if start == -1:
             if pos < len(text):
-                segments.append(("text", text[pos:], True))
+                segments.append(("text", pos, len(text), text[pos:], True))
             return segments
         if start > pos:
-            segments.append(("text", text[pos:start], True))
+            segments.append(("text", pos, start, text[pos:start], True))
         body = start + len(TOOL_CALL_START)
         end = text.find(TOOL_CALL_END, body)
         if end == -1:
-            segments.append(("block", text[body:], False))
+            segments.append(("block", start, len(text), text[body:], False))
             return segments
-        segments.append(("block", text[body:end], True))
-        pos = end + len(TOOL_CALL_END)
+        block_end = end + len(TOOL_CALL_END)
+        segments.append(("block", start, block_end, text[body:end], True))
+        pos = block_end
 
 
 def _make_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -131,6 +133,19 @@ def _make_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         "name": name,
         "arguments": json.dumps(args, ensure_ascii=False),
     }
+
+
+def _partial_marker_suffix(text: str) -> int:
+    """Length of a trailing proper prefix of the start marker (``"<|tool_c"``), else 0."""
+    for n in range(min(len(TOOL_CALL_START) - 1, len(text)), 0, -1):
+        if text.endswith(TOOL_CALL_START[:n]):
+            return n
+    return 0
+
+
+def _ends_inside_block(text: str) -> bool:
+    start = text.rfind(TOOL_CALL_START)
+    return start != -1 and text.find(TOOL_CALL_END, start + len(TOOL_CALL_START)) == -1
 
 
 @ToolParserManager.register_module(["lfm2", "lfm2.5"])
@@ -153,7 +168,7 @@ class Lfm2ToolParser(ToolParser):
         text = self.strip_think_tags(model_output)
         tool_calls: list[dict[str, Any]] = []
         content: list[str] = []
-        for kind, value, _closed in _split(text):
+        for kind, _start, _end, value, _closed in _split(text):
             if kind == "text":
                 content.append(value)
                 continue
@@ -203,73 +218,74 @@ class Lfm2ToolParser(ToolParser):
         seen once, and ``index`` is the absolute call position so a client that
         concatenates per index never sees a call twice.
         """
-        start_pos = current_text.find(TOOL_CALL_START)
-        if start_pos == -1:
-            return {"content": delta_text}
-
-        prev_end_count = previous_text.count(TOOL_CALL_END)
-        if current_text.count(TOOL_CALL_END) > prev_end_count:
-            emitted_calls = 0
-            new_calls: list[dict[str, Any]] = []
-            new_text: list[str] = []
-            first_new_index = 0
-            closed_seen = 0
-            for kind, value, closed in _split(current_text):
-                if kind != "block" or not closed:
-                    continue
-                parsed = _parse_payload(value)
-                if closed_seen < prev_end_count:
-                    emitted_calls += len(parsed or [])
-                elif parsed is None:
-                    new_text.append(value.strip())
-                else:
-                    if not new_calls:
-                        first_new_index = emitted_calls
-                    new_calls.extend(_make_call(n, a) for n, a in parsed)
-                    emitted_calls += len(parsed)
-                closed_seen += 1
-            result: dict[str, Any] = {}
-            if new_calls:
-                result = self._format_streaming(new_calls, first_new_index)
-            tail = self._text_after_last_block(previous_text, current_text)
-            content = "".join(new_text) + tail
-            if content.strip():
-                result["content"] = content
-            return result or None
-
-        in_block = current_text.count(TOOL_CALL_START) > current_text.count(
-            TOOL_CALL_END
+        # Text the stream has already handed to the client. A trailing piece that could be
+        # the start of the marker is held back until the next delta shows what it is, so a
+        # marker split across deltas never leaks as prose.
+        seen = len(previous_text)
+        if not _ends_inside_block(previous_text):
+            seen -= _partial_marker_suffix(previous_text)
+        segments = _split(current_text)
+        held = (
+            _partial_marker_suffix(current_text)
+            if segments and segments[-1][0] == "text"
+            else 0
         )
-        if in_block:
-            # Text that shared a delta with the start marker is still the user's.
-            if start_pos >= len(previous_text) and TOOL_CALL_START not in previous_text:
-                lead = current_text[len(previous_text) : start_pos]
-                if lead.strip():
-                    return {"content": lead}
-            return None
-        # Between or after calls: pass prose through, drop pure whitespace.
-        return {"content": delta_text} if delta_text.strip() else None
 
-    @staticmethod
-    def _text_after_last_block(previous_text: str, current_text: str) -> str:
-        """Text after the last end marker that this delta is the first to carry."""
-        last_end = current_text.rfind(TOOL_CALL_END)
-        if last_end == -1:
-            return ""
-        after_start = last_end + len(TOOL_CALL_END)
-        if current_text.count(TOOL_CALL_START) > current_text.count(TOOL_CALL_END):
-            return ""
-        return current_text[max(len(previous_text), after_start) :]
+        running = 0  # calls in closed blocks so far, i.e. the next absolute index
+        first_new: int | None = None
+        new_calls: list[dict[str, Any]] = []
+        content: list[str] = []
+        after_block = False
+        for kind, start, end, body, closed in segments:
+            if kind == "text":
+                # Prose is user-visible. Whatever part of it is new in this delta goes out
+                # now, including prose between two blocks that arrived in one delta.
+                stop = len(body) - (held if end == len(current_text) else 0)
+                offset = max(0, seen - start)
+                part = body[offset:stop]
+                # Whitespace right after a call is not content, but whitespace inside prose
+                # that follows it is (a word separator arriving as its own delta).
+                if part and (part.strip() or not after_block or body[:offset].strip()):
+                    content.append(part)
+                continue
+            after_block = True
+            if not closed:
+                continue  # still streaming; buffered until its end marker
+            parsed = _parse_payload(body)
+            already_sent = end <= seen
+            if parsed is None:
+                if not already_sent:
+                    content.append(body.strip())
+                continue
+            if not already_sent:
+                if first_new is None:
+                    first_new = running
+                new_calls.extend(_make_call(n, a) for n, a in parsed)
+            running += len(parsed)
+
+        result: dict[str, Any] = {}
+        if new_calls:
+            result = self._format_streaming(new_calls, first_new or 0)
+        text = "".join(content)
+        if text:
+            result["content"] = text
+        return result or None
 
     def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
         """Resolve a block the model never closed (stopped before the end marker)."""
         segments = _split(current_text)
-        if not segments or segments[-1][0] != "block" or segments[-1][2]:
+        if segments and segments[-1][0] == "text":
+            # Generation ended on something that looked like the start of a marker.
+            held = _partial_marker_suffix(current_text)
+            return {"content": current_text[-held:]} if held else None
+        if not segments or segments[-1][0] != "block" or segments[-1][4]:
             return None
         already = sum(
-            len(_parse_payload(v) or []) for k, v, c in segments[:-1] if k == "block"
+            len(_parse_payload(body) or [])
+            for kind, _s, _e, body, _c in segments[:-1]
+            if kind == "block"
         )
-        parsed = _parse_payload(segments[-1][1])
+        parsed = _parse_payload(segments[-1][3])
         if parsed is None:
             return None
         return self._format_streaming([_make_call(n, a) for n, a in parsed], already)

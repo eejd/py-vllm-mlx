@@ -269,3 +269,102 @@ class TestLfm2Finalize:
 
     def test_plain_text_is_left_alone(self):
         assert self.parser.finalize_streaming("hello") is None
+
+
+class TestLfm2ProseBetweenBlocks:
+    """Prose between two blocks must survive however the deltas are cut."""
+
+    def _stream(self, text, size):
+        parser = Lfm2ToolParser()
+        parser.reset()
+        acc, calls, content = "", [], ""
+        for i in range(0, len(text), size):
+            delta = text[i : i + size]
+            previous, acc = acc, acc + delta
+            out = parser.extract_tool_calls_streaming(previous, acc, delta)
+            calls += (out or {}).get("tool_calls", [])
+            content += (out or {}).get("content", "")
+        return calls, content
+
+    def test_prose_between_blocks_in_large_deltas(self):
+        text = _block("[a(x=1)]") + "PROSE_BETWEEN" + _block("[b(y=2)]") + "AFTER"
+        for size in (50, 64, 10_000):
+            calls, content = self._stream(text, size)
+            assert [c["index"] for c in calls] == [0, 1], size
+            assert content == "PROSE_BETWEENAFTER", size
+
+    def test_prose_before_between_and_after(self):
+        text = "A " + _block("[a(x=1)]") + " B " + _block("[b(y=2)]") + " C"
+        calls, content = self._stream(text, 10_000)
+        assert [c["index"] for c in calls] == [0, 1]
+        assert content.split() == ["A", "B", "C"]
+
+
+class TestLfm2Robustness:
+    def test_memory_error_while_evaluating_an_argument_is_not_a_crash(
+        self, monkeypatch
+    ):
+        from vllm_mlx.tool_parsers import lfm2_tool_parser
+
+        def boom(_tree):
+            raise MemoryError
+
+        monkeypatch.setattr(lfm2_tool_parser.ast, "literal_eval", boom)
+        result = Lfm2ToolParser().extract_tool_calls(_block("[f(x=1)]"))
+        assert result.tools_called is False
+
+    def test_huge_integer_literal_is_rejected_not_fatal(self):
+        result = Lfm2ToolParser().extract_tool_calls(
+            _block("[f(x=" + "9" * 20_000 + ")]")
+        )
+        assert result.tools_called is False
+
+    def test_deeply_nested_value_is_rejected_not_fatal(self):
+        depth = 5_000
+        result = Lfm2ToolParser().extract_tool_calls(
+            _block("[f(x=" + "[" * depth + "]" * depth + ")]")
+        )
+        assert result.tools_called is False
+
+
+class TestLfm2SplitMarkers:
+    """A marker cut across deltas is never user-visible prose."""
+
+    def _stream(self, text, size):
+        parser = Lfm2ToolParser()
+        parser.reset()
+        acc, calls, content = "", [], ""
+        for i in range(0, len(text), size):
+            delta = text[i : i + size]
+            previous, acc = acc, acc + delta
+            out = parser.extract_tool_calls_streaming(previous, acc, delta)
+            calls += (out or {}).get("tool_calls", [])
+            content += (out or {}).get("content", "")
+        return parser, acc, calls, content
+
+    def test_start_marker_split_at_every_boundary(self):
+        text = "Hi. " + _block("[a(x=1)]") + " Mid " + _block("[b(y=2)]") + " End."
+        for size in range(1, 30):
+            _parser, _acc, calls, content = self._stream(text, size)
+            assert [c["index"] for c in calls] == [0, 1], size
+            assert "<|" not in content and "|>" not in content, (size, content)
+            assert content.split() == ["Hi.", "Mid", "End."], (size, content)
+
+    def test_text_before_any_call_keeps_its_whitespace_deltas(self):
+        parser = Lfm2ToolParser()
+        parser.reset()
+        acc, content = "", ""
+        for delta in ["Hello", " ", "world", "!"]:
+            previous, acc = acc, acc + delta
+            out = parser.extract_tool_calls_streaming(previous, acc, delta)
+            content += (out or {}).get("content", "")
+        assert content == "Hello world!"
+
+    def test_a_lookalike_that_never_becomes_a_marker_is_released(self):
+        parser, acc, _calls, content = self._stream("a <|tool_ b", 1)
+        assert content == "a <|tool_ b"
+
+    def test_generation_ending_on_a_partial_marker_is_released_on_finalize(self):
+        parser, acc, _calls, content = self._stream("Done <|tool_ca", 2)
+        assert content == "Done "
+        assert parser.finalize_streaming(acc) == {"content": "<|tool_ca"}

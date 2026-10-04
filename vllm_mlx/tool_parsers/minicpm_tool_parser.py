@@ -29,12 +29,28 @@ from .abstract_tool_parser import (
 )
 from .hermes_tool_parser import _parse_param_value, generate_tool_id
 
-_FUNCTION_RE = re.compile(r'<function\s+name="([^"]+)"\s*>(.*?)</function>', re.DOTALL)
+# A CDATA section is matched atomically and any other text must not start a tag we are
+# looking for the end of, so a value such as ``<![CDATA[x = "</function>"]]>`` cannot end
+# its element early and an unterminated block fails fast instead of backtracking.
+_CDATA = r"(?><!\[CDATA\[.*?\]\]>)"
+_FUNCTION_RE = re.compile(
+    r'<function\s+name="([^"]+)"\s*>((?:'
+    + _CDATA
+    + r"|(?!</function>|<!\[CDATA\[).)*+)</function>",
+    re.DOTALL,
+)
 _OPEN_TAIL_RE = re.compile(r'<function\s+name="([^"]+)"\s*>(.*)\Z', re.DOTALL)
-_PARAM_RE = re.compile(r'<param\s+name="([^"]+)"\s*>(.*?)</param>', re.DOTALL)
+_PARAM_RE = re.compile(
+    r'<param\s+name="([^"]+)"\s*>((?:'
+    + _CDATA
+    + r"|(?!</param>|<!\[CDATA\[).)*+)</param>",
+    re.DOTALL,
+)
 _CDATA_RE = re.compile(r"\A\s*<!\[CDATA\[(.*)\]\]>\s*\Z", re.DOTALL)
-# Legacy MiniCPM tokens some checkpoints still emit around a call.
-_STRAY_TOKENS_RE = re.compile(r"</?tool_call>")
+_CDATA_SECTION_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+# Legacy MiniCPM tokens some checkpoints still emit around a call, and a closing tag with
+# no element to close.
+_STRAY_TOKENS_RE = re.compile(r"</?tool_call>|</function>")
 
 _FUNCTION_OPEN = "<function"
 _FUNCTION_CLOSE = "</function>"
@@ -123,6 +139,35 @@ class MiniCPMToolParser(ToolParser):
             tools_called=True, tool_calls=calls, content=content or None
         )
 
+    def __init__(self, tokenizer=None):
+        super().__init__(tokenizer)
+        self._reset_stream_state()
+
+    def _reset_stream_state(self) -> None:
+        # Elements already closed in the text seen so far, where the last one ended, and how
+        # much text that covers. Streaming advances this incrementally so each delta only
+        # scans the new window instead of re-matching the whole output.
+        self._n_closed = 0
+        self._last_end = 0
+        self._seen_len = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self._reset_stream_state()
+
+    def _sync(self, previous_text: str) -> None:
+        """Make the cached state describe ``previous_text`` (a no-op in normal streaming)."""
+        if self._seen_len == len(previous_text):
+            return
+        matches = (
+            list(_FUNCTION_RE.finditer(previous_text))
+            if _FUNCTION_CLOSE in previous_text
+            else []
+        )
+        self._n_closed = len(matches)
+        self._last_end = matches[-1].end() if matches else 0
+        self._seen_len = len(previous_text)
+
     @staticmethod
     def _format_streaming(
         calls: list[dict[str, Any]], start_index: int
@@ -152,50 +197,82 @@ class MiniCPMToolParser(ToolParser):
     ) -> dict[str, Any] | None:
         """Emit each ``<function>`` element once, when its closing tag arrives.
 
-        Every call is one element, so the absolute ``index`` is the number of
-        elements closed before it; counting on accumulated text keeps tags that
-        split across deltas correct and never re-sends a call.
+        The index of a call is the number of *elements* closed before it (not the number
+        of ``</function>`` strings: a stray one, or one inside CDATA, closes nothing).
+        Elements are tracked on accumulated text, so tags that split across deltas work and
+        a call is never re-sent. The server only routes deltas here once ``<function`` has
+        appeared, so think text before it has already gone out as content.
         """
-        start_pos = current_text.find(_FUNCTION_OPEN)
-        if start_pos == -1:
+        self._sync(previous_text)
+        if _FUNCTION_OPEN not in current_text:
+            self._seen_len = len(current_text)
             return {"content": delta_text}
 
-        prev_closed = previous_text.count(_FUNCTION_CLOSE)
-        closed = current_text.count(_FUNCTION_CLOSE)
-        if closed > prev_closed:
-            matches = list(_FUNCTION_RE.finditer(current_text))
-            new = matches[prev_closed:]
-            result: dict[str, Any] = {}
-            if new:
-                result = self._format_streaming(
-                    [_build_call(m.group(1), m.group(2), request) for m in new],
-                    prev_closed,
-                )
-            if matches and current_text.count(_FUNCTION_OPEN) <= closed:
-                tail = current_text[max(len(previous_text), matches[-1].end()) :]
-                tail = _STRAY_TOKENS_RE.sub("", tail)
-                if tail.strip():
-                    result["content"] = tail
-            return result or None
+        prev_closed = self._n_closed
+        # A newly completed element must end inside this delta (plus the bytes a tag could
+        # straddle), so only then is the matcher run.
+        window = max(0, len(previous_text) - len(_FUNCTION_CLOSE) + 1)
+        new = (
+            list(_FUNCTION_RE.finditer(current_text, self._last_end))
+            if _FUNCTION_CLOSE in current_text[window:]
+            else []
+        )
+        if new:
+            self._n_closed += len(new)
+            self._last_end = new[-1].end()
+        self._seen_len = len(current_text)
+        element_open = current_text.find(_FUNCTION_OPEN, self._last_end) != -1
 
-        if current_text.count(_FUNCTION_OPEN) > closed:
-            # Inside an element. Prose that shared a delta with its opening tag
-            # is still the user's.
-            if _FUNCTION_OPEN not in previous_text and start_pos >= len(previous_text):
-                lead = current_text[len(previous_text) : start_pos]
+        if new:
+            result: dict[str, Any] = self._format_streaming(
+                [_build_call(m.group(1), m.group(2), request) for m in new],
+                prev_closed,
+            )
+            if not element_open:
+                text = _STRAY_TOKENS_RE.sub(
+                    "", current_text[max(len(previous_text), self._last_end) :]
+                )
+                if text.strip():
+                    result["content"] = text
+            return result
+
+        if element_open:
+            # Inside an element. Prose that shared a delta with its opening tag is still
+            # the user's.
+            first_open = current_text.find(_FUNCTION_OPEN, self._last_end)
+            if first_open >= len(previous_text):
+                lead = current_text[len(previous_text) : first_open]
                 if lead.strip():
                     return {"content": lead}
             return None
         # Between or after calls: pass prose through, drop whitespace and stray tokens.
         text = _STRAY_TOKENS_RE.sub("", delta_text)
-        return {"content": text} if text.strip() else None
+        if (
+            not text.strip()
+            and not current_text[self._last_end : len(previous_text)].strip()
+        ):
+            return None  # whitespace right after a call is not content
+        return {"content": text} if text else None
 
     def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
-        """Resolve an element the model never closed, when its params are all closed."""
+        """Resolve an element the model never closed, when it is unambiguous.
+
+        The server calls this with the text only, so a schema cannot be applied: values
+        are typed by the same fallback chain as when the request has no tools.
+        """
         matches = list(_FUNCTION_RE.finditer(current_text))
         tail_from = matches[-1].end() if matches else 0
         tail = _OPEN_TAIL_RE.search(current_text, tail_from)
-        if not tail or tail.group(2).count("<param") != tail.group(2).count("</param>"):
+        if not tail:
+            return None
+        body = _CDATA_SECTION_RE.sub("", tail.group(2))
+        if (
+            _FUNCTION_OPEN in body
+            or "<![CDATA[" in body
+            or body.count("<param") != body.count("</param>")
+        ):
+            # A second element, a CDATA section the model never closed, or a param that is
+            # still open: guessing would merge or truncate arguments.
             return None
         return self._format_streaming(
             [_build_call(tail.group(1), tail.group(2), None)], len(matches)
