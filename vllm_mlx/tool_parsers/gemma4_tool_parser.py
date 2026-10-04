@@ -544,9 +544,8 @@ class Gemma4ToolParser(ToolParser):
         # Emit each call once, on the delta that first makes it parseable. A brace
         # form block still waiting for its end marker is left to the branch above,
         # otherwise its calls would be sent here and again when the block closes.
-        brace_block_pending = (
-            has_canonical
-            and bool(self._extract_canonical(self.strip_think_tags(current_text))[0])
+        brace_block_pending = has_canonical and bool(
+            self._extract_canonical(self.strip_think_tags(current_text))[0]
         )
         if has_fallback and not brace_block_pending:
             result = self.extract_tool_calls(current_text)

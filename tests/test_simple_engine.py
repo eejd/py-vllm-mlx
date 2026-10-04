@@ -12,7 +12,6 @@ import pytest
 pytestmark = pytest.mark.anyio
 
 
-
 def _wrappable_tokenizer():
     """A MagicMock tokenizer that mlx-lm's ``TokenizerWrapper`` accepts.
 
@@ -26,6 +25,7 @@ def _wrappable_tokenizer():
     tokenizer = MagicMock()
     type(tokenizer).apply_chat_template = PreTrainedTokenizerBase.apply_chat_template
     return tokenizer
+
 
 class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""

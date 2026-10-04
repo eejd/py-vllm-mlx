@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
-
 def _restore_module(name):
     """Undo a fixture's re-import so later tests see the real module.
 
@@ -37,6 +36,7 @@ def _restore_module(name):
                 setattr(parent, attr, original)
 
     return restore
+
 
 @pytest.fixture
 def engine_core_module(monkeypatch):

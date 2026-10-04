@@ -55,7 +55,7 @@ def test_multiturn_roundtrip_preserves_call_and_result():
     assistant = [m for m in chat_messages if m["role"] == "assistant"]
     assert len(assistant) == 1
     assert "```tool_code" in assistant[0]["content"]
-    assert 'radarr_get_movies(search=' in assistant[0]["content"]
+    assert "radarr_get_movies(search=" in assistant[0]["content"]
 
     # The tool result survives as a tool_output block inside a user turn.
     rendered = "\n".join(str(m["content"]) for m in chat_messages)
@@ -137,7 +137,11 @@ class _FakePydantic:
 
     def model_dump(self, exclude_none=False):
         return {
-            k: (v.model_dump(exclude_none=exclude_none) if isinstance(v, _FakePydantic) else v)
+            k: (
+                v.model_dump(exclude_none=exclude_none)
+                if isinstance(v, _FakePydantic)
+                else v
+            )
             for k, v in self._data.items()
             if not (exclude_none and v is None)
         }
@@ -174,9 +178,17 @@ def test_gemma_template_needs_serialization():
 
 
 def test_unknown_template_falls_back_to_model_type():
-    processor = SimpleNamespace(chat_template=None, tokenizer=SimpleNamespace(chat_template=None))
-    assert _template_supports_tool_role(processor, SimpleNamespace(model_type="gemma4")) is False
-    assert _template_supports_tool_role(processor, SimpleNamespace(model_type="qwen3")) is True
+    processor = SimpleNamespace(
+        chat_template=None, tokenizer=SimpleNamespace(chat_template=None)
+    )
+    assert (
+        _template_supports_tool_role(processor, SimpleNamespace(model_type="gemma4"))
+        is False
+    )
+    assert (
+        _template_supports_tool_role(processor, SimpleNamespace(model_type="qwen3"))
+        is True
+    )
 
 
 def test_non_tool_messages_unchanged():

@@ -447,11 +447,7 @@ def _template_supports_tool_role(processor: object, config: object) -> bool:
         tokenizer = getattr(processor, "tokenizer", None)
         template = getattr(tokenizer, "chat_template", None)
     if isinstance(template, str) and template:
-        return (
-            "tool_calls" in template
-            or "'tool'" in template
-            or '"tool"' in template
-        )
+        return "tool_calls" in template or "'tool'" in template or '"tool"' in template
     # Unknown template: assume support except for the Gemma family.
     model_type = str(getattr(config, "model_type", "") or "").lower()
     return "gemma" not in model_type
