@@ -114,12 +114,29 @@ def _build_call(name: str, body: str, request: dict[str, Any] | None) -> dict[st
     }
 
 
+# How far back a still-forming opening tag can start. A real tag is ``<function name="``
+# with optional extra whitespace, so a short window is enough and keeps the check O(1).
+_HOLD_WINDOW = 96
+_PARTIAL_NAME_RE = re.compile(r"\s*(?:n(?:a(?:m(?:e=?)?)?)?)?")
+
+
 def _partial_open_suffix(text: str) -> int:
-    """Length of a trailing proper prefix of the opening tag (``"<func"``), else 0."""
-    for n in range(min(len(_OPEN_CANON) - 1, len(text)), 0, -1):
-        if text.endswith(_OPEN_CANON[:n]):
-            return n
-    return 0
+    """Length of a trailing proper prefix of an opening tag (``"<func"``), else 0.
+
+    Matches what an opening tag looks like while it is still arriving: ``<``, ``<f`` ...
+    ``<function``, then whitespace, then a prefix of ``name=``. ``<functions`` is not one.
+    """
+    tail = text[-_HOLD_WINDOW:]
+    start = tail.rfind("<")
+    if start == -1:
+        return 0
+    candidate = tail[start:]
+    if len(candidate) < len(_FUNCTION_OPEN):
+        return len(candidate) if _FUNCTION_OPEN.startswith(candidate) else 0
+    if not candidate.startswith(_FUNCTION_OPEN):
+        return 0
+    rest = candidate[len(_FUNCTION_OPEN) :]
+    return len(candidate) if _PARTIAL_NAME_RE.fullmatch(rest) else 0
 
 
 @ToolParserManager.register_module(["minicpm", "minicpm5"])
@@ -226,17 +243,17 @@ class MiniCPMToolParser(ToolParser):
         appeared, so think text before it has already gone out as content.
         """
         if not self._open_seen and self._seen_len == len(previous_text):
-            window = current_text[
-                max(0, len(previous_text) - len(_FUNCTION_OPEN) + 1) :
-            ]
-            if _FUNCTION_OPEN not in window:
+            window = current_text[max(0, len(previous_text) - _HOLD_WINDOW) :]
+            if _OPEN_RE.search(window) is None:
                 held = _partial_open_suffix(current_text)
                 part = current_text[
                     len(previous_text) - self._held : len(current_text) - held
                 ]
                 self._held, self._seen_len = held, len(current_text)
-                if part and (part.strip() or self._prose_sent):
-                    self._prose_sent = self._prose_sent or bool(part.strip())
+                if not self._prose_sent:
+                    part = part.lstrip()
+                if part:
+                    self._prose_sent = True
                     return {"content": part}
                 return None
         self._open_seen = True
@@ -281,9 +298,11 @@ class MiniCPMToolParser(ToolParser):
             part = _STRAY_TOKENS_RE.sub("", current_text[lo:b]) if b > lo else ""
             # Leading whitespace is not content (the non-streaming result strips it), but
             # once prose has gone out whitespace is a word separator.
-            if part and (part.strip() or prose_sent):
+            if not prose_sent:
+                part = part.lstrip()
+            if part:
                 content.append(part)
-                prose_sent = prose_sent or bool(part.strip())
+                prose_sent = True
         self._prose_sent = prose_sent
 
         result: dict[str, Any] = {}

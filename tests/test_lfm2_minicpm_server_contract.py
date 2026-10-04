@@ -114,3 +114,44 @@ class TestMiniCPMProseThatLooksLikeATag:
         calls, content = _run_like_the_server(MiniCPMToolParser(), text, size)
         assert calls == {0: "get_weather"}
         assert content.split() == ["Use", "<functions>", "to", "call."]
+
+
+@pytest.mark.parametrize("name", sorted(CASES))
+class TestLeadingWhitespaceIsChunkIndependent:
+    """Leading whitespace is dropped however it is split from the first word."""
+
+    @pytest.mark.parametrize("size", [1, 2, 3, 5, 13, 64, 10_000])
+    def test_plain_prose(self, name, size):
+        _calls, content = _run_like_the_server(
+            CASES[name][0](), "   three spaces then word. And more.", size
+        )
+        assert content == "three spaces then word. And more."
+
+    @pytest.mark.parametrize("size", [1, 7, 60, 10_000])
+    def test_prose_right_after_a_call(self, name, size):
+        cls, _two, one = CASES[name]
+        _calls, content = _run_like_the_server(cls(), one + " PostWord more", size)
+        assert content == "PostWord more"
+
+
+class TestMiniCPMTagShapes:
+    @pytest.mark.parametrize("size", [1, 3, 10_000])
+    def test_extra_whitespace_inside_the_opening_tag(self, size):
+        text = '<function   name="f"><param name="x">1</param></function>'
+        calls, content = _run_like_the_server(MiniCPMToolParser(), text, size)
+        assert calls == {0: "f"}
+        assert content == ""
+
+    @pytest.mark.parametrize("prefix", ["Use <functions> to ", "I <func", "a < b "])
+    def test_a_lookalike_early_does_not_disable_the_constant_time_path(self, prefix):
+        parser = MiniCPMToolParser()
+        parser.reset()
+        text = prefix + "word " * 40_000
+        acc = ""
+        start = time.perf_counter()
+        for i in range(0, len(text), 3):
+            delta = text[i : i + 3]
+            previous, acc = acc, acc + delta
+            parser.extract_tool_calls_streaming(previous, acc, delta)
+        assert time.perf_counter() - start < 3
+        assert parser._open_seen is False

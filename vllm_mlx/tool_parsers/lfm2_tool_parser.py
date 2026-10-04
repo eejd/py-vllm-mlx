@@ -248,8 +248,10 @@ class Lfm2ToolParser(ToolParser):
                     len(previous_text) - self._held : len(current_text) - held
                 ]
                 self._held, self._seen_len = held, len(current_text)
-                if part and (part.strip() or self._prose_sent):
-                    self._prose_sent = self._prose_sent or bool(part.strip())
+                if not self._prose_sent:
+                    part = part.lstrip()
+                if part:
+                    self._prose_sent = True
                     return {"content": part}
                 return None
         self._marker_seen = True
@@ -279,9 +281,11 @@ class Lfm2ToolParser(ToolParser):
                 part = body[max(0, seen - start) : stop]
                 # Leading whitespace is not content (the non-streaming result strips it),
                 # but once prose has gone out whitespace is a word separator.
-                if part and (part.strip() or prose_sent):
+                if not prose_sent:
+                    part = part.lstrip()
+                if part:
                     content.append(part)
-                    prose_sent = prose_sent or bool(part.strip())
+                    prose_sent = True
                 continue
             if not closed:
                 continue  # still streaming; buffered until its end marker
