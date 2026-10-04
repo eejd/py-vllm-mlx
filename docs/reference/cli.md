@@ -59,7 +59,7 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
-| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`) | None |
+| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`, `lfm2`, `minicpm`; see the tool-calling guide for the full list) | None |
 | `--models-config` | YAML registry file for multi-model serving | None |
 | `--memory-budget-gb` | Override the registry manager model-weight residency budget in GB. This is not a total runtime-memory limit and does not guarantee prevention of Metal/MLX OOM. | YAML manager budget |
 

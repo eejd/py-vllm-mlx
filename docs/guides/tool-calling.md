@@ -89,6 +89,8 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `xlam` | | Salesforce xLAM | JSON with `tool_calls` array |
 | `functionary` | `meetkai` | MeetKai Functionary | Multiple function blocks |
 | `glm47` | `glm4` | GLM-4.7, GLM-4.7-Flash | `<tool_call>` with `<arg_key>`/`<arg_value>` XML |
+| `lfm2` | `lfm2.5` | Liquid LFM2, LFM2.5 | `<\|tool_call_start\|>[fn(arg=value)]<\|tool_call_end\|>` Python-call list |
+| `minicpm` | `minicpm5` | MiniCPM5 | `<function name=".."><param name="..">..</param></function>` XML |
 
 ## Model Examples
 

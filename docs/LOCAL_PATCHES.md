@@ -18,6 +18,7 @@ Base: upstream `80e7fde` (2026-10-03, 57 commits past v0.5.0).
 | 8 | Remove the pre-0.31.2 BatchGenerator monkey-patch layer (~600 lines that could not run on any supported mlx-lm) and their tests | 044134d | local | candidate | n/a |
 | 9 | Test isolation: restore `sys.modules`/package attributes after fixtures that re-import `engine_core`/`engine.batched` (4 order-dependent failures present on upstream main); wrappable mock tokenizers for 0.32; plugin tests skip without vllm/torch | 4e50df2 | local | candidate | n/a |
 | 10 | CI: triggers on `eejd/**` and `release/**`; Apple Silicon job runs mlx-lm 0.31.3 and latest; plugin test step; black-clean | 598ed4a and later | local | fork-only | n/a |
+| 11 | Tool parsers `lfm2` (`lfm2.5`) and `minicpm` (`minicpm5`): the LFM2 Python-call list between `<\|tool_call_start\|>`/`<\|tool_call_end\|>` and the MiniCPM5 `<function name><param name>` XML, each with absolute-index emit-once streaming, `finalize_streaming`, and a round-trip test against the models' own chat templates (skipped without the local model cache) | this change | local; eejd/py-vllm-mlx#19 | candidate (not opened); no lfm/minicpm parser exists upstream at 80e7fde | Upstream ships LFM2/MiniCPM parsers |
 
 ## Landed upstream (no longer carried)
 
