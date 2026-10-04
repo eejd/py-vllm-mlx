@@ -162,6 +162,14 @@ class Lfm2ToolParser(ToolParser):
     # Lets the server route deltas here once the (non-special) start marker shows up.
     STREAMING_MARKERS = (TOOL_CALL_START,)
 
+    def __init__(self, tokenizer=None):
+        super().__init__(tokenizer)
+        self._prose_sent = False
+
+    def reset(self) -> None:
+        super().reset()
+        self._prose_sent = False
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
@@ -235,20 +243,19 @@ class Lfm2ToolParser(ToolParser):
         first_new: int | None = None
         new_calls: list[dict[str, Any]] = []
         content: list[str] = []
-        after_block = False
+        prose_sent = self._prose_sent
         for kind, start, end, body, closed in segments:
             if kind == "text":
                 # Prose is user-visible. Whatever part of it is new in this delta goes out
                 # now, including prose between two blocks that arrived in one delta.
                 stop = len(body) - (held if end == len(current_text) else 0)
-                offset = max(0, seen - start)
-                part = body[offset:stop]
-                # Whitespace right after a call is not content, but whitespace inside prose
-                # that follows it is (a word separator arriving as its own delta).
-                if part and (part.strip() or not after_block or body[:offset].strip()):
+                part = body[max(0, seen - start) : stop]
+                # Leading whitespace is not content (the non-streaming result strips it),
+                # but once prose has gone out whitespace is a word separator.
+                if part and (part.strip() or prose_sent):
                     content.append(part)
+                    prose_sent = prose_sent or bool(part.strip())
                 continue
-            after_block = True
             if not closed:
                 continue  # still streaming; buffered until its end marker
             parsed = _parse_payload(body)
@@ -256,6 +263,7 @@ class Lfm2ToolParser(ToolParser):
             if parsed is None:
                 if not already_sent:
                     content.append(body.strip())
+                    prose_sent = prose_sent or bool(body.strip())
                 continue
             if not already_sent:
                 if first_new is None:
@@ -266,6 +274,7 @@ class Lfm2ToolParser(ToolParser):
         result: dict[str, Any] = {}
         if new_calls:
             result = self._format_streaming(new_calls, first_new or 0)
+        self._prose_sent = prose_sent
         text = "".join(content)
         if text:
             result["content"] = text

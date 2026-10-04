@@ -109,6 +109,14 @@ def _build_call(name: str, body: str, request: dict[str, Any] | None) -> dict[st
     }
 
 
+def _partial_open_suffix(text: str) -> int:
+    """Length of a trailing proper prefix of ``<function`` (``"<func"``), else 0."""
+    for n in range(min(len(_FUNCTION_OPEN) - 1, len(text)), 0, -1):
+        if text.endswith(_FUNCTION_OPEN[:n]):
+            return n
+    return 0
+
+
 @ToolParserManager.register_module(["minicpm", "minicpm5"])
 class MiniCPMToolParser(ToolParser):
     """Tool call parser for MiniCPM5.
@@ -150,6 +158,7 @@ class MiniCPMToolParser(ToolParser):
         self._n_closed = 0
         self._last_end = 0
         self._seen_len = 0
+        self._prose_sent = False
 
     def reset(self) -> None:
         super().reset()
@@ -204,16 +213,12 @@ class MiniCPMToolParser(ToolParser):
         appeared, so think text before it has already gone out as content.
         """
         self._sync(previous_text)
-        if _FUNCTION_OPEN not in current_text:
-            self._seen_len = len(current_text)
-            return {"content": delta_text}
-
-        prev_closed = self._n_closed
+        prev_closed, prev_last_end = self._n_closed, self._last_end
         # A newly completed element must end inside this delta (plus the bytes a tag could
         # straddle), so only then is the matcher run.
         window = max(0, len(previous_text) - len(_FUNCTION_CLOSE) + 1)
         new = (
-            list(_FUNCTION_RE.finditer(current_text, self._last_end))
+            list(_FUNCTION_RE.finditer(current_text, prev_last_end))
             if _FUNCTION_CLOSE in current_text[window:]
             else []
         )
@@ -221,38 +226,46 @@ class MiniCPMToolParser(ToolParser):
             self._n_closed += len(new)
             self._last_end = new[-1].end()
         self._seen_len = len(current_text)
-        element_open = current_text.find(_FUNCTION_OPEN, self._last_end) != -1
 
+        # Prose is the text outside elements. ``handed`` is how much of the output the
+        # client has already been given: up to an open element's tag, or, with none open,
+        # up to a trailing piece that could still be the start of ``<function`` (held back
+        # so a tag split across deltas never leaks as prose).
+        def prose_end(text: str, last_end: int) -> int:
+            opened = text.find(_FUNCTION_OPEN, last_end)
+            return opened if opened != -1 else len(text) - _partial_open_suffix(text)
+
+        handed = prose_end(previous_text, prev_last_end)
+        end_now = prose_end(current_text, self._last_end)
+        gaps: list[tuple[int, int]] = []
+        cursor = prev_last_end
+        for m in new:
+            gaps.append((cursor, m.start()))
+            cursor = m.end()
+        gaps.append((cursor, end_now))
+
+        content: list[str] = []
+        prose_sent = self._prose_sent
+        for a, b in gaps:
+            lo = max(a, handed)
+            part = _STRAY_TOKENS_RE.sub("", current_text[lo:b]) if b > lo else ""
+            # Leading whitespace is not content (the non-streaming result strips it), but
+            # once prose has gone out whitespace is a word separator.
+            if part and (part.strip() or prose_sent):
+                content.append(part)
+                prose_sent = prose_sent or bool(part.strip())
+        self._prose_sent = prose_sent
+
+        result: dict[str, Any] = {}
         if new:
-            result: dict[str, Any] = self._format_streaming(
+            result = self._format_streaming(
                 [_build_call(m.group(1), m.group(2), request) for m in new],
                 prev_closed,
             )
-            if not element_open:
-                text = _STRAY_TOKENS_RE.sub(
-                    "", current_text[max(len(previous_text), self._last_end) :]
-                )
-                if text.strip():
-                    result["content"] = text
-            return result
-
-        if element_open:
-            # Inside an element. Prose that shared a delta with its opening tag is still
-            # the user's.
-            first_open = current_text.find(_FUNCTION_OPEN, self._last_end)
-            if first_open >= len(previous_text):
-                lead = current_text[len(previous_text) : first_open]
-                if lead.strip():
-                    return {"content": lead}
-            return None
-        # Between or after calls: pass prose through, drop whitespace and stray tokens.
-        text = _STRAY_TOKENS_RE.sub("", delta_text)
-        if (
-            not text.strip()
-            and not current_text[self._last_end : len(previous_text)].strip()
-        ):
-            return None  # whitespace right after a call is not content
-        return {"content": text} if text else None
+        text = "".join(content)
+        if text:
+            result["content"] = text
+        return result or None
 
     def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
         """Resolve an element the model never closed, when it is unambiguous.
@@ -264,7 +277,9 @@ class MiniCPMToolParser(ToolParser):
         tail_from = matches[-1].end() if matches else 0
         tail = _OPEN_TAIL_RE.search(current_text, tail_from)
         if not tail:
-            return None
+            # Generation ended on something that looked like the start of a tag.
+            held = _partial_open_suffix(current_text)
+            return {"content": current_text[-held:]} if held else None
         body = _CDATA_SECTION_RE.sub("", tail.group(2))
         if (
             _FUNCTION_OPEN in body

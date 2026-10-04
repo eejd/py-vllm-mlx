@@ -67,17 +67,18 @@ CASES = {
 
 def _stream_calls(parser, text, size):
     parser.reset()
-    calls, seen, acc = {}, {}, ""
+    calls, seen, acc, prose = {}, {}, "", []
     for i in range(0, len(text), size):
         delta = text[i : i + size]
         previous, acc = acc, acc + delta
         out = parser.extract_tool_calls_streaming(previous, acc, delta)
+        prose.append((out or {}).get("content") or "")
         for tc in (out or {}).get("tool_calls", []):
             slot = calls.setdefault(tc["index"], {"name": "", "arguments": ""})
             slot["name"] += tc["function"]["name"] or ""
             slot["arguments"] += tc["function"]["arguments"] or ""
             seen[tc["index"]] = seen.get(tc["index"], 0) + 1
-    return calls, seen
+    return calls, seen, "".join(prose)
 
 
 @pytest.mark.parametrize("size", [1, 2, 5, 13, 64, 10_000])
@@ -87,11 +88,14 @@ def test_streamed_calls_equal_the_non_streaming_calls(name, size):
     rng = random.Random(f"{name}-{size}")
     for _ in range(40):
         text = make(rng)
-        expected = parser_cls().extract_tool_calls(text).tool_calls
-        calls, seen = _stream_calls(parser_cls(), text, size)
+        extracted = parser_cls().extract_tool_calls(text)
+        expected = extracted.tool_calls
+        calls, seen, prose = _stream_calls(parser_cls(), text, size)
 
         assert sorted(calls) == list(range(len(expected))), (text, calls)
         assert all(n == 1 for n in seen.values()), (text, seen)
         assert [
             (calls[i]["name"], json.loads(calls[i]["arguments"])) for i in sorted(calls)
         ] == [(c["name"], json.loads(c["arguments"])) for c in expected], text
+        # The same user-visible words come out, in order, and no tag text leaks.
+        assert prose.split() == (extracted.content or "").split(), (text, prose)
