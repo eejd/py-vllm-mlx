@@ -14,16 +14,22 @@ import pytest
 
 from vllm_mlx.tool_parsers.gemma4_tool_parser import Gemma4ToolParser
 from vllm_mlx.tool_parsers.hermes_tool_parser import HermesToolParser
+from vllm_mlx.tool_parsers.lfm2_tool_parser import Lfm2ToolParser
+from vllm_mlx.tool_parsers.minicpm_tool_parser import MiniCPMToolParser
 from vllm_mlx.tool_parsers.qwen_tool_parser import QwenToolParser
 
 _QWEN_CALL = '<tool_call>\n{{"name": "get_weather", "arguments": {{"city": "{c}"}}}}\n</tool_call>'
 _GEMMA_CALL = '<|tool_call>call:get_weather{{city:<|"|>{c}<|"|>}}<tool_call|>'
+_LFM2_CALL = "<|tool_call_start|>[get_weather(city='{c}')]<|tool_call_end|>"
+_MINICPM_CALL = '<function name="get_weather"><param name="city">{c}</param></function>'
 
 # (parser class, one-call template)
 PARSERS = {
     "qwen": (QwenToolParser, _QWEN_CALL),
     "hermes": (HermesToolParser, _QWEN_CALL),
     "gemma4": (Gemma4ToolParser, _GEMMA_CALL),
+    "lfm2": (Lfm2ToolParser, _LFM2_CALL),
+    "minicpm": (MiniCPMToolParser, _MINICPM_CALL),
 }
 
 CHUNK_SIZES = [1, 3, 7, 10_000]
@@ -95,3 +101,24 @@ class TestStreamedToolCallsEmitOnce:
             + self._call(name, "Tokyo")
         )
         _assert_once(_stream(self._parser(name), text, size), ["Paris", "Tokyo"])
+
+
+@pytest.mark.parametrize("size", CHUNK_SIZES)
+def test_lfm2_parallel_calls_in_one_block_emit_once(size):
+    """LFM2 renders parallel calls inside a single marker pair."""
+    text = (
+        "<|tool_call_start|>"
+        "[get_weather(city='Paris'), get_weather(city='Tokyo')]"
+        "<|tool_call_end|>"
+    )
+    _assert_once(_stream(Lfm2ToolParser(), text, size), ["Paris", "Tokyo"])
+
+
+@pytest.mark.parametrize("size", CHUNK_SIZES)
+def test_lfm2_second_block_continues_the_index(size):
+    text = (
+        "<|tool_call_start|>[get_weather(city='Paris'), get_weather(city='Tokyo')]"
+        "<|tool_call_end|>"
+        "<|tool_call_start|>[get_weather(city='Rome')]<|tool_call_end|>"
+    )
+    _assert_once(_stream(Lfm2ToolParser(), text, size), ["Paris", "Tokyo", "Rome"])

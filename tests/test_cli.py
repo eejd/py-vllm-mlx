@@ -240,6 +240,24 @@ def test_serve_parser_accepts_registered_step3p5_tool_parser():
     assert args.tool_call_parser == "step3p5"
 
 
+@pytest.mark.parametrize("name", ["lfm2", "lfm2.5", "minicpm", "minicpm5"])
+def test_serve_parser_accepts_registered_lfm2_and_minicpm_tool_parsers(name):
+    from vllm_mlx import cli
+
+    args = cli.create_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            "local-test-model",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            name,
+        ]
+    )
+
+    assert args.tool_call_parser == name
+
+
 def test_memory_budget_help_describes_scope_and_limitations(capsys):
     from vllm_mlx.cli import create_parser
 

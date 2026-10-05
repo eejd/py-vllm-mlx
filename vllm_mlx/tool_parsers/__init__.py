@@ -22,6 +22,8 @@ Available parsers:
 - glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
 - harmony/gpt-oss: GPT-OSS models (Harmony format with channels)
 - minimax: MiniMax-M2 models
+- lfm2/lfm2.5: Liquid LFM2/LFM2.5 models (<|tool_call_start|>[fn(k=v)]<|tool_call_end|>)
+- minicpm/minicpm5: MiniCPM5 models (<function name=".."><param name="..">..</param></function>)
 - step3p5/step: Step3p5/Step 3.7 Flash XML function calls
 
 Usage:
@@ -56,7 +58,9 @@ from .gemma4_tool_parser import Gemma4ToolParser
 from .granite_tool_parser import GraniteToolParser
 from .hermes_tool_parser import HermesToolParser
 from .kimi_tool_parser import KimiToolParser
+from .lfm2_tool_parser import Lfm2ToolParser
 from .llama_tool_parser import LlamaToolParser
+from .minicpm_tool_parser import MiniCPMToolParser
 from .mistral_tool_parser import MistralToolParser
 from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
@@ -107,6 +111,8 @@ __all__ = [
     "PoolsideV1ToolParser",
     "Qwen3XMLToolParser",
     "LlamaToolParser",
+    "Lfm2ToolParser",
+    "MiniCPMToolParser",
     "HermesToolParser",
     "DeepSeekToolParser",
     "DeepSeekV4ToolParser",
