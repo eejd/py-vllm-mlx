@@ -62,6 +62,22 @@ class TestNonStreaming:
         result = parser.extract_tool_calls('<tool_call>\n{"name": "fetch", "argum')
         assert not result.tool_calls
 
+    def test_hermes_prose_after_json_is_kept_by_the_lenient_fallback(self):
+        # Not the new \\Z alternative: hermes' pre-existing TOOL_CALL_LENIENT_PATTERN
+        # accepts a complete {"name", "arguments"} object whatever follows it.
+        result = HermesToolParser().extract_tool_calls(
+            f"<tool_call>\n{FASTA}\nand some prose"
+        )
+        assert len(result.tool_calls) == 1
+
+    def test_two_unclosed_blocks_yield_no_calls(self, parser):
+        # Limitation: only the LAST block may be unterminated. With no closing tag at all,
+        # the first block's lazy match runs to the final "}" and is not valid JSON.
+        result = parser.extract_tool_calls(
+            f"<tool_call>\n{FASTA}\n<tool_call>\n{GENBANK}"
+        )
+        assert not result.tool_calls
+
     def test_closed_blocks_unchanged(self, parser):
         text = "Sure.\n" + _closed(FASTA) + "\n" + _closed(GENBANK)
         result = parser.extract_tool_calls(text)
