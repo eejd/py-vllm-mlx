@@ -62,6 +62,9 @@ class HermesToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser hermes are set.
     """
 
+    # An unterminated last block can arrive in the same delta as an emitted call.
+    FINALIZE_AFTER_RESULT = True
+
     # Qwen3 / Hermes chat templates handle role="tool" and tool_calls natively.
     # Without this, tool history is converted to "[Calling tool: ...]" text,
     # which causes the model to mimic that text format instead of producing
@@ -69,7 +72,11 @@ class HermesToolParser(ToolParser):
     SUPPORTS_NATIVE_TOOL_FORMAT = True
 
     # Standard format: <tool_call>{"name": ..., "arguments": ...}</tool_call>
-    TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    # The closing tag is optional at the very end of the output (a model that stops after
+    # the last call's JSON); see QwenToolParser.XML_PATTERN.
+    TOOL_CALL_PATTERN = re.compile(
+        r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|\Z)", re.DOTALL
+    )
     # Lenient format: <tool_call or <tool_call> followed by JSON (handles malformed tags)
     TOOL_CALL_LENIENT_PATTERN = re.compile(
         r'<tool_call[^{]*(\{"name":\s*"[^"]+",\s*"arguments":\s*\{[^}]*\}\})', re.DOTALL
@@ -285,20 +292,26 @@ class HermesToolParser(ToolParser):
         prev_close_count = previous_text.count("</tool_call>")
 
         if open_count > 0:
-            if open_count > close_count:
-                # Inside an incomplete tool call block, suppress output
-                return None
-
             if close_count > prev_close_count:
-                # New tool call(s) completed in this delta
-                result = self.extract_tool_calls(current_text, request)
+                # New tool call(s) completed in this delta. Parse only the closed blocks:
+                # a later block may still be open, and finalize_streaming resolves one
+                # that the model never closes.
+                closed_text = current_text[
+                    : current_text.rfind("</tool_call>") + len("</tool_call>")
+                ]
+                result = self.extract_tool_calls(closed_text, request)
                 if result.tools_called:
                     # Only emit newly completed tool calls (skip already emitted)
                     new_calls = result.tool_calls[prev_close_count:]
                     if new_calls:
+                        self.current_tool_id = len(result.tool_calls) - 1
                         return self._format_streaming_tool_calls(
                             new_calls, start_index=prev_close_count
                         )
+
+            if open_count > close_count:
+                # Inside an incomplete tool call block, suppress output
+                return None
 
             # All current tool calls already emitted, pass content through
             return {"content": delta_text}
@@ -334,3 +347,15 @@ class HermesToolParser(ToolParser):
             return None
 
         return {"content": delta_text}
+
+    def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
+        """Emit a final ``<tool_call>`` block the model never closed."""
+        if current_text.count("<tool_call>") <= current_text.count("</tool_call>"):
+            return None
+        result = self.extract_tool_calls(current_text)
+        first_new = self.current_tool_id + 1
+        new_calls = result.tool_calls[first_new:] if result.tools_called else []
+        if not new_calls:
+            return None
+        self.current_tool_id = len(result.tool_calls) - 1
+        return self._format_streaming_tool_calls(new_calls, start_index=first_new)
