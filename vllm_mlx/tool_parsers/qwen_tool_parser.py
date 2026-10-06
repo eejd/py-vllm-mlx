@@ -60,8 +60,12 @@ class QwenToolParser(ToolParser):
 
     SUPPORTS_NATIVE_TOOL_FORMAT = True
 
-    # Pattern for XML-style: <tool_call>{"json"}</tool_call>
-    XML_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    # Pattern for XML-style: <tool_call>{"json"}</tool_call>. The closing tag is optional
+    # at the very end of the output: small Qwen3 models sometimes stop after the last
+    # call's JSON without emitting </tool_call> (vllm's hermes parser accepts this too).
+    XML_PATTERN = re.compile(
+        r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|\Z)", re.DOTALL
+    )
 
     # Pattern for bracket-style: [Calling tool: func_name({...})]
     BRACKET_PATTERN = re.compile(r"\[Calling tool:\s*(\w+)\((\{.*?\})\)\]", re.DOTALL)
@@ -356,3 +360,29 @@ class QwenToolParser(ToolParser):
                 }
 
         return None
+
+    def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
+        """Emit a final ``<tool_call>`` block the model never closed.
+
+        Streaming emits a call once its ``</tool_call>`` arrives; a model that ends with
+        the last call's JSON and no closing tag would otherwise lose that call.
+        """
+        if current_text.count("<tool_call>") <= current_text.count("</tool_call>"):
+            return None
+        result = self.extract_tool_calls(current_text)
+        first_new = self.current_tool_id + 1
+        new_calls = result.tool_calls[first_new:] if result.tools_called else []
+        if not new_calls:
+            return None
+        self.current_tool_id = len(result.tool_calls) - 1
+        return {
+            "tool_calls": [
+                {
+                    "index": first_new + i,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for i, tc in enumerate(new_calls)
+            ]
+        }
