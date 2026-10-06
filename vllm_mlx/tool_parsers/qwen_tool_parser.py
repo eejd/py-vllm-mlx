@@ -58,6 +58,9 @@ class QwenToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser qwen are set.
     """
 
+    # An unterminated last block can arrive in the same delta as an emitted call.
+    FINALIZE_AFTER_RESULT = True
+
     SUPPORTS_NATIVE_TOOL_FORMAT = True
 
     # Pattern for XML-style: <tool_call>{"json"}</tool_call>. The closing tag is optional

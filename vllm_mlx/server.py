@@ -3221,8 +3221,8 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     content,
                     tool_request_context,
                 )
-                if output_finished and (
-                    tool_result is None or _requires_eager_tool_streaming(tool_parser)
+                if output_finished and _should_finalize_tool_stream(
+                    tool_parser, tool_result
                 ):
                     tool_result = _finalize_streaming_tool_result(
                         tool_parser, tool_accumulated_text, tool_result
@@ -3269,8 +3269,8 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     delta_text,
                     tool_request_context,
                 )
-                if output.finished and (
-                    tool_result is None or _requires_eager_tool_streaming(tool_parser)
+                if output.finished and _should_finalize_tool_stream(
+                    tool_parser, tool_result
                 ):
                     tool_result = _finalize_streaming_tool_result(
                         tool_parser, tool_accumulated_text, tool_result
@@ -3814,6 +3814,17 @@ def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
                 or _STREAMING_BARE_JSON_PARTIAL.search(text) is not None
             )
         )
+    )
+
+
+def _should_finalize_tool_stream(tool_parser, tool_result) -> bool:
+    """Whether the end-of-stream hook runs: nothing was emitted on the last delta, the
+    parser needs every delta, or the parser can still hold a call after emitting one
+    (FINALIZE_AFTER_RESULT: a closed call and an unterminated tail in the same delta)."""
+    return (
+        tool_result is None
+        or _requires_eager_tool_streaming(tool_parser)
+        or bool(getattr(tool_parser, "FINALIZE_AFTER_RESULT", False))
     )
 
 
@@ -6769,9 +6780,8 @@ async def _stream_anthropic_messages(
                                 tool_request_context,
                             )
                         )
-                        if output.finished and (
-                            tool_result is None
-                            or _requires_eager_tool_streaming(tool_parser)
+                        if output.finished and _should_finalize_tool_stream(
+                            tool_parser, tool_result
                         ):
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
@@ -6819,7 +6829,6 @@ async def _stream_anthropic_messages(
             if content_to_emit or (
                 tool_parser and output_finished and tool_markup_possible
             ):
-
                 # Filter tool call markup during streaming
                 if tool_parser and (
                     content_to_emit or (output.finished and tool_markup_possible)
@@ -6842,9 +6851,8 @@ async def _stream_anthropic_messages(
                                 tool_request_context,
                             )
                         )
-                        if output.finished and (
-                            tool_result is None
-                            or _requires_eager_tool_streaming(tool_parser)
+                        if output.finished and _should_finalize_tool_stream(
+                            tool_parser, tool_result
                         ):
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
@@ -7231,9 +7239,8 @@ async def stream_chat_completion(
                             )
                         )
 
-                        if output.finished and (
-                            tool_result is None
-                            or _requires_eager_tool_streaming(tool_parser)
+                        if output.finished and _should_finalize_tool_stream(
+                            tool_parser, tool_result
                         ):
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
@@ -7427,9 +7434,8 @@ async def stream_chat_completion(
                             )
                         )
 
-                        if output.finished and (
-                            tool_result is None
-                            or _requires_eager_tool_streaming(tool_parser)
+                        if output.finished and _should_finalize_tool_stream(
+                            tool_parser, tool_result
                         ):
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result

@@ -62,6 +62,9 @@ class HermesToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser hermes are set.
     """
 
+    # An unterminated last block can arrive in the same delta as an emitted call.
+    FINALIZE_AFTER_RESULT = True
+
     # Qwen3 / Hermes chat templates handle role="tool" and tool_calls natively.
     # Without this, tool history is converted to "[Calling tool: ...]" text,
     # which causes the model to mimic that text format instead of producing

@@ -100,10 +100,11 @@ def _stream(parser, text: str, size: int) -> tuple[dict[int, dict], dict | None]
             request={"tools": []},
         )
         _collect(last, calls, emissions)
-    # The server runs the end-of-stream hook when the last delta produced nothing.
+    # Same decision as the server's end-of-stream hook.
     final = None
-    if last is None:
-        final = server._finalize_streaming_tool_result(parser, acc, last)
+    if server._should_finalize_tool_stream(parser, last):
+        # merged with None so only what the hook itself adds is collected
+        final = server._finalize_streaming_tool_result(parser, acc, None)
         _collect(final, calls, emissions)
     assert all(n == 1 for n in emissions.values()), emissions
     return calls, final
@@ -119,10 +120,7 @@ def _collect(result, calls, emissions):
 
 
 class TestStreaming:
-    # A single delta that carries the last closed block and the unterminated tail returns a
-    # result, so the server skips the end-of-stream hook; real streams deliver the tail in
-    # later deltas. Sizes below keep the tail in its own deltas.
-    @pytest.mark.parametrize("size", [1, 5, 17])
+    @pytest.mark.parametrize("size", [1, 5, 17, 10_000])
     def test_unterminated_last_block_emitted_once(self, parser, size):
         calls, _ = _stream(parser, PARALLEL_106, size)
         assert sorted(calls) == [0, 1, 2]
