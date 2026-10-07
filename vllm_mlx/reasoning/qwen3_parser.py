@@ -18,10 +18,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
 
     Qwen3 uses <think>...</think> tokens to denote reasoning text.
 
-    Supports three scenarios:
+    Supports four scenarios:
     1. Both tags in output: <think>reasoning</think>content
     2. Only closing tag (think in prompt): reasoning</think>content
-    3. No tags: pure content
+    3. Only opening tag (generation stopped mid-thought, e.g. max_tokens):
+       <think>reasoning -> reasoning only, no content
+    4. No tags: pure content
 
     Example (normal):
         Input: "<think>Let me analyze this...</think>The answer is 42."
@@ -56,9 +58,11 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         Returns:
             (reasoning, content) tuple.
         """
-        # If no end token at all, treat as pure content
-        if self.end_token not in model_output:
+        # No tags at all: pure content (thinking off, or an unmarked reply).
+        # An unterminated <think> is reasoning that was cut off; it must not
+        # leak into content (streaming already routes it to reasoning).
+        if self.end_token not in model_output and self.start_token not in model_output:
             return None, model_output
 
-        # Use base class implementation (handles both explicit and implicit)
+        # Use base class implementation (handles explicit, implicit, truncated)
         return super().extract_reasoning(model_output)

@@ -511,6 +511,58 @@ class TestExtractMultimodalContent:
         assert processed[0]["tool_call_id"] == "call_1"
         assert processed[0]["content"] == "72F and sunny"
 
+    @staticmethod
+    def _tool_call_turn(**extra):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "NYC"}'},
+                }
+            ],
+            **extra,
+        }
+
+    @pytest.mark.parametrize("key", ["reasoning_content", "reasoning"])
+    def test_native_tool_call_keeps_replayed_reasoning(self, key):
+        processed, *_ = extract_multimodal_content(
+            [self._tool_call_turn(**{key: "need the weather"})],
+            preserve_native_format=True,
+        )
+        assert processed[0]["reasoning_content"] == "need the weather"
+        assert processed[0]["tool_calls"][0]["function"]["arguments"] == {"city": "NYC"}
+
+    def test_native_tool_call_keeps_reasoning_from_message_model(self):
+        msg = Message(**self._tool_call_turn(reasoning="from alias"))
+        processed, *_ = extract_multimodal_content([msg], preserve_native_format=True)
+        assert processed[0]["reasoning_content"] == "from alias"
+
+    def test_native_tool_call_without_reasoning_has_no_field(self):
+        processed, *_ = extract_multimodal_content(
+            [self._tool_call_turn()], preserve_native_format=True
+        )
+        assert "reasoning_content" not in processed[0]
+
+    def test_replayed_reasoning_changes_rendered_prompt(self):
+        jinja2 = pytest.importorskip("jinja2")
+        tmpl = jinja2.Template(
+            "{% for m in messages %}{% if m.reasoning_content %}"
+            "<think>{{ m.reasoning_content }}</think>{% endif %}"
+            "{{ m.role }}|{% endfor %}"
+        )
+        base = [{"role": "user", "content": "hi"}]
+        with_r, *_ = extract_multimodal_content(
+            [*base, self._tool_call_turn(reasoning_content="why")],
+            preserve_native_format=True,
+        )
+        without, *_ = extract_multimodal_content(
+            [*base, self._tool_call_turn()], preserve_native_format=True
+        )
+        assert tmpl.render(messages=with_r) != tmpl.render(messages=without)
+
     def test_assistant_with_tool_calls(self):
         messages = [
             Message(
