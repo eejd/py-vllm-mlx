@@ -564,15 +564,14 @@ def _content_to_text(content) -> str:
 def _replayed_reasoning(msg: Message | dict) -> str | None:
     """Return reasoning a client replayed on an assistant message, if any.
 
-    Accepts ``reasoning_content`` or the ``reasoning`` alias (as
-    ``api.models.Message`` does) on dict or Pydantic messages.
+    Dicts may carry ``reasoning_content`` or the ``reasoning`` alias. A
+    Pydantic ``Message`` has already resolved the alias at validation, so it
+    is read through ``reasoning_content`` only.
     """
     if isinstance(msg, dict):
         value = msg.get("reasoning_content") or msg.get("reasoning")
     else:
-        value = getattr(msg, "reasoning_content", None) or getattr(
-            msg, "reasoning", None
-        )
+        value = getattr(msg, "reasoning_content", None)
     return value if isinstance(value, str) and value else None
 
 

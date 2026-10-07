@@ -546,6 +546,19 @@ class TestExtractMultimodalContent:
         )
         assert "reasoning_content" not in processed[0]
 
+    def test_non_native_tool_call_drops_reasoning(self):
+        processed, *_ = extract_multimodal_content(
+            [self._tool_call_turn(reasoning_content="why")],
+            preserve_native_format=False,
+        )
+        assert "reasoning_content" not in processed[0]
+
+    def test_empty_replayed_reasoning_is_ignored(self):
+        processed, *_ = extract_multimodal_content(
+            [self._tool_call_turn(reasoning_content="")], preserve_native_format=True
+        )
+        assert "reasoning_content" not in processed[0]
+
     def test_replayed_reasoning_changes_rendered_prompt(self):
         jinja2 = pytest.importorskip("jinja2")
         tmpl = jinja2.Template(

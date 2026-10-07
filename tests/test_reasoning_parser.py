@@ -1567,6 +1567,16 @@ class TestSplitTagStreaming:
     def parser(self, request):
         return get_parser(request.param)()
 
+    @pytest.mark.parametrize("chunk", [1, 3, 7, 16])
+    def test_truncated_think_streams_as_reasoning_like_non_streaming(self, chunk):
+        """Qwen3: an unterminated <think> is reasoning in both modes."""
+        parser = get_parser("qwen3")()
+        text = "<think>truncated thinking"
+        reasoning, content = self._stream(parser, text, chunk)
+        ns_reasoning, ns_content = parser.extract_reasoning(text)
+        assert reasoning.strip() == ns_reasoning == "truncated thinking"
+        assert content == "" and ns_content is None
+
     @pytest.mark.parametrize("chunk", [1, 2, 3, 4, 5, 6, 7, 16])
     def test_split_end_tag_does_not_leak(self, parser, chunk):
         """No fragment of </think> may surface as reasoning."""
