@@ -116,12 +116,12 @@ class TestQwen3Parser:
         assert reasoning is None
         assert content == output
 
-    def test_only_start_tag_no_reasoning(self, parser):
-        """Qwen3 requires both tags - missing end tag means no reasoning."""
+    def test_only_start_tag_is_truncated_reasoning(self, parser):
+        """An unterminated <think> is cut-off reasoning, never content."""
         output = "<think>Started thinking but never finished"
         reasoning, content = parser.extract_reasoning(output)
-        assert reasoning is None
-        assert content == output
+        assert reasoning == "Started thinking but never finished"
+        assert content is None
 
     def test_only_end_tag_implicit_mode(self, parser):
         """Qwen3 supports implicit mode - when <think> is in prompt, only </think> in output."""
@@ -666,13 +666,12 @@ class TestQwen3SpecificCases:
         assert reasoning == "some text"
         assert content == "more text"
 
-        # Only start tag - no </think> means model is still generating
-        # Qwen3 requires </think> to extract reasoning (treats as pure content until then)
+        # Only start tag - generation stopped mid-thought (e.g. max_tokens):
+        # the text is reasoning, and must not leak into content.
         output2 = "<think>incomplete reasoning"
         reasoning, content = parser.extract_reasoning(output2)
-        # No </think> = no reasoning extraction, entire output is content
-        assert reasoning is None
-        assert content == output2
+        assert reasoning == "incomplete reasoning"
+        assert content is None
 
     def test_qwen3_empty_think_tags(self, parser):
         """Test empty think tags."""
@@ -1567,6 +1566,16 @@ class TestSplitTagStreaming:
     @pytest.fixture(params=["qwen3", "deepseek_r1"])
     def parser(self, request):
         return get_parser(request.param)()
+
+    @pytest.mark.parametrize("chunk", [1, 3, 7, 16])
+    def test_truncated_think_streams_as_reasoning_like_non_streaming(self, chunk):
+        """Qwen3: an unterminated <think> is reasoning in both modes."""
+        parser = get_parser("qwen3")()
+        text = "<think>truncated thinking"
+        reasoning, content = self._stream(parser, text, chunk)
+        ns_reasoning, ns_content = parser.extract_reasoning(text)
+        assert reasoning.strip() == ns_reasoning == "truncated thinking"
+        assert content == "" and ns_content is None
 
     @pytest.mark.parametrize("chunk", [1, 2, 3, 4, 5, 6, 7, 16])
     def test_split_end_tag_does_not_leak(self, parser, chunk):

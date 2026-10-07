@@ -1330,6 +1330,41 @@ class TestHelperFunctions:
             '<|message|>{"path":"/etc/hosts"}<|call|>'
         ]
 
+    @pytest.mark.parametrize("with_tools", [False, True])
+    @pytest.mark.parametrize(
+        ("parser_name", "raw", "reasoning_text"),
+        [
+            ("qwen3", "<think>Okay so I need to", "Okay so I need to"),
+            ("gemma4", "<|channel>thought\nSome reasoning", "Some reasoning"),
+        ],
+    )
+    def test_truncated_think_stays_reasoning(
+        self, monkeypatch, with_tools, parser_name, raw, reasoning_text
+    ):
+        """A reply cut off mid-thought is all reasoning: no content, no tool
+        parsing of the raw reasoning text, with or without request tools."""
+        import vllm_mlx.server as server
+        from vllm_mlx.reasoning import get_parser
+
+        seen = []
+
+        def fake_parse(text, request, **_):
+            seen.append(text)
+            return text, None
+
+        request = SimpleNamespace(tools=[{"type": "function"}] if with_tools else None)
+        monkeypatch.setattr(server, "_reasoning_parser", get_parser(parser_name)())
+        monkeypatch.setattr(server, "_parse_tool_calls_with_parser", fake_parse)
+
+        reasoning, cleaned, tool_calls = server._extract_reasoning_and_tool_calls(
+            raw, request
+        )
+
+        assert reasoning == reasoning_text
+        assert cleaned == ""
+        assert tool_calls is None
+        assert seen == ([""] if with_tools else [])
+
 
 # =============================================================================
 # Security and Reliability Tests (PR #4)

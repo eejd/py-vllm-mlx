@@ -3557,7 +3557,14 @@ def _extract_reasoning_and_tool_calls(
             # output with the analysis (reasoning) blocks removed so the
             # commentary call can be extracted without reasoning text
             # reaching the generic fallback.
-            if request is not None and getattr(request, "tools", None):
+            # Other think-tag parsers land here for a reply cut off mid-thought
+            # (no final content): nothing is left to parse, and the raw
+            # ``<think>...`` text must not reach the tool parser or content.
+            if (
+                request is not None
+                and getattr(request, "tools", None)
+                and "<|channel|>" in output_text
+            ):
                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""

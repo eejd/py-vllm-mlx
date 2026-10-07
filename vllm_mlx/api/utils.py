@@ -561,6 +561,20 @@ def _content_to_text(content) -> str:
     return str(content)
 
 
+def _replayed_reasoning(msg: Message | dict) -> str | None:
+    """Return reasoning a client replayed on an assistant message, if any.
+
+    Dicts may carry ``reasoning_content`` or the ``reasoning`` alias. A
+    Pydantic ``Message`` has already resolved the alias at validation, so it
+    is read through ``reasoning_content`` only.
+    """
+    if isinstance(msg, dict):
+        value = msg.get("reasoning_content") or msg.get("reasoning")
+    else:
+        value = getattr(msg, "reasoning_content", None)
+    return value if isinstance(value, str) and value else None
+
+
 def extract_multimodal_content(
     messages: Sequence[Message | dict],
     preserve_native_format: bool = False,
@@ -676,6 +690,12 @@ def extract_multimodal_content(
                 msg_dict = {"role": role, "content": _content_to_text(content)}
                 if tool_calls_list:
                     msg_dict["tool_calls"] = tool_calls_list
+                # Chat templates that render prior reasoning (Qwen3, Gemma 4)
+                # read it from this field; dropping it makes client-side
+                # reasoning replay a silent no-op on the text-model path.
+                reasoning = _replayed_reasoning(msg)
+                if reasoning:
+                    msg_dict["reasoning_content"] = reasoning
                 processed_messages.append(msg_dict)
             else:
                 # Convert tool calls to text for models without native support
