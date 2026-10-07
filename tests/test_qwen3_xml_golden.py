@@ -46,7 +46,9 @@ def test_parse_error_is_logged_once_per_stream(caplog):
     parser = Qwen3XMLToolParser(None)
     with caplog.at_level("WARNING"):
         parser.extract_tool_calls(text)
-    assert len([r for r in caplog.records if "parsing XML elements" in r.getMessage()]) <= 1
+    logged = [r for r in caplog.records if "parsing XML elements" in r.getMessage()]
+    # The unpatched parser logged this dropped closer three times (measured on 0.5.0-local4).
+    assert len(logged) == 1
 
 
 @pytest.mark.parametrize(
@@ -73,3 +75,37 @@ def test_server_coerce_closes_missing_braces_and_never_completes_values():
     }
     assert _coerce_tool_arguments('{"city": "To', "get_weather", None) == '{"city": "To'
     assert _coerce_tool_arguments('{"city": "Tokyo"}', "get_weather", None) == '{"city": "Tokyo"}'
+
+
+def _extract(text):
+    tools = CASES[0]["tools"]
+    return Qwen3XMLToolParser(None).extract_tool_calls(text, {"tools": tools})
+
+
+def test_only_the_truncated_last_call_is_dropped():
+    text = (
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n"
+        "</function>\n</tool_call>\n<tool_call>\n<function=read_file>\n<parameter=path>\n/a.p"
+    )
+    result = _extract(text)
+    assert [c["name"] for c in result.tool_calls] == ["get_weather"]
+    assert json.loads(result.tool_calls[0]["arguments"]) == {"city": "Tokyo"}
+    assert "read_file" in result.content and "/a.p" in result.content
+
+
+def test_second_parameter_cut_off_drops_the_call():
+    text = (
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n"
+        "<parameter=days>\n3"
+    )
+    result = _extract(text)
+    assert not result.tools_called and "days" in result.content
+
+
+def test_prose_mentioning_function_tag_falls_back_to_valid_only():
+    text = (
+        "Use <function=nothing> as the marker.\n<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>"
+    )
+    result = _extract(text)
+    assert [json.loads(c["arguments"]) for c in result.tool_calls] == [{"city": "Tokyo"}]

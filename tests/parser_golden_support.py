@@ -38,6 +38,11 @@ def _arguments(call: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]
     return value, None
 
 
+def _canonical(calls: Any) -> str:
+    # json.dumps keeps 3 and 3.0 (and 1 and true) apart, which == does not.
+    return json.dumps(calls, sort_keys=True)
+
+
 def check_case(
     case: dict[str, Any], calls: Sequence[dict[str, Any]], content: str | None = None
 ) -> list[str]:
@@ -49,6 +54,9 @@ def check_case(
     problems: list[str] = []
     decoded: list[dict[str, Any]] = []
     for i, call in enumerate(calls):
+        if not isinstance(call, dict):
+            problems.append(f"call {i} is {type(call).__name__}, not an object")
+            continue
         name = call.get("name")
         args, err = _arguments(call)
         if not isinstance(name, str) or not name:
@@ -59,7 +67,7 @@ def check_case(
             decoded.append({"name": name, "arguments": args})
     policy = case["policy"]
     if policy in ("exact", "salvage"):
-        if not problems and decoded != case["expected_calls"]:
+        if not problems and _canonical(decoded) != _canonical(case["expected_calls"]):
             problems.append(f"expected {case['expected_calls']!r}, got {decoded!r}")
     elif policy == "reject":
         if calls:
