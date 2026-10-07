@@ -2151,7 +2151,17 @@ def get_engine() -> BaseEngine:
 def _coerce_tool_arguments(
     arguments_json: str, tool_name: str, tools: list[dict] | None
 ) -> str:
-    """Losslessly recover tool argument types from the request schema."""
+    """Losslessly recover tool argument types from the request schema.
+
+    Arguments that are not a JSON object because the model stopped before ``</function>`` get
+    their missing closing braces; a value cut off mid-way is left as it is, never completed.
+    """
+    try:
+        json.loads(arguments_json)
+    except (json.JSONDecodeError, TypeError):
+        from .tool_parsers.qwen3_xml_tool_parser import repair_json_arguments
+
+        arguments_json = repair_json_arguments(arguments_json) or arguments_json
     if not tools:
         return arguments_json
 

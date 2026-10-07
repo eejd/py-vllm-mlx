@@ -153,6 +153,7 @@ class StreamingXMLToolCallParser:
         """Reset streaming parsing state"""
 
         self.deltas = []
+        self._parse_error_logged = False
         # state for streaming
         self.tool_call_index = 0
         self.current_call_id = None
@@ -424,7 +425,13 @@ class StreamingXMLToolCallParser:
                 found_any = True
 
             except Exception as e:
-                logger.warning("Error when parsing XML elements: %s", e)
+                # expat keeps its error sticky, so one dropped closing tag raises the same
+                # failure for every following element: report it once per stream.
+                if not self._parse_error_logged:
+                    self._parse_error_logged = True
+                    logger.warning("Error when parsing XML elements: %s", e)
+                else:
+                    logger.debug("Error when parsing XML elements: %s", e)
 
             # Update processed position
             self.last_processed_pos = end_pos
@@ -1432,6 +1439,30 @@ class StreamingXMLToolCallParser:
 # ---------------------------------------------------------------------------
 
 
+
+def repair_json_arguments(raw: str) -> str | None:
+    """``raw`` if it is a JSON object, the object with missing closing braces added if that makes
+    it one (the model stopped before ``</function>``), else ``None``.
+
+    Only closing braces are ever added: a value cut off mid-way is never completed.
+    """
+    for suffix in ("", "}", "}}"):
+        try:
+            value = json.loads(raw + suffix)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        return raw + suffix if isinstance(value, dict) else None
+    return None
+
+
+def _segment_is_complete(segment: str) -> bool:
+    """Whether the model finished a call: it wrote ``</function>``, or every ``<parameter=`` it
+    opened is closed (so only the closing tags are missing, not part of a value)."""
+    return "</function>" in segment or (
+        segment.count("<parameter=") == segment.count("</parameter>")
+    )
+
+
 @ToolParserManager.register_module(["qwen3_xml", "qwen3.5", "qwen3_coder"])
 class Qwen3XMLToolParser(ToolParser):
     """
@@ -1483,21 +1514,48 @@ class Qwen3XMLToolParser(ToolParser):
                 content=result.content if result.content else model_output,
             )
 
+        # One call per "<function=" in the text, in order; used to tell a call the model
+        # finished from one it was cut off in.
+        segments = cleaned.split("<function=")[1:]
+        named = [tc for tc in result.tool_calls if tc.function and tc.function.name]
+        aligned = len(segments) == len(named)
         tool_calls: list[dict[str, Any]] = []
-        for tc in result.tool_calls:
-            if tc.function and tc.function.name:
-                tool_calls.append(
-                    {
-                        "id": tc.id or f"call_{uuid.uuid4().hex[:8]}",
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "{}",
-                    }
-                )
+        dropped: list[str] = []
+        for i, tc in enumerate(named):
+            arguments = tc.function.arguments or "{}"
+            if aligned and _segment_is_complete(segments[i]):
+                fixed = repair_json_arguments(arguments)
+            else:
+                # Cut off mid-value, or no way to tell: keep the call only if already valid.
+                fixed = arguments if repair_json_arguments(arguments) == arguments else None
+            if fixed is None:
+                dropped.append("<function=" + segments[i] if aligned else tc.function.name)
+                continue
+            tool_calls.append(
+                {
+                    "id": tc.id or f"call_{uuid.uuid4().hex[:8]}",
+                    "name": tc.function.name,
+                    "arguments": fixed,
+                }
+            )
+        if dropped:
+            logger.warning(
+                "qwen3_xml: dropped %d tool call(s) whose arguments are not a complete JSON "
+                "object (output cut off or malformed)",
+                len(dropped),
+            )
+        content = result.content
+        if dropped:
+            content = (content or "") + "".join(dropped)
+        if not tool_calls:
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=content or model_output
+            )
 
         return ExtractedToolCallInformation(
-            tools_called=len(tool_calls) > 0,
+            tools_called=True,
             tool_calls=tool_calls,
-            content=result.content,
+            content=content,
         )
 
     def extract_tool_calls_streaming(
