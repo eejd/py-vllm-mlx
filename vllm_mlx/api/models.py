@@ -262,12 +262,30 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: str | None = "stop"
 
 
+class PromptTokensDetails(BaseModel):
+    """Breakdown of the prompt tokens (OpenAI ``usage.prompt_tokens_details``)."""
+
+    cached_tokens: int = 0
+
+
 class Usage(BaseModel):
-    """Token usage statistics."""
+    """Token usage statistics.
+
+    ``prompt_tokens_details`` is present only when the engine reports how many prompt tokens
+    came from the prefix cache; it is omitted (not 0) when it does not.
+    """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    prompt_tokens_details: PromptTokensDetails | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unreported_details(self, handler):
+        data = handler(self)
+        if data.get("prompt_tokens_details") is None:
+            data.pop("prompt_tokens_details", None)
+        return data
 
 
 class GenerationMetadata(BaseModel):

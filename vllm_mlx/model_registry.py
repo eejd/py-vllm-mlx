@@ -782,6 +782,10 @@ class ModelManager:
             )
         return data
 
+    def loaded_engines(self) -> list[tuple[str, BaseEngine]]:
+        """(registered name, engine) for every model whose engine is currently loaded."""
+        return [(name, loaded.engine) for name, loaded in self._loaded.items()]
+
     def get_metrics_engine(self) -> BaseEngine | None:
         """Return the engine to source Prometheus gauges from, or None if idle.
 

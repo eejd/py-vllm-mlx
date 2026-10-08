@@ -250,6 +250,43 @@ class MemoryCacheConfig:
                 f"min_prefix_tokens must be >= 1, got {self.min_prefix_tokens}"
             )
 
+    def memory_limit_details(self) -> dict[str, Any]:
+        """
+        Compute the memory limit in bytes and record how it was derived.
+
+        The default is a fraction of the RAM that is *free when the cache is created*, so it
+        differs between starts; ``source`` makes that visible.
+
+        Returns:
+            ``{"bytes", "source", ...}`` where source is ``explicit`` (``max_memory_mb``),
+            ``percent_of_available`` (with ``percent`` and ``available_bytes``) or
+            ``fallback_8gb`` (free memory could not be read).
+        """
+        if self.max_memory_mb is not None:
+            return {
+                "bytes": self.max_memory_mb * _BYTES_PER_MB,
+                "source": "explicit",
+                "max_memory_mb": self.max_memory_mb,
+            }
+
+        available = _get_available_memory()
+        if available > 0:
+            limit = int(available * self.max_memory_percent)
+            return {
+                "bytes": max(limit, _MIN_MEMORY_BYTES),
+                "source": "percent_of_available",
+                "percent": self.max_memory_percent,
+                "available_bytes": int(available),
+            }
+
+        # Fallback: assume 8GB system, use configured percent
+        fallback_total = 8 * 1024 * _BYTES_PER_MB
+        return {
+            "bytes": int(fallback_total * self.max_memory_percent),
+            "source": "fallback_8gb",
+            "percent": self.max_memory_percent,
+        }
+
     def compute_memory_limit(self) -> int:
         """
         Compute the memory limit in bytes.
@@ -257,17 +294,7 @@ class MemoryCacheConfig:
         Returns:
             Memory limit in bytes.
         """
-        if self.max_memory_mb is not None:
-            return self.max_memory_mb * _BYTES_PER_MB
-
-        available = _get_available_memory()
-        if available > 0:
-            limit = int(available * self.max_memory_percent)
-            return max(limit, _MIN_MEMORY_BYTES)
-
-        # Fallback: assume 8GB system, use configured percent
-        fallback_total = 8 * 1024 * _BYTES_PER_MB
-        return int(fallback_total * self.max_memory_percent)
+        return int(self.memory_limit_details()["bytes"])
 
 
 @dataclass
@@ -970,13 +997,60 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
     return result
 
 
+def _quantization_signature(model: Any) -> str:
+    """Canonical description of the weight quantization present in ``model``.
+
+    Counts the quantized layers by (kind, bits, group size, mode), so a mixed-precision
+    checkpoint differs from a uniform one. A layer counts as quantized when it carries integer
+    ``bits`` and ``group_size`` attributes (this includes MoE expert layers).  ``none`` for an unquantized model;
+    ``unavailable`` when the module tree cannot be walked (the fingerprint then cannot
+    tell quantizations apart, which is logged).
+    """
+    try:
+        counts: dict[tuple[str, Any, Any, Any], int] = {}
+        for _, module in model.named_modules():
+            # Any module that carries integer ``bits`` and ``group_size`` is quantized weights:
+            # QuantizedLinear, QuantizedEmbedding, and also mlx_lm's QuantizedSwitchLinear (the MoE
+            # experts) and anything similar, which are plain ``nn.Module`` subclasses.
+            bits, group = getattr(module, "bits", None), getattr(module, "group_size", None)
+            if (
+                isinstance(bits, int)
+                and isinstance(group, int)
+                and not isinstance(bits, bool)
+                and not isinstance(group, bool)
+            ):
+                key = (
+                    type(module).__name__,
+                    getattr(module, "bits", None),
+                    getattr(module, "group_size", None),
+                    getattr(module, "mode", None),
+                )
+                counts[key] = counts.get(key, 0) + 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[model_fingerprint] cannot read the model's quantization (%s); persisted "
+            "caches of differently quantized checkpoints will not be told apart",
+            exc,
+        )
+        return "unavailable"
+    if not counts:
+        return "none"
+    return ";".join(
+        f"{kind}:{bits}:{group}:{mode}x{n}"
+        for (kind, bits, group, mode), n in sorted(counts.items(), key=str)
+    )
+
+
 def _compute_model_fingerprint(model: Any) -> str:
     """Compute a fingerprint from model architecture for cache compatibility.
 
     Used to reject disk-persisted caches created by a different model or
     a different quantisation of the same model.  The fingerprint is a
-    short hex digest of (num_layers, hidden_size, vocab_size, num_kv_heads,
-    head_dim) — lightweight and deterministic.
+    short hex digest of the architecture (num_layers, hidden_size, vocab_size,
+    num_kv_heads, head_dim, ...) and of the weight quantization actually present
+    in the loaded model (see :func:`_quantization_signature`) — lightweight and
+    deterministic.  Two checkpoints of one architecture quantized differently
+    (4-bit vs 6-bit, different group size or mode) therefore do not share a cache.
     """
     import hashlib
 
@@ -1001,6 +1075,8 @@ def _compute_model_fingerprint(model: Any) -> str:
         val = getattr(cfg, key, None)
         if val is not None:
             parts.append(f"{key}={val}")
+
+    parts.append(f"quant={_quantization_signature(model)}")
 
     fingerprint = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
     logger.debug(f"[model_fingerprint] {fingerprint} ({', '.join(parts)})")
@@ -1051,7 +1127,8 @@ class MemoryAwarePrefixCache:
         self._sorted_keys: list[tuple[int, ...]] = []
 
         # Memory tracking
-        self._max_memory = self._config.compute_memory_limit()
+        self._memory_limit_info = self._config.memory_limit_details()
+        self._max_memory = int(self._memory_limit_info["bytes"])
         self._current_memory = 0
         self._memory_lock = threading.RLock()
         # Serializes the entry-sized snapshot copy in store().  Separate
@@ -1587,8 +1664,10 @@ class MemoryAwarePrefixCache:
         logger.debug("Cache cleared")
 
     def get_stats(self) -> dict[str, Any]:
-        """Get cache statistics."""
-        return self._stats.to_dict()
+        """Get cache statistics, including how the memory limit was derived."""
+        stats = self._stats.to_dict()
+        stats["memory_limit"] = dict(self._memory_limit_info)
+        return stats
 
     def reset_stats(self) -> None:
         """Reset statistics while preserving cache contents."""

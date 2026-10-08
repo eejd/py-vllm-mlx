@@ -1214,7 +1214,7 @@ class MLLMScheduler:
                     "tokens_per_second": None,
                     "ttft_s": None,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": None,  # not reported by the MLLM scheduler
                 }
             )
 
@@ -1259,7 +1259,7 @@ class MLLMScheduler:
                     "tokens_per_second": tok_s,
                     "ttft_s": ttft,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": None,  # not reported by the MLLM scheduler
                 }
             )
 
