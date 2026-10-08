@@ -42,6 +42,13 @@ def http(method, url, body=None, timeout=300):
         return e.code, e.read().decode()[:300]
 
 
+def port_in_use(port):
+    try:
+        return http("GET", f"http://127.0.0.1:{port}/health", timeout=2)[0] > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def start(mode, model, port, workdir):
     cmd = [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(ROOT)!r}); from vllm_mlx.cli import main; main()", "serve"]
     pdir = workdir / f"{mode}-prefix"
@@ -108,6 +115,8 @@ def chat(base, model_id, suffix):
 
 
 def probe(mode, model, port, workdir):
+    if port_in_use(port):
+        raise SystemExit(f"port {port} already answers: refusing to probe a stale server")
     proc, name = start(mode, model, port, workdir)
     base = f"http://127.0.0.1:{port}"
     steps = []
@@ -129,6 +138,7 @@ def probe(mode, model, port, workdir):
             proc.wait(timeout=120)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
     log = (workdir / f"{mode}.log").read_text()
     warn = [ln for ln in log.splitlines() if "only take effect with --continuous-batching" in ln]
     return {"mode": mode, "returncode": proc.returncode, "startup_warnings": warn, "steps": steps}

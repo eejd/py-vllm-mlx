@@ -1001,16 +1001,20 @@ def _quantization_signature(model: Any) -> str:
     """Canonical description of the weight quantization present in ``model``.
 
     Counts the quantized layers by (kind, bits, group size, mode), so a mixed-precision
-    checkpoint differs from a uniform one.  ``none`` for an unquantized model;
+    checkpoint differs from a uniform one. A layer counts as quantized when it carries integer
+    ``bits`` and ``group_size`` attributes (this includes MoE expert layers).  ``none`` for an unquantized model;
     ``unavailable`` when the module tree cannot be walked (the fingerprint then cannot
     tell quantizations apart, which is logged).
     """
     try:
-        import mlx.nn as nn
-
         counts: dict[tuple[str, Any, Any, Any], int] = {}
         for _, module in model.named_modules():
-            if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            # Any module that carries integer ``bits`` and ``group_size`` is quantized weights:
+            # QuantizedLinear, QuantizedEmbedding, and also mlx_lm's QuantizedSwitchLinear (the MoE
+            # experts) and anything similar, which are plain ``nn.Module`` subclasses.
+            if isinstance(getattr(module, "bits", None), int) and isinstance(
+                getattr(module, "group_size", None), int
+            ):
                 key = (
                     type(module).__name__,
                     getattr(module, "bits", None),

@@ -4560,11 +4560,18 @@ def _persistence_snapshot() -> dict:
     snapshot = {
         "policy": _prefix_cache_policy.as_dict(),
         "dirs": {d: dict(st) for d, st in _prefix_cache_state.items()},
-        "applies": _model_manager is None,
+        "applies": True,
     }
     if _model_manager is not None:
+        snapshot["applies"] = False
         snapshot["not_applied_reason"] = (
             "registry mode (--models-config) does not load or save persisted prefix caches"
+        )
+    elif _engine is not None and not hasattr(_engine, "load_cache_from_disk"):
+        snapshot["applies"] = False
+        snapshot["not_applied_reason"] = (
+            f"{type(_engine).__name__} has no persisted prefix-cache hooks (continuous batching "
+            "only)"
         )
     return snapshot
 
@@ -7346,7 +7353,6 @@ async def stream_chat_completion(
     # Track token counts for usage reporting
     prompt_tokens = 0
     completion_tokens = 0
-    cached_tokens: int | None = None
     cached_tokens: int | None = None
     last_output = None
 

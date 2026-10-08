@@ -287,7 +287,9 @@ def test_build_reports_counters_and_the_memory_limit_derivation():
         "current_memory_mb": 1.5, "max_memory_mb": 64.0,
     }
     assert state["memory_limit"]["source"] == "explicit"
-    assert state["engine"] == {"class": "SimpleNamespace", "continuous_batching": True,
+    # a registry model's engine mode comes from its class, not from the CLI flag
+    assert state["engine"] == {"class": "SimpleNamespace",
+                               "continuous_batching": cache_state.UNREPORTED,
                                "registry_mode": True}
     assert set(state["versions"]) == {"vllm_mlx", "mlx", "mlx_lm"}
 
@@ -550,3 +552,120 @@ def test_model_manager_lists_only_loaded_engines():
     assert mgr.loaded_engines() == [("x", "ex"), ("y", "ey")]
     mgr._loaded = {}
     assert mgr.loaded_engines() == []
+
+
+# --- review round 1 -------------------------------------------------------------------------
+
+
+def _moe_model(expert_bits, order=("a", "b")):
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchLinear
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.args = SimpleNamespace(num_hidden_layers=2, hidden_size=64, vocab_size=100,
+                                        model_type="moe")
+            for name, bits in zip(order, expert_bits):
+                setattr(self, name, SwitchLinear(64, 64, 4, bias=False)
+                        .to_quantized(group_size=64, bits=bits))
+
+    return M()
+
+
+def test_moe_expert_quantization_is_part_of_the_fingerprint():
+    from vllm_mlx.memory_cache import _compute_model_fingerprint as fp
+    from vllm_mlx.memory_cache import _quantization_signature as sig
+
+    assert "QuantizedSwitchLinear:4:64" in sig(_moe_model((4, 4)))
+    assert fp(_moe_model((4, 4))) != fp(_moe_model((4, 8)))  # mixed precision experts differ
+
+
+def test_signature_does_not_depend_on_module_registration_order():
+    from vllm_mlx.memory_cache import _quantization_signature as sig
+
+    assert sig(_moe_model((4, 8), ("a", "b"))) == sig(_moe_model((8, 4), ("a", "b")))
+    assert sig(_moe_model((4, 8), ("a", "b"))) == sig(_moe_model((4, 8), ("b", "a")))
+
+
+def test_negative_cached_token_counts_are_clamped():
+    from vllm_mlx.server import _prompt_tokens_details
+
+    assert _prompt_tokens_details(-3).cached_tokens == 0
+    assert _prompt_tokens_details(None) is None
+
+
+def test_batched_mllm_nested_prefix_cache_stats_are_surfaced_not_called_unreportable():
+    nested = {
+        "prefix_cache": {"hits": 2, "misses": 1, "evictions": 0, "tokens_saved": 64,
+                         "entry_count": 1,
+                         "memory_limit": {"bytes": 5, "source": "explicit"}},
+        "vision_embedding_cache": {"hits": 0},
+    }
+    state = cache_state.build(
+        engine=SimpleNamespace(), launch=None, engine_cache=nested,
+        persistence={}, registry_mode=False,
+    )
+    assert state["counters"]["hits"] == 2 and state["counters"]["tokens_saved"] == 64
+    assert state["memory_limit"]["source"] == "explicit"
+
+
+class BatchedEngine:  # named like the real classes: registry state keys off the class name
+    pass
+
+
+class SimpleEngine:
+    pass
+
+
+def test_registry_models_report_their_own_engine_not_the_cli_flags():
+    launch = cache_state.launch_options(_args("--kv-cache-quantization"))  # CLI: simple + inert
+    assert launch["continuous_batching"] is False and launch["inert_options"]
+    for eng, expect in ((BatchedEngine(), True), (SimpleEngine(), False)):
+        state = cache_state.build(engine=eng, launch=launch, engine_cache=None,
+                                  persistence={}, registry_mode=True)
+        assert state["engine"]["continuous_batching"] is expect
+        assert state["launch_options"]["value"] == cache_state.UNREPORTED
+        assert "registry mode" in state["launch_options"]["reason"]
+        assert state["inert_options"]["value"] == cache_state.UNREPORTED
+    odd = cache_state.build(engine=SimpleNamespace(), launch=launch, engine_cache=None,
+                            persistence={}, registry_mode=True)
+    assert odd["engine"]["continuous_batching"] == cache_state.UNREPORTED
+
+
+def test_the_other_scheduler_only_flags_are_listed_as_inert_in_simple_mode():
+    ns = _args("--prefix-cache-size", "5", "--paged-cache-block-size", "32",
+               "--max-cache-blocks", "7", "--chunked-prefill-tokens", "128")
+    assert cache_state.inert_options(ns) == [
+        "--prefix-cache-size", "--paged-cache-block-size", "--max-cache-blocks",
+        "--chunked-prefill-tokens",
+    ]
+
+
+def test_persistence_does_not_apply_to_an_engine_without_the_hooks(monkeypatch):
+    import vllm_mlx.server as server
+
+    monkeypatch.setattr(server, "_model_manager", None)
+    monkeypatch.setattr(server, "_engine", SimpleEngine())
+    snap = server._persistence_snapshot()
+    assert snap["applies"] is False and "SimpleEngine" in snap["not_applied_reason"]
+
+    class WithHooks:
+        def load_cache_from_disk(self, d):
+            return 0
+
+    monkeypatch.setattr(server, "_engine", WithHooks())
+    assert server._persistence_snapshot()["applies"] is True
+    monkeypatch.setattr(server, "_engine", None)  # not loaded yet: cannot tell, assume it applies
+    assert server._persistence_snapshot()["applies"] is True
+
+
+@pytest.mark.anyio
+async def test_streaming_completions_usage_reports_cached_tokens(monkeypatch):
+    server = _patch_server(monkeypatch, _Engine(5))
+    req = server.CompletionRequest(model="served-model", prompt="a b", max_tokens=2, stream=True)
+    chunks = [c async for c in server.stream_completion(_Engine(5), "a b", req, 2)]
+    payloads = [json.loads(c.removeprefix("data: ").strip()) for c in chunks
+                if c.startswith("data: ") and "[DONE]" not in c]
+    usage = [p["usage"] for p in payloads if p.get("usage")]
+    assert usage and usage[-1]["prompt_tokens_details"] == {"cached_tokens": 5}

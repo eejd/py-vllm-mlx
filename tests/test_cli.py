@@ -309,3 +309,69 @@ models:
 
     assert server._model_manager is not None
     assert server._model_manager.memory_budget_bytes == int(6.5 * (1024**3))
+
+
+def _patched_serve(monkeypatch):
+    """The real server module with model loading and uvicorn stubbed out."""
+    from vllm_mlx import server
+    from vllm_mlx.utils import download
+
+    monkeypatch.setattr(
+        download, "ensure_model_downloaded", lambda *args, **kwargs: "local-test-model"
+    )
+    monkeypatch.setattr(server, "load_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "load_model_registry", lambda *args, **kwargs: None)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_cache_launch_options", None)
+    return server
+
+
+def test_serve_records_cache_launch_options_and_warns_about_simple_engine_inert_flags(
+    monkeypatch, capsys
+):
+    from vllm_mlx import cli
+
+    server = _patched_serve(monkeypatch)
+    cli.serve_command(_serve_args(kv_cache_quantization=True, cache_memory_mb=512))
+
+    out = capsys.readouterr().out
+    assert "only take effect with --continuous-batching" in out
+    assert "--cache-memory-mb" in out and "--kv-cache-quantization" in out
+    opts = server._cache_launch_options
+    assert opts["continuous_batching"] is False
+    assert opts["inert_options"] == ["--cache-memory-mb", "--kv-cache-quantization"]
+    assert opts["kv_cache_quantization"] == {
+        "requested": True, "bits": 8, "group_size": 64, "min_quantize_tokens": 256,
+        "effective": False,
+    }
+
+
+def test_serve_with_continuous_batching_records_options_and_does_not_warn(monkeypatch, capsys):
+    from vllm_mlx import cli
+
+    server = _patched_serve(monkeypatch)
+    cli.serve_command(
+        _serve_args(
+            continuous_batching=True, kv_cache_quantization=True, cache_memory_mb=512,
+            mllm_prefill_step_size=0, specprefill_backbone_pct=0.0,
+        )
+    )
+    assert "only take effect with --continuous-batching" not in capsys.readouterr().out
+    assert server._cache_launch_options["inert_options"] == []
+    assert server._cache_launch_options["kv_cache_quantization"]["effective"] is True
+
+
+@pytest.mark.parametrize(
+    ("extra", "warns"),
+    [({}, False), ({"prefix_cache_dir": "/x"}, True), ({"prefix_cache_persist": "none"}, True),
+     ({"prefix_cache_reset": "start"}, True)],
+)
+def test_registry_mode_warns_that_prefix_cache_options_do_nothing(
+    monkeypatch, capsys, extra, warns
+):
+    from vllm_mlx import cli
+
+    _patched_serve(monkeypatch)
+    cli.serve_command(_serve_args(model=None, models_config="models.yaml", **extra))
+    out = capsys.readouterr().out
+    assert ("registry mode (--models-config) does not load or save" in out) is warns

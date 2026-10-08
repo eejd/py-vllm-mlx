@@ -36,6 +36,10 @@ CONTINUOUS_BATCHING_ONLY: dict[str, tuple[str, Any]] = {
     "--use-paged-cache": ("use_paged_cache", False),
     "--ssd-cache-dir": ("ssd_cache_dir", None),
     "--ssd-cache-max-gb": ("ssd_cache_max_gb", 10.0),
+    "--prefix-cache-size": ("prefix_cache_size", 100),
+    "--paged-cache-block-size": ("paged_cache_block_size", 64),
+    "--max-cache-blocks": ("max_cache_blocks", 1000),
+    "--chunked-prefill-tokens": ("chunked_prefill_tokens", 0),
 }
 
 
@@ -142,8 +146,27 @@ def build(
     ``none_reason`` replaces the "no engine is loaded" reason when ``engine`` is None for a known
     cause (registry mode keeps no single default engine; its models are listed separately).
     """
-    cb = bool(launch and launch.get("continuous_batching"))
     engine_class = type(engine).__name__ if engine is not None else None
+    if registry_mode and engine is not None:
+        # Registry entries choose their own engine; the CLI's --continuous-batching and cache
+        # options describe the defaults, not necessarily this model. The engine class is the truth.
+        batching: Any = {"BatchedEngine": True, "SimpleEngine": False}.get(
+            engine_class or "", UNREPORTED
+        )
+        launch_block: Any = _unreported(
+            "registry mode: cache options come from each model's registry entry; see engine.class"
+        )
+        inert: Any = launch_block
+    else:
+        batching = bool(launch.get("continuous_batching")) if launch else UNREPORTED
+        launch_block = launch if launch is not None else _unreported("server not started via the CLI")
+        inert = (launch or {}).get("inert_options", UNREPORTED)
+
+    # The batched MLLM engine nests its prefix-cache stats one level down.
+    if isinstance(engine_cache, dict) and "hits" not in engine_cache:
+        nested = engine_cache.get("prefix_cache")
+        if isinstance(nested, dict) and "hits" in nested:
+            engine_cache = nested
 
     counters: dict[str, Any] | dict[str, str]
     memory_limit: Any
@@ -166,11 +189,11 @@ def build(
         "versions": versions(),
         "engine": {
             "class": engine_class,
-            "continuous_batching": cb if launch else UNREPORTED,
+            "continuous_batching": batching,
             "registry_mode": registry_mode,
         },
-        "launch_options": launch if launch is not None else _unreported("server not started via the CLI"),
-        "inert_options": (launch or {}).get("inert_options", UNREPORTED),
+        "launch_options": launch_block,
+        "inert_options": inert,
         "memory_limit": memory_limit,
         "counters": counters,
         "persistence": persistence,

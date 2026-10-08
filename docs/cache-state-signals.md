@@ -22,8 +22,8 @@ that does not follow behavior, **missing** when absent. "Unreported" below is th
 | `usage.prompt_tokens_details.cached_tokens` per request | **missing** (omitted, never a fake 0) | **real** (this PR): cold 0, exact repeat 0, shared prefix 1532 of 1539 | same as the model's engine mode |
 | `engine_cache` counters (`hits`, `misses`, `evictions`, `tokens_saved`, `entry_count`, `current_memory_mb`) | **missing**: only `system_kv_cache` (capacity 4, all counters 0 in the probe) | **real**, but see the exact-repeat caveat below | `engine_cache` is null at top level (no default engine); per-model under `models` (this PR) |
 | Effective memory limit and how it was derived | n/a (no memory-aware cache) | **real** (this PR): `memory_limit` = `{source: percent_of_available, percent, available_bytes, bytes}`; was invisible before | per model |
-| `cache_state` block | **real** (this PR): engine class, launch options, inert options, versions; counters `unreported` with a reason | **real** | top level says "registry mode keeps no single default engine"; per model under `models` |
-| Persisted prefix cache (`persistence`) | not loaded or saved (the Simple engine has no hooks) | loaded and saved per `--prefix-cache-*` | **not applicable**: `persistence.applies: false` (eejd/py-vllm-mlx#41) |
+| `cache_state` block | **real** (this PR): engine class, launch options, inert options, versions; counters `unreported` with a reason | **real**; the batched MLLM engine nests its stats under `prefix_cache`, which `cache_state` unwraps | top level says "registry mode keeps no single default engine"; per model under `models`, where `engine.continuous_batching` comes from the model's engine class and `launch_options`/`inert_options` are `unreported` (registry entries choose their own engine, so the CLI flags do not describe them) |
+| Persisted prefix cache (`persistence`) | not loaded or saved (no hooks): `persistence.applies: false` with the engine class named | loaded and saved per `--prefix-cache-*` | **not applicable**: `persistence.applies: false` (eejd/py-vllm-mlx#41) |
 | `GET /v1/status` cache section | **missing** (`cache` key absent in the probe; per the code, `--prefix-trie-cache` stats come from `SimpleEngine.get_stats` and are not in `/v1/cache/stats`; the trie was off in the probe, so this is not verified live) | **real** (same numbers as `engine_cache`) | only `model_manager` |
 | `GET /metrics` prefix-cache series | **missing**; only `vllm_mlx_metal_memory_bytes{kind="cache"}` | **missing**; same | **missing** (eejd/py-vllm-mlx#42) |
 | `DELETE /v1/cache` | clears (nothing material to clear) | clears: entries and counters back to 0, next request cold again (probe: entry_count 2 -> 0, hits 2 -> 0) | per the engine |
@@ -78,7 +78,8 @@ mode should reuse prefixes).
 
 `load_from_disk` refuses a cache whose version, `cache_format` or model fingerprint differs. The
 fingerprint is now also a function of the **weight quantization actually present in the loaded model**
-(count of quantized layers by kind, bits, group size and mode), so a 4-bit checkpoint and a 6-bit
+(count of quantized layers by kind, bits, group size and mode; a layer counts as quantized when it has integer
+`bits` and `group_size`, which includes MoE expert layers such as `QuantizedSwitchLinear`), so a 4-bit checkpoint and a 6-bit
 checkpoint of one architecture no longer share a cache. Before this change the fingerprint hashed only
 architecture fields (layers, hidden size, heads, vocab, ...) although its docstring claimed to reject a
 different quantization. **Existing persisted caches are refused once and rebuilt**; the refusal is
