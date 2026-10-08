@@ -40,6 +40,7 @@ The server provides:
 import argparse
 import asyncio
 import copy
+import functools
 import hashlib
 from dataclasses import dataclass
 import inspect
@@ -66,6 +67,12 @@ from starlette.routing import Match
 # Import from new modular API
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai
+from .prefix_cache_persistence import (
+    PersistenceError,
+    PersistencePolicy,
+    describe_dir,
+    reset_cache_dir,
+)
 from .api.anthropic_models import (
     AnthropicRequest,
     AnthropicResponse,
@@ -195,6 +202,10 @@ _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
 _warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at startup
+# Where the persisted prefix cache lives and when it is read, written or deleted,
+# and what the last startup/shutdown did to each cache directory (for stats).
+_prefix_cache_policy: PersistencePolicy = PersistencePolicy()
+_prefix_cache_state: dict[str, dict] = {}
 _default_model_key: str | None = None
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
@@ -1511,14 +1522,69 @@ def _invalidate_tool_parser_cache(reason: str | None = None) -> None:
     _tool_parser_instance = None
 
 
-async def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None:
-    """Load prefix cache from disk during startup."""
+def set_prefix_cache_policy(policy: PersistencePolicy) -> None:
+    """Install the persisted-prefix-cache policy (before the engine starts)."""
+    global _prefix_cache_policy
+    _prefix_cache_policy = policy
+    _prefix_cache_state.clear()
+
+
+def _persistence_state(cache_dir: str) -> dict:
+    return _prefix_cache_state.setdefault(cache_dir, {"dir": cache_dir})
+
+
+def _log_persistence(state: dict) -> None:
+    policy = _prefix_cache_policy
+    logger.info(
+        "prefix_cache dir=%s persist=%s reset=%s entries_on_disk=%s bytes_on_disk=%s "
+        "loaded=%s",
+        state.get("dir"),
+        policy.persist,
+        policy.reset,
+        state.get("entries_on_disk"),
+        state.get("bytes_on_disk"),
+        state.get("loaded"),
+    )
+
+
+async def _load_prefix_cache_from_disk(
+    engine: BaseEngine | None = None, model_key: str | None = None
+) -> None:
+    """Load prefix cache from disk during startup, as the policy allows.
+
+    A requested reset that cannot be done safely is an error, not a warning:
+    the caller asked for a defined starting state and must not get another.
+    """
     target_engine = engine or _engine
     if target_engine is None:
         return
 
+    policy = _prefix_cache_policy
+    d = _get_cache_dir(model_key)
+    state = _persistence_state(d)
+    if policy.resets_at_start:
+        result = reset_cache_dir(d)  # PersistenceError propagates
+        state["reset_at_start"] = {
+            "deleted_files": result.deleted_files,
+            "deleted_bytes": result.deleted_bytes,
+            "left_alone": result.left_alone,
+        }
+        logger.info(
+            "[lifespan] prefix cache reset at start: deleted %d files (%d bytes) in %s",
+            result.deleted_files,
+            result.deleted_bytes,
+            d,
+        )
+    state["entries_on_disk"], state["bytes_on_disk"] = describe_dir(d)
+    if not policy.loads:
+        state["loaded"] = 0
+        logger.info(
+            "[lifespan] prefix cache persist=%s: not loading from %s", policy.persist, d
+        )
+        _log_persistence(state)
+        return
+
     try:
-        d = _get_cache_dir()
         logger.info(f"[lifespan] Loading prefix cache from {d}")
         owned_load = getattr(target_engine, "_load_cache_from_disk_on_owner", None)
         if owned_load is not None:
@@ -1529,61 +1595,91 @@ async def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None
                 loaded = await load_cache(d)
             else:
                 loaded = await asyncio.to_thread(load_cache, d)
+        state["loaded"] = loaded
         if loaded > 0:
             logger.info(f"[lifespan] Loaded {loaded} prefix cache entries")
         else:
             logger.info("[lifespan] No prefix cache entries found on disk")
     except Exception as e:
+        state["loaded"] = 0
         logger.warning(
             "[lifespan] Failed to load cache from disk: %s",
             _sanitize_log_text(e, limit=500),
         )
+    _log_persistence(state)
 
 
-async def _save_prefix_cache_to_disk(engine: BaseEngine | None = None) -> None:
-    """Save prefix cache to disk during shutdown."""
+async def _save_prefix_cache_to_disk(
+    engine: BaseEngine | None = None, model_key: str | None = None
+) -> None:
+    """Save prefix cache to disk during shutdown, as the policy allows."""
     target_engine = engine or _engine
     if target_engine is None:
         return
 
-    try:
-        d = _get_cache_dir()
-        logger.info(f"[lifespan] Saving prefix cache to {d}")
-        owned_save = getattr(target_engine, "_save_cache_to_disk_on_owner", None)
-        if owned_save is not None:
-            saved = await owned_save(d)
-        else:
-            save_cache = target_engine.save_cache_to_disk
-            if inspect.iscoroutinefunction(save_cache):
-                saved = await save_cache(d)
-            else:
-                saved = await asyncio.to_thread(save_cache, d)
-        if saved:
-            logger.info(f"[lifespan] Saved prefix cache to {d}")
-        else:
-            logger.info("[lifespan] No cache to save")
-    except Exception as e:
-        logger.warning(
-            "[lifespan] Failed to save cache to disk: %s",
-            _sanitize_log_text(e, limit=500),
+    policy = _prefix_cache_policy
+    d = _get_cache_dir(model_key)
+    state = _persistence_state(d)
+    if not policy.saves:
+        state["saved"] = False
+        logger.info(
+            "[lifespan] prefix cache persist=%s: not saving to %s", policy.persist, d
         )
+    else:
+        try:
+            logger.info(f"[lifespan] Saving prefix cache to {d}")
+            owned_save = getattr(target_engine, "_save_cache_to_disk_on_owner", None)
+            if owned_save is not None:
+                saved = await owned_save(d)
+            else:
+                save_cache = target_engine.save_cache_to_disk
+                if inspect.iscoroutinefunction(save_cache):
+                    saved = await save_cache(d)
+                else:
+                    saved = await asyncio.to_thread(save_cache, d)
+            state["saved"] = bool(saved)
+            if saved:
+                logger.info(f"[lifespan] Saved prefix cache to {d}")
+            else:
+                logger.info("[lifespan] No cache to save")
+        except Exception as e:
+            logger.warning(
+                "[lifespan] Failed to save cache to disk: %s",
+                _sanitize_log_text(e, limit=500),
+            )
+    if policy.resets_at_stop:
+        try:
+            result = reset_cache_dir(d)
+            state["reset_at_stop"] = {
+                "deleted_files": result.deleted_files,
+                "deleted_bytes": result.deleted_bytes,
+                "left_alone": result.left_alone,
+            }
+            logger.info(
+                "[lifespan] prefix cache reset at stop: deleted %d files (%d bytes) in %s",
+                result.deleted_files,
+                result.deleted_bytes,
+                d,
+            )
+        except PersistenceError as e:
+            logger.error("[lifespan] prefix cache reset at stop refused: %s", e)
 
 
-def _get_cache_dir() -> str:
-    """Get cache persistence directory based on actual model path."""
+def _get_cache_dir(model_key: str | None = None) -> str:
+    """Get cache persistence directory based on actual model path.
+
+    ``model_key`` names the model explicitly (registry mode serves several, and
+    has no single ``_model_path``); otherwise the single-model path is used.
+    """
     # Use _model_path (actual model path) not _model_name (which may be overridden
     # by --served-model-name). This ensures cache is shared regardless of served name.
-    model_name = (
+    model_name = model_key or (
         _model_path if _model_path else (_model_name if _model_name else "default")
     )
     logger.info(
         f"[_get_cache_dir] _model_path={_model_path!r} type={type(_model_path)}"
     )
-    # Sanitize model name for filesystem
-    safe_name = str(model_name).replace("/", "--").replace("\\", "--")
-    cache_dir = os.path.join(
-        os.path.expanduser("~"), ".cache", "vllm-mlx", "prefix_cache", safe_name
-    )
+    cache_dir = _prefix_cache_policy.resolve_dir(model_name)
     logger.info(f"[_get_cache_dir] cache_dir={cache_dir!r}")
     return cache_dir
 
@@ -1662,13 +1758,19 @@ async def _run_blocking_engine_cache_io(io_fn, engine: BaseEngine) -> None:
 async def _restore_engine_state(spec: ModelSpec, engine: BaseEngine) -> None:
     """Restore engine-local state, such as prefix cache, after a cold load."""
     if hasattr(engine, "load_cache_from_disk"):
-        await _run_blocking_engine_cache_io(_load_prefix_cache_from_disk, engine)
+        await _run_blocking_engine_cache_io(
+            functools.partial(_load_prefix_cache_from_disk, model_key=spec.model_name),
+            engine,
+        )
 
 
 async def _persist_engine_state(spec: ModelSpec, engine: BaseEngine) -> None:
     """Persist engine-local state before an idle unload or shutdown unload."""
     if hasattr(engine, "save_cache_to_disk"):
-        await _run_blocking_engine_cache_io(_save_prefix_cache_to_disk, engine)
+        await _run_blocking_engine_cache_io(
+            functools.partial(_save_prefix_cache_to_disk, model_key=spec.model_name),
+            engine,
+        )
 
 
 def _activate_engine(engine: BaseEngine | None) -> BaseEngine | None:
@@ -4409,6 +4511,14 @@ async def status():
     }
 
 
+def _persistence_snapshot() -> dict:
+    """The persisted-prefix-cache policy and what startup/shutdown did to each directory."""
+    return {
+        "policy": _prefix_cache_policy.as_dict(),
+        "dirs": {d: dict(st) for d, st in _prefix_cache_state.items()},
+    }
+
+
 @app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
 async def cache_stats():
     """Get cache statistics for debugging and monitoring."""
@@ -4428,6 +4538,7 @@ async def cache_stats():
 
         return {
             "engine_cache": engine_cache,
+            "persistence": _persistence_snapshot(),
             "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
             "pixel_values_cache": get_pixel_values_cache_stats(),
             "pil_image_cache": get_pil_cache_stats(),
@@ -4435,6 +4546,7 @@ async def cache_stats():
     except ImportError:
         return {
             "engine_cache": engine_cache,
+            "persistence": _persistence_snapshot(),
             "error": "Cache stats not available (mlx_vlm not loaded)",
         }
 
