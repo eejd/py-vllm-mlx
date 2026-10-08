@@ -449,10 +449,13 @@ def test_model_names_cannot_resolve_to_the_base_or_its_parent(tmp_path, name):
 
 def test_reset_with_dotdot_model_name_does_not_touch_the_parent(tmp_path):
     base = tmp_path / "base"
-    _populate(tmp_path, 1)  # a cache-looking file set in the parent of the base
+    base.mkdir()
+    _populate(base, 1)  # cache-looking files in the base itself ...
+    _populate(tmp_path, 1)  # ... and in its parent
     pol = PersistencePolicy(base_dir=str(base), persist="none", reset="start")
-    reset_cache_dir(pol.resolve_dir(".."))
-    assert (tmp_path / "index.json").exists()
+    for name in ("..", "."):
+        reset_cache_dir(pol.resolve_dir(name))
+    assert (tmp_path / "index.json").exists() and (base / "index.json").exists()
 
 
 def test_reset_refuses_a_path_that_reaches_home_through_a_symlinked_parent(tmp_path):
