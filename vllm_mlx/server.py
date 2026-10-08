@@ -67,6 +67,7 @@ from starlette.routing import Match
 # Import from new modular API
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai
+from . import cache_state as _cache_state
 from .prefix_cache_persistence import (
     PersistenceError,
     PersistencePolicy,
@@ -112,6 +113,7 @@ from .api.models import (
     RerankResult,
     RerankUsage,
     ToolCall,
+    PromptTokensDetails,
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
@@ -206,6 +208,9 @@ _warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at 
 # and what the last startup/shutdown did to each cache directory (for stats).
 _prefix_cache_policy: PersistencePolicy = PersistencePolicy()
 _prefix_cache_state: dict[str, dict] = {}
+# Cache-relevant launch options recorded by the CLI (cache_state.launch_options); None when the
+# server was not started through ``vllm-mlx serve``.
+_cache_launch_options: dict | None = None
 _default_model_key: str | None = None
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
@@ -1527,6 +1532,12 @@ def set_prefix_cache_policy(policy: PersistencePolicy) -> None:
     global _prefix_cache_policy
     _prefix_cache_policy = policy
     _prefix_cache_state.clear()
+
+
+def set_cache_launch_options(options: dict | None) -> None:
+    """Record the cache-relevant launch options for ``/v1/cache/stats``."""
+    global _cache_launch_options
+    _cache_launch_options = options
 
 
 def _persistence_state(cache_dir: str) -> dict:
@@ -4365,6 +4376,13 @@ def load_model_registry(
     )
 
 
+def _prompt_tokens_details(cached_tokens: int | None) -> PromptTokensDetails | None:
+    """``usage.prompt_tokens_details`` when the engine reported cached tokens, else None."""
+    if cached_tokens is None:
+        return None
+    return PromptTokensDetails(cached_tokens=max(0, int(cached_tokens)))
+
+
 def get_usage(output: GenerationOutput) -> Usage:
     """Extract usage metrics from GenerationOutput."""
     total_prompt_tokens = (
@@ -4377,6 +4395,9 @@ def get_usage(output: GenerationOutput) -> Usage:
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
         total_tokens=total_prompt_tokens + total_completion_tokens,
+        prompt_tokens_details=_prompt_tokens_details(
+            getattr(output, "cached_tokens", None)
+        ),
     )
 
 
@@ -4531,11 +4552,44 @@ async def status():
 
 
 def _persistence_snapshot() -> dict:
-    """The persisted-prefix-cache policy and what startup/shutdown did to each directory."""
-    return {
+    """The persisted-prefix-cache policy and what startup/shutdown did to each directory.
+
+    ``applies`` is False in registry mode (``--models-config``): that path never loads or saves
+    a persisted prefix cache, so the policy is displayed but has no effect there.
+    """
+    snapshot = {
         "policy": _prefix_cache_policy.as_dict(),
         "dirs": {d: dict(st) for d, st in _prefix_cache_state.items()},
+        "applies": _model_manager is None,
     }
+    if _model_manager is not None:
+        snapshot["not_applied_reason"] = (
+            "registry mode (--models-config) does not load or save persisted prefix caches"
+        )
+    return snapshot
+
+
+def _registry_cache_states() -> dict:
+    """Per loaded model: engine cache stats and cache_state (registry mode serves several)."""
+    out: dict[str, dict] = {}
+    for name, engine in _model_manager.loaded_engines():
+        stats = None
+        if hasattr(engine, "get_cache_stats"):
+            try:
+                stats = engine.get_cache_stats()
+            except Exception as exc:  # noqa: BLE001
+                stats = {"error": f"engine cache stats failed: {exc}"}
+        out[name] = {
+            "engine_cache": stats,
+            "cache_state": _cache_state.build(
+                engine=engine,
+                launch=_cache_launch_options,
+                engine_cache=stats,
+                persistence=_persistence_snapshot(),
+                registry_mode=True,
+            ),
+        }
+    return out
 
 
 @app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
@@ -4548,6 +4602,21 @@ async def cache_stats():
         except Exception as exc:
             engine_cache = {"error": f"engine cache stats failed: {exc}"}
 
+    persistence = _persistence_snapshot()
+    registry_mode = _model_manager is not None
+    state = _cache_state.build(
+        engine=_engine,
+        launch=_cache_launch_options,
+        engine_cache=engine_cache,
+        persistence=persistence,
+        registry_mode=registry_mode,
+        none_reason=(
+            "registry mode keeps no single default engine: see 'models'"
+            if registry_mode
+            else None
+        ),
+    )
+    models = _registry_cache_states() if registry_mode else None
     try:
         from mlx_vlm.utils import (
             get_multimodal_kv_cache_stats,
@@ -4557,7 +4626,9 @@ async def cache_stats():
 
         return {
             "engine_cache": engine_cache,
-            "persistence": _persistence_snapshot(),
+            "persistence": persistence,
+            "cache_state": state,
+            **({"models": models} if models is not None else {}),
             "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
             "pixel_values_cache": get_pixel_values_cache_stats(),
             "pil_image_cache": get_pil_cache_stats(),
@@ -4565,7 +4636,9 @@ async def cache_stats():
     except ImportError:
         return {
             "engine_cache": engine_cache,
-            "persistence": _persistence_snapshot(),
+            "persistence": persistence,
+            "cache_state": state,
+            **({"models": models} if models is not None else {}),
             "error": "Cache stats not available (mlx_vlm not loaded)",
         }
 
@@ -5862,6 +5935,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         choices = []
         total_completion_tokens = 0
         total_prompt_tokens = 0
+        total_cached_tokens: int | None = 0  # None once any prompt does not report it
         for i, prompt in enumerate(prompts):
             generate_kwargs = {
                 "prompt": prompt,
@@ -5923,6 +5997,12 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             total_prompt_tokens += (
                 output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
             )
+            output_cached = getattr(output, "cached_tokens", None)
+            total_cached_tokens = (
+                None
+                if total_cached_tokens is None or output_cached is None
+                else total_cached_tokens + output_cached
+            )
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
@@ -5942,6 +6022,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens,
+                prompt_tokens_details=_prompt_tokens_details(total_cached_tokens),
             ),
         )
     finally:
@@ -6140,6 +6221,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
+                prompt_tokens_details=_prompt_tokens_details(
+                    getattr(output, "cached_tokens", None)
+                ),
             ),
             generation_metadata=_generation_metadata(
                 prepared.thinking_processor, output
@@ -7262,6 +7346,8 @@ async def stream_chat_completion(
     # Track token counts for usage reporting
     prompt_tokens = 0
     completion_tokens = 0
+    cached_tokens: int | None = None
+    cached_tokens: int | None = None
     last_output = None
 
     # Response-format streaming filter — strip markdown code fences from
@@ -7300,6 +7386,8 @@ async def stream_chat_completion(
                 prompt_tokens = output.prompt_tokens
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
+            if getattr(output, "cached_tokens", None) is not None:
+                cached_tokens = output.cached_tokens
 
             if reasoning_parser and delta_text:
                 previous_raw = raw_stream_text
@@ -7821,6 +7909,7 @@ async def stream_chat_completion(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tokens_details=_prompt_tokens_details(cached_tokens),
                 ),
                 generation_metadata=terminal_metadata,
             )

@@ -7,7 +7,7 @@ and cache-hit behavior unreproducible. Three options make it explicit.
 
 | Option | Values | Meaning |
 |---|---|---|
-| `--prefix-cache-dir DIR` (or `VLLM_MLX_PREFIX_CACHE_DIR`) | absolute path | Base directory. Default `~/.cache/vllm-mlx/prefix_cache`. Each model keeps its own subdirectory (the model path with `/` replaced by `--`), so existing caches keep working and `--models-config` serves one directory per model. |
+| `--prefix-cache-dir DIR` (or `VLLM_MLX_PREFIX_CACHE_DIR`) | absolute path | Base directory. Default `~/.cache/vllm-mlx/prefix_cache`. Each model keeps its own subdirectory (the model path with `/` replaced by `--`), so existing caches keep working. |
 | `--prefix-cache-persist` | `auto` (default), `none`, `load-only`, `save-only` | `auto`: load at start, save at stop (the historical behavior). `none`: never read or write the persisted cache. `load-only`: start from the preserved cache and never modify it, so every run starts from the same warm state. `save-only`: start cold, write at stop (builds a snapshot). |
 | `--prefix-cache-reset` | `never` (default), `start`, `stop`, `both` | Delete this model's persisted entries before the load (`start`), after the shutdown save (`stop`), or both. |
 
@@ -45,9 +45,16 @@ A failed reset at stop is logged and never prevents the engine from stopping. Co
 option combinations are refused before any model loads; an unsafe or failing reset path can only be
 found once the directory is examined, which happens at startup after the model has loaded.
 
-With `--models-config` (registry mode) a reset at start applies on every cold load of a model,
-including a reload after an idle unload, so `--prefix-cache-persist auto --prefix-cache-reset start`
-does not carry a cache across an idle cycle. Use `load-only` for a cache that must survive reloads.
+With `--auto-unload-idle-seconds` (single-model lazy load and idle unload) a reset at start applies
+on every cold load, including a reload after an idle unload, so `--prefix-cache-persist auto
+--prefix-cache-reset start` does not carry a cache across an idle cycle. Use `load-only` for a cache
+that must survive reloads.
+
+**Registry mode (`--models-config`) does not persist prefix caches at all**: its model manager never
+calls the load and save hooks, so these options have no effect there. The server prints a warning when
+they are given with `--models-config`, and `GET /v1/cache/stats` reports `persistence.applies: false`
+with the reason. (An earlier version of this guide said registry mode used one directory per model;
+that was wrong. It is the single-model lazy-load manager that passes the model name to the hooks.)
 
 `python -m vllm_mlx.server` has no `--prefix-cache-*` flags; it honors `VLLM_MLX_PREFIX_CACHE_DIR`
 and otherwise behaves as `auto`/`never`. Persist and reset modes are options of `vllm-mlx serve`.

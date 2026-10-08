@@ -93,6 +93,27 @@ def serve_command(args):
         print(f"Error: {exc}")
         sys.exit(1)
 
+    from . import cache_state as _cs
+
+    if _cs.registry_ignores_persistence(args):
+        print(
+            "Warning: registry mode (--models-config) does not load or save persisted prefix "
+            "caches; --prefix-cache-dir/-persist/-reset have no effect there"
+        )
+
+    # Record the cache-relevant options for /v1/cache/stats, and say so when this engine mode
+    # ignores some the user set: the prefix cache, KV quantization, paged cache and SSD tier belong
+    # to the continuous-batching scheduler; the Simple engine does not use them.
+    from . import cache_state
+
+    server.set_cache_launch_options(cache_state.launch_options(args))
+    inert = cache_state.inert_options(args)
+    if inert:
+        print(
+            "Warning: these options only take effect with --continuous-batching and are "
+            f"ignored by the Simple engine: {', '.join(inert)}"
+        )
+
     # Validate tool calling arguments
     if args.enable_auto_tool_choice and not args.tool_call_parser:
         print("Error: --enable-auto-tool-choice requires --tool-call-parser")

@@ -97,6 +97,7 @@ def test_continuous_batching_forwards_prefill_step_size_to_scheduler_config(
     server.load_model = lambda *args, **kwargs: captured.update(load_model=kwargs)
     server.load_model_registry = lambda *args, **kwargs: None
     server.set_prefix_cache_policy = lambda policy: None
+    server.set_cache_launch_options = lambda options: None
 
     uvicorn = ModuleType("uvicorn")
     uvicorn.run = lambda *args, **kwargs: None

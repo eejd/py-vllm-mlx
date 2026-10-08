@@ -225,6 +225,9 @@ class RequestOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Prompt tokens served from the prefix cache. None means the engine did not report it
+    # (as opposed to 0, which means it was consulted and nothing was reused).
+    cached_tokens: Optional[int] = None
     # Request-level sparse-prefill decision and diagnostics.
     specprefill_outcome: Optional["SpecPrefillOutcome"] = None
 
