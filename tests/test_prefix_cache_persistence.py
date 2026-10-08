@@ -396,3 +396,79 @@ def test_serve_refuses_a_contradictory_combination_before_loading_anything(
 
 def test_the_worktree_package_is_the_one_under_test():
     assert Path(server.__file__).parent.parent == Path(__file__).resolve().parent.parent
+
+
+# --- review round 1: failure paths and odd names ------------------------------------------
+
+
+def test_a_failing_reset_at_stop_is_logged_and_does_not_raise(policy_for, monkeypatch):
+    policy_for("none", "stop")
+
+    def boom(path):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(server, "reset_cache_dir", boom)
+    _run(server._save_prefix_cache_to_disk(StubEngine()))  # must not raise
+
+
+def test_an_oserror_in_reset_at_start_fails_startup_and_blocks_the_shutdown_save(
+    policy_for, monkeypatch
+):
+    d = policy_for("auto", "start")
+    monkeypatch.setattr(
+        server, "reset_cache_dir", lambda path: (_ for _ in ()).throw(PermissionError("x"))
+    )
+    eng = StubEngine()
+    with pytest.raises(PersistenceError, match="reset at start failed"):
+        _run(server._load_prefix_cache_from_disk(eng))
+    _run(server._save_prefix_cache_to_disk(eng))
+    assert eng.loads == [] and eng.saves == [] and not d.exists()
+    assert server._prefix_cache_state[str(d)]["saved"] is False
+
+
+def test_a_refused_reset_at_start_also_blocks_the_shutdown_save(policy_for, tmp_path):
+    d = policy_for("auto", "start")
+    real = tmp_path / "elsewhere"
+    _populate(real, 2)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    d.symlink_to(real, target_is_directory=True)
+    eng = StubEngine(entries=1)
+    before = _digest(real)
+    with pytest.raises(PersistenceError):
+        _run(server._load_prefix_cache_from_disk(eng))
+    _run(server._save_prefix_cache_to_disk(eng))
+    assert eng.saves == [] and _digest(real) == before
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "...", "a/.."])
+def test_model_names_cannot_resolve_to_the_base_or_its_parent(tmp_path, name):
+    pol = PersistencePolicy(base_dir=str(tmp_path / "base"))
+    d = Path(pol.resolve_dir(name))
+    assert d.parent == tmp_path / "base" and d.name not in ("", ".", "..")
+
+
+def test_reset_with_dotdot_model_name_does_not_touch_the_parent(tmp_path):
+    base = tmp_path / "base"
+    _populate(tmp_path, 1)  # a cache-looking file set in the parent of the base
+    pol = PersistencePolicy(base_dir=str(base), persist="none", reset="start")
+    reset_cache_dir(pol.resolve_dir(".."))
+    assert (tmp_path / "index.json").exists()
+
+
+def test_reset_refuses_a_path_that_reaches_home_through_a_symlinked_parent(tmp_path):
+    home = Path(os.path.expanduser("~"))
+    link = tmp_path / "lnk"
+    link.symlink_to(home.parent, target_is_directory=True)
+    with pytest.raises(PersistenceError, match="not a cache directory"):
+        reset_cache_dir(link / home.name)
+
+
+def test_registry_reload_under_reset_start_begins_cold_every_time(policy_for):
+    """Documented: in registry mode reset=start applies to every cold load."""
+    d = policy_for("auto", "start")
+    server._model_path = None
+    spec = types.SimpleNamespace(model_name="org/regmodel")
+    _run(server._persist_engine_state(spec, StubEngine(2)))  # idle-unload save
+    eng = StubEngine()
+    _run(server._restore_engine_state(spec, eng))  # reload
+    assert server._prefix_cache_state[str(d.parent / "org--regmodel")]["loaded"] == 0

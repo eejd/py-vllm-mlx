@@ -31,11 +31,26 @@ Typical uses:
 ## What a reset deletes
 
 Only the files the persistence code writes (`index.json`, `entry_<i>.safetensors`,
-`entry_<i>_tokens.bin`) in that model's directory. It never follows a symlink, never acts on `/` or
-the home directory or a parent of it, refuses a directory that is a symlink or a regular file, and
-leaves a directory with none of those files untouched. Other files are reported and left in place.
+`entry_<i>_tokens.bin`) in that model's directory. It never acts on `/` or the home directory or a
+parent of it (checked as written and with symlinks in the path resolved), refuses a directory that is
+itself a symlink or a regular file, never follows a symlink named like an entry, and leaves a
+directory with none of those files untouched. Other files are reported and left in place, and an
+emptied model directory is removed (the next save recreates it with default permissions). A model
+named `.` or `..` is mapped to a harmless directory name. A symlink swapped in between the check and
+the delete is not defended against; the file-name allow-list bounds what it could remove.
+
 A reset requested at start that cannot be done safely stops the server with an error instead of
-continuing with an unknown cache; a failed reset at stop is logged.
+continuing with an unknown cache, and the shutdown that follows does not save into that directory.
+A failed reset at stop is logged and never prevents the engine from stopping. Contradictory
+option combinations are refused before any model loads; an unsafe or failing reset path can only be
+found once the directory is examined, which happens at startup after the model has loaded.
+
+With `--models-config` (registry mode) a reset at start applies on every cold load of a model,
+including a reload after an idle unload, so `--prefix-cache-persist auto --prefix-cache-reset start`
+does not carry a cache across an idle cycle. Use `load-only` for a cache that must survive reloads.
+
+`python -m vllm_mlx.server` has no `--prefix-cache-*` flags; it honors `VLLM_MLX_PREFIX_CACHE_DIR`
+and otherwise behaves as `auto`/`never`. Persist and reset modes are options of `vllm-mlx serve`.
 
 ## What the server reports
 

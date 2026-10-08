@@ -1562,8 +1562,17 @@ async def _load_prefix_cache_from_disk(
     policy = _prefix_cache_policy
     d = _get_cache_dir(model_key)
     state = _persistence_state(d)
+    state["start_reset_failed"] = False
     if policy.resets_at_start:
-        result = reset_cache_dir(d)  # PersistenceError propagates
+        try:
+            result = reset_cache_dir(d)
+        except (PersistenceError, OSError) as e:
+            # Startup fails; the shutdown path must not then save into the
+            # directory the caller asked to have reset.
+            state["start_reset_failed"] = True
+            if isinstance(e, PersistenceError):
+                raise
+            raise PersistenceError(f"prefix cache reset at start failed: {e}") from e
         state["reset_at_start"] = {
             "deleted_files": result.deleted_files,
             "deleted_bytes": result.deleted_bytes,
@@ -1620,6 +1629,12 @@ async def _save_prefix_cache_to_disk(
     policy = _prefix_cache_policy
     d = _get_cache_dir(model_key)
     state = _persistence_state(d)
+    if state.get("start_reset_failed"):
+        state["saved"] = False
+        logger.warning(
+            "[lifespan] prefix cache reset at start failed: not saving to %s", d
+        )
+        return
     if not policy.saves:
         state["saved"] = False
         logger.info(
@@ -1661,8 +1676,12 @@ async def _save_prefix_cache_to_disk(
                 result.deleted_bytes,
                 d,
             )
-        except PersistenceError as e:
-            logger.error("[lifespan] prefix cache reset at stop refused: %s", e)
+        except Exception as e:
+            # Never let a failed cleanup keep the engine from stopping.
+            logger.error(
+                "[lifespan] prefix cache reset at stop failed: %s",
+                _sanitize_log_text(e, limit=500),
+            )
 
 
 def _get_cache_dir(model_key: str | None = None) -> str:
@@ -7920,6 +7939,11 @@ def main():
     global _default_presence_penalty, _default_repetition_penalty
     global _max_audio_upload_bytes, _max_tts_input_chars
     global _embedding_max_length, _embedding_overflow_policy
+    # This entry point has no --prefix-cache-* flags; honor the directory env var.
+    try:
+        set_prefix_cache_policy(PersistencePolicy.from_options())
+    except PersistenceError as e:
+        parser.error(str(e))
     _api_key = args.api_key
     _default_timeout = args.timeout
     _metrics_enabled = args.enable_metrics

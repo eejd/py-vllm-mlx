@@ -28,9 +28,11 @@ Valid combinations (an unmarked cell is refused at startup)::
 
 Deleting is deliberately narrow: only the files the persistence code writes
 (``index.json``, ``entry_<i>.safetensors``, ``entry_<i>_tokens.bin``) inside
-the resolved per-model directory, never through a symlink, never in ``/`` or
-the home directory itself, and a directory with none of those files is left
-alone. Anything else in the directory is reported and left in place.
+the resolved per-model directory, never when the directory itself is a symlink,
+never in ``/`` or the home directory itself (checked as spelled and with
+intermediate symlinks resolved), and a directory with none of those files is
+left alone. A symlink swapped in between the check and the delete is not
+defended against; the allow-list of file names bounds the damage. Anything else in the directory is reported and left in place.
 """
 
 from __future__ import annotations
@@ -59,8 +61,15 @@ def default_base_dir() -> str:
 
 
 def safe_model_name(model_name: object) -> str:
-    """Directory name for a model (unchanged from the historical scheme)."""
-    return str(model_name).replace("/", "--").replace("\\", "--")
+    """Directory name for a model (unchanged from the historical scheme).
+
+    A name that would resolve to the base directory or its parent (``""``,
+    ``"."``, ``".."``) is mapped to a distinct, harmless name instead.
+    """
+    name = str(model_name).replace("/", "--").replace("\\", "--")
+    if name in ("", ".", ".."):
+        return "_empty" if not name else name.replace(".", "_dot")
+    return name
 
 
 def _is_recognized(name: str) -> bool:
@@ -182,8 +191,11 @@ def reset_cache_dir(path: str | os.PathLike[str]) -> ResetResult:
     if not p.is_absolute():
         raise PersistenceError(f"refusing to reset a relative path: {os.fspath(path)!r}")
     home = Path(os.path.expanduser("~"))
-    if p == Path(p.anchor) or p == home or p in home.parents:
-        raise PersistenceError(f"refusing to reset {p}: not a cache directory")
+    # Compare both the spelled path and the one with intermediate symlinks
+    # resolved, so a link to the home directory or to ``/`` is also refused.
+    for cand, ref in ((p, home), (Path(os.path.realpath(p)), Path(os.path.realpath(home)))):
+        if cand == Path(cand.anchor) or cand == ref or cand in ref.parents:
+            raise PersistenceError(f"refusing to reset {p}: not a cache directory")
     try:
         st = os.lstat(p)
     except FileNotFoundError:
