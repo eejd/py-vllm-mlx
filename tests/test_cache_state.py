@@ -669,3 +669,27 @@ async def test_streaming_completions_usage_reports_cached_tokens(monkeypatch):
                 if c.startswith("data: ") and "[DONE]" not in c]
     usage = [p["usage"] for p in payloads if p.get("usage")]
     assert usage and usage[-1]["prompt_tokens_details"] == {"cached_tokens": 5}
+
+
+def test_registry_top_level_with_no_default_engine_does_not_report_the_cli_flags():
+    launch = cache_state.launch_options(_args("--kv-cache-quantization"))
+    state = cache_state.build(engine=None, launch=launch, engine_cache=None, persistence={},
+                              registry_mode=True, none_reason="registry mode keeps no default")
+    assert state["engine"]["continuous_batching"] == cache_state.UNREPORTED
+    assert state["launch_options"]["value"] == cache_state.UNREPORTED
+    assert state["inert_options"]["value"] == cache_state.UNREPORTED
+    assert state["counters"]["reason"] == "registry mode keeps no default"
+
+
+def test_boolean_attributes_are_not_mistaken_for_quantization_bits():
+    import mlx.nn as nn
+
+    from vllm_mlx.memory_cache import _quantization_signature as sig
+
+    class Odd(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bits = True
+            self.group_size = True
+
+    assert sig(Odd()) == "none"

@@ -361,6 +361,17 @@ def test_serve_with_continuous_batching_records_options_and_does_not_warn(monkey
     assert server._cache_launch_options["kv_cache_quantization"]["effective"] is True
 
 
+def test_registry_mode_does_not_call_global_cache_flags_inert(monkeypatch, capsys):
+    """Registry entries pick their own engine: the Simple-engine wording would be a false claim."""
+    from vllm_mlx import cli
+
+    _patched_serve(monkeypatch)
+    cli.serve_command(
+        _serve_args(model=None, models_config="models.yaml", kv_cache_quantization=True)
+    )
+    assert "only take effect with --continuous-batching" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     ("extra", "warns"),
     [({}, False), ({"prefix_cache_dir": "/x"}, True), ({"prefix_cache_persist": "none"}, True),

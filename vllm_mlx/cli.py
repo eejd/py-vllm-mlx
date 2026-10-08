@@ -107,7 +107,8 @@ def serve_command(args):
     from . import cache_state
 
     server.set_cache_launch_options(cache_state.launch_options(args))
-    inert = cache_state.inert_options(args)
+    # Registry entries choose their own engine, so the global flags cannot be called inert there.
+    inert = [] if getattr(args, "models_config", None) else cache_state.inert_options(args)
     if inert:
         print(
             "Warning: these options only take effect with --continuous-batching and are "

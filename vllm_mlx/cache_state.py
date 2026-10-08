@@ -147,9 +147,10 @@ def build(
     cause (registry mode keeps no single default engine; its models are listed separately).
     """
     engine_class = type(engine).__name__ if engine is not None else None
-    if registry_mode and engine is not None:
+    if registry_mode:
         # Registry entries choose their own engine; the CLI's --continuous-batching and cache
-        # options describe the defaults, not necessarily this model. The engine class is the truth.
+        # options describe the defaults, not necessarily any model. The engine class is the truth
+        # (and with no default engine, as at the top level of a registry server, there is none).
         batching: Any = {"BatchedEngine": True, "SimpleEngine": False}.get(
             engine_class or "", UNREPORTED
         )

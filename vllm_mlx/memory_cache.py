@@ -1012,8 +1012,12 @@ def _quantization_signature(model: Any) -> str:
             # Any module that carries integer ``bits`` and ``group_size`` is quantized weights:
             # QuantizedLinear, QuantizedEmbedding, and also mlx_lm's QuantizedSwitchLinear (the MoE
             # experts) and anything similar, which are plain ``nn.Module`` subclasses.
-            if isinstance(getattr(module, "bits", None), int) and isinstance(
-                getattr(module, "group_size", None), int
+            bits, group = getattr(module, "bits", None), getattr(module, "group_size", None)
+            if (
+                isinstance(bits, int)
+                and isinstance(group, int)
+                and not isinstance(bits, bool)
+                and not isinstance(group, bool)
             ):
                 key = (
                     type(module).__name__,
