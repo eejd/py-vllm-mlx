@@ -77,6 +77,22 @@ def serve_command(args):
         print("Error: --memory-budget-gb requires --models-config")
         sys.exit(1)
 
+    # Persisted prefix cache: where it lives, whether it is read or written, and
+    # when it is deleted. Invalid combinations are refused before any model loads.
+    from .prefix_cache_persistence import PersistenceError, PersistencePolicy
+
+    try:
+        server.set_prefix_cache_policy(
+            PersistencePolicy.from_options(
+                getattr(args, "prefix_cache_dir", None),
+                getattr(args, "prefix_cache_persist", None),
+                getattr(args, "prefix_cache_reset", None),
+            )
+        )
+    except PersistenceError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
     # Validate tool calling arguments
     if args.enable_auto_tool_choice and not args.tool_call_parser:
         print("Error: --enable-auto-tool-choice requires --tool-call-parser")
@@ -1129,6 +1145,30 @@ Examples:
         type=int,
         default=100,
         help="Max entries in prefix cache (default: 100, legacy mode only)",
+    )
+    serve_parser.add_argument(
+        "--prefix-cache-dir",
+        type=str,
+        default=None,
+        help="Base directory of the persisted prefix cache; each model keeps its "
+        "own subdirectory (default: $VLLM_MLX_PREFIX_CACHE_DIR, else "
+        "~/.cache/vllm-mlx/prefix_cache)",
+    )
+    serve_parser.add_argument(
+        "--prefix-cache-persist",
+        choices=("auto", "none", "load-only", "save-only"),
+        default="auto",
+        help="auto: load at start and save at stop (default); none: never read or "
+        "write the persisted cache; load-only: start from the preserved cache and "
+        "never modify it; save-only: start cold and save at stop",
+    )
+    serve_parser.add_argument(
+        "--prefix-cache-reset",
+        choices=("never", "start", "stop", "both"),
+        default="never",
+        help="Delete this model's persisted prefix-cache entries before loading "
+        "(start), after the shutdown save (stop), or both (default: never). Only "
+        "the persistence files in the model's cache directory are deleted",
     )
     # Memory-aware cache options (recommended for large models)
     serve_parser.add_argument(

@@ -2112,10 +2112,10 @@ class TestLifecycleFailureHandling:
         async def fake_engine_factory(spec):
             return FakeEngine()
 
-        def fake_load_prefix_cache_from_disk(engine=None):
+        def fake_load_prefix_cache_from_disk(engine=None, model_key=None):
             load_calls["count"] += 1
 
-        def fake_save_prefix_cache_to_disk(engine=None):
+        def fake_save_prefix_cache_to_disk(engine=None, model_key=None):
             save_calls["count"] += 1
 
         monkeypatch.setattr(srv, "_engine_factory", fake_engine_factory)
