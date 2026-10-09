@@ -373,16 +373,17 @@ def test_registry_mode_does_not_call_global_cache_flags_inert(monkeypatch, capsy
 
 
 @pytest.mark.parametrize(
-    ("extra", "warns"),
-    [({}, False), ({"prefix_cache_dir": "/x"}, True), ({"prefix_cache_persist": "none"}, True),
-     ({"prefix_cache_reset": "start"}, True)],
+    "extra",
+    [{}, {"prefix_cache_dir": "/x"}, {"prefix_cache_persist": "none"},
+     {"prefix_cache_reset": "start"}],
 )
-def test_registry_mode_warns_that_prefix_cache_options_do_nothing(
-    monkeypatch, capsys, extra, warns
+def test_registry_mode_no_longer_says_that_prefix_cache_options_do_nothing(
+    monkeypatch, capsys, extra
 ):
+    """Registry models load and save persisted caches now (#41): no "does nothing" warning."""
     from vllm_mlx import cli
 
     _patched_serve(monkeypatch)
     cli.serve_command(_serve_args(model=None, models_config="models.yaml", **extra))
     out = capsys.readouterr().out
-    assert ("registry mode (--models-config) does not load or save" in out) is warns
+    assert "does not load or save persisted prefix caches" not in out

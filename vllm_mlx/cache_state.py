@@ -108,20 +108,6 @@ def inert_options(args: Any) -> list[str]:
     ]
 
 
-def registry_ignores_persistence(args: Any) -> bool:
-    """True when ``--models-config`` is combined with a non-default --prefix-cache-* option.
-
-    Registry mode never loads or saves a persisted prefix cache, so such options do nothing there.
-    """
-    if not getattr(args, "models_config", None):
-        return False
-    return (
-        getattr(args, "prefix_cache_dir", None) is not None
-        or getattr(args, "prefix_cache_persist", "auto") != "auto"
-        or getattr(args, "prefix_cache_reset", "never") != "never"
-    )
-
-
 def launch_options(args: Any) -> dict[str, Any]:
     """The cache-relevant options the server was started with (as requested)."""
     cb = bool(getattr(args, "continuous_batching", False))

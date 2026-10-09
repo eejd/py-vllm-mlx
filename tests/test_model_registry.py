@@ -1254,3 +1254,136 @@ models:
         manager_config, _ = load_registry_config(config_path, _defaults())
 
         assert manager_config.idle_unload_seconds == 0.0
+
+
+# --- lifecycle hooks: persisted prefix caches in registry mode (#41) -------------------------
+
+
+def _hooked_manager(tmp_path, sizes, events, *, fail_load=False, fail_unload=False, budget_gb=8):
+    registry = _registry(tmp_path, sizes)
+    created: dict[str, list[FakeEngine]] = {}
+
+    def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+        engine = FakeEngine(config)
+        created.setdefault(config.entry.name, []).append(engine)
+        return engine
+
+    async def on_loaded(config: ResolvedModelConfig, engine) -> None:
+        events.append(("load", config.entry.name, engine.started, engine.stopped))
+        if fail_load:
+            raise RuntimeError("restore failed")
+
+    async def on_unloading(config: ResolvedModelConfig, engine) -> None:
+        events.append(("save", config.entry.name, engine.started, engine.stopped))
+        if fail_unload:
+            raise RuntimeError("save failed")
+
+    manager = ModelManager(
+        _manager_config(budget_gb=budget_gb),
+        registry,
+        _defaults(),
+        engine_factory=engine_factory,
+        on_engine_loaded=on_loaded,
+        on_engine_unloading=on_unloading,
+    )
+    return manager, created
+
+
+def test_load_hook_runs_after_the_engine_started_and_before_the_lease(tmp_path):
+    async def _run():
+        events: list = []
+        manager, created = _hooked_manager(tmp_path, {"alpha": 4}, events)
+        lease = await manager.acquire("alpha")
+        assert events == [("load", "alpha", 1, 0)]  # started once, not yet stopped
+        await lease.release()
+        await manager.shutdown()
+
+    asyncio.run(_run())
+
+
+def test_unload_hook_runs_before_the_engine_stops(tmp_path):
+    async def _run():
+        events: list = []
+        manager, created = _hooked_manager(tmp_path, {"alpha": 4}, events)
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        await manager.shutdown()
+        assert events[-1] == ("save", "alpha", 1, 0)  # saved while still running
+        assert created["alpha"][0].stopped == 1
+
+    asyncio.run(_run())
+
+
+def test_eviction_saves_the_evicted_model_and_loads_the_new_one(tmp_path):
+    async def _run():
+        events: list = []
+        manager, created = _hooked_manager(
+            tmp_path, {"alpha": 5, "beta": 5}, events, budget_gb=8
+        )
+        first = await manager.acquire("alpha")
+        await first.release()
+        second = await manager.acquire("beta")  # does not fit next to alpha
+        await second.release()
+        assert [e[:2] for e in events] == [
+            ("load", "alpha"), ("save", "alpha"), ("load", "beta"),
+        ]
+        assert created["alpha"][0].stopped == 1
+        await manager.shutdown()
+        assert events[-1][:2] == ("save", "beta")
+
+    asyncio.run(_run())
+
+
+def test_a_reload_runs_the_load_hook_again(tmp_path):
+    async def _run():
+        events: list = []
+        manager, created = _hooked_manager(
+            tmp_path, {"alpha": 5, "beta": 5}, events, budget_gb=8
+        )
+        for name in ("alpha", "beta", "alpha"):
+            lease = await manager.acquire(name)
+            await lease.release()
+        assert [e[:2] for e in events if e[0] == "load"] == [
+            ("load", "alpha"), ("load", "beta"), ("load", "alpha"),
+        ]
+        await manager.shutdown()
+
+    asyncio.run(_run())
+
+
+def test_a_failing_load_hook_stops_the_engine_and_fails_the_acquire(tmp_path):
+    async def _run():
+        events: list = []
+        manager, created = _hooked_manager(tmp_path, {"alpha": 4}, events, fail_load=True)
+        with pytest.raises(RuntimeError, match="restore failed"):
+            await manager.acquire("alpha")
+        assert created["alpha"][0].started == 1 and created["alpha"][0].stopped == 1
+        assert manager.loaded_engines() == []
+
+    asyncio.run(_run())
+
+
+def test_a_failing_unload_hook_still_stops_the_engine(tmp_path):
+    async def _run():
+        events: list = []
+        manager, created = _hooked_manager(tmp_path, {"alpha": 4}, events, fail_unload=True)
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        await manager.shutdown()
+        assert created["alpha"][0].stopped == 1
+
+    asyncio.run(_run())
+
+
+def test_a_manager_without_hooks_behaves_as_before(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=8), registry, _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        await manager.shutdown()
+
+    asyncio.run(_run())
