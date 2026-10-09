@@ -126,6 +126,7 @@ _COUNTER_KEYS = (
     "misses",
     "evictions",
     "tokens_saved",
+    "discarded_hits",
     "entry_count",
     "current_memory_mb",
     "max_memory_mb",

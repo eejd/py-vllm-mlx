@@ -22,6 +22,7 @@ Base: upstream `80e7fde` (2026-10-03, 57 commits past v0.5.0).
 | 12 | `Qwen3XMLToolParser` (qwen3_coder/qwen3_xml/qwen3.5): never return invalid-JSON `arguments` (add missing closing braces when the model stopped before `</function>`; drop a call cut off mid-value into content); log the sticky expat error once per stream, not once per element; `_coerce_tool_arguments` applies the same brace repair on the streaming path. Tested against the shared quantbench golden corpus (`tests/data/parser_golden.jsonl`) | this change | local; eejd/py-vllm-mlx#24 | candidate (not opened) | Upstream validates salvaged arguments |
 | 13 | Persisted prefix cache controls: `--prefix-cache-dir` / `VLLM_MLX_PREFIX_CACHE_DIR`, `--prefix-cache-persist {auto,none,load-only,save-only}`, `--prefix-cache-reset {never,start,stop,both}` (`vllm_mlx/prefix_cache_persistence.py`); the single-model lazy-load manager uses a per-model directory (was a shared `default`); registry mode (`--models-config`) persists nothing, reported as `persistence.applies: false`; `persistence` block in `/v1/cache/stats`; guide `docs/guides/prefix-cache-persistence.md` | this PR (fork#36) | local | candidate, after production use here; context: waybarrios/vllm-mlx#747, #758, #794. Nothing opened upstream | Upstream adopts equivalent options |
 | 14 | Cache observability: per-request `usage.prompt_tokens_details.cached_tokens` (omitted when the engine does not report it), a `cache_state` block in `/v1/cache/stats` (engine mode, cache options and which are inert, memory-limit derivation, counters, per-model state in registry mode; `"unreported"` instead of defaults), a startup warning for options the Simple engine ignores, and a model fingerprint that includes the weight quantization; `scripts/probe_cache_state.py`, `docs/cache-state-signals.md` | this PR (fork#37) | local | candidate, after production use here. Nothing opened upstream | Upstream adopts equivalent reporting |
+| 15 | Exact and supersequence prefix hits are reused on plain KV layers (the scheduler rewinds a copy by one position and feeds only the last token) instead of prefilling in full; a hit the scheduler does not use is taken back from `hits`/`tokens_saved` and counted in `discarded_hits`; persisted entries are quantized on load under the same rule as fresh ones when KV quantization is on | this PR | local (eejd/py-vllm-mlx#39, #40) | candidate (not opened) | none |
 
 ## Landed upstream (no longer carried)
 
@@ -51,5 +52,7 @@ Base: upstream `80e7fde` (2026-10-03, 57 commits past v0.5.0).
   (`next()` responses, `extract_cache`, `insert_segments`) would be the fix; not implemented here.
 - **Mid-prefill saves, `prefix_boundary` two-phase prefill and LLM-path MTP are inactive** on every
   supported mlx-lm for the same reason (they log or degrade silently).
-- An exact repeat of a prompt on plain-KV models is counted as a hit but is not noticeably faster;
-  partial-prefix hits are (about 20x on a 2.2k-token prompt). Same on all three configurations measured.
+- An exact repeat of a prompt on plain-KV models used to be counted as a hit but prefilled in full;
+  since row 15 it reuses all but the last token. Recurrent, rotating-window and container caches still
+  prefill an exact repeat (and take the hit back from the counters). Partial-prefix hits were always reused
+  (about 20x on a 2.2k-token prompt).
