@@ -556,3 +556,202 @@ class TestMetricsMiddlewareStreamingTiming:
             "settle metrics at request exit, not only whenever the "
             "abandoned generator happens to be garbage-collected"
         )
+
+
+def _scrape(collector, **kwargs):
+    payload, _ = collector.render_metrics(engine=kwargs.pop("engine", None), mcp_manager=None, **kwargs)
+    return payload.decode()
+
+
+def _state(**over):
+    state = {
+        "counters": {
+            "hits": 3, "misses": 1, "evictions": 2, "tokens_saved": 120,
+            "discarded_hits": 1, "entry_count": 4, "current_memory_mb": 2.0,
+            "max_memory_mb": 64.0,
+        },
+        "memory_limit": {"bytes": 64 << 20, "source": "explicit"},
+    }
+    state.update(over)
+    return state
+
+
+class TestPrefixCacheSeries:
+    """Per-model prefix-cache series built from the cache_state blocks (#42)."""
+
+    @pytest.fixture()
+    def collector(self):
+        from vllm_mlx.metrics import MetricsCollector
+
+        c = MetricsCollector()
+        c.configure(enabled=True)
+        return c
+
+    def test_counters_limit_and_persistence_are_exported_per_model(self, collector):
+        text = _scrape(
+            collector,
+            cache_states={"m1": _state()},
+            persistence={
+                "applies": True,
+                "dirs": {"/d": {"loaded": 3, "entries_on_disk": 5}},
+            },
+        )
+        assert 'vllm_mlx_prefix_cache_hits{model="m1"} 3.0' in text
+        assert 'vllm_mlx_prefix_cache_misses{model="m1"} 1.0' in text
+        assert 'vllm_mlx_prefix_cache_discarded_hits{model="m1"} 1.0' in text
+        assert 'vllm_mlx_prefix_cache_evictions{model="m1"} 2.0' in text
+        assert 'vllm_mlx_prefix_cache_tokens_saved{model="m1"} 120.0' in text
+        assert 'vllm_mlx_prefix_cache_entries{model="m1"} 4.0' in text
+        assert 'vllm_mlx_prefix_cache_memory_bytes{model="m1"} 2.097152e+06' in text
+        assert (
+            'vllm_mlx_prefix_cache_memory_limit_bytes{model="m1",source="explicit"}'
+            " 6.7108864e+07" in text
+        )
+        assert "vllm_mlx_prefix_cache_persistence_applies 1.0" in text
+        assert "vllm_mlx_prefix_cache_persisted_entries_loaded 3.0" in text
+        assert "vllm_mlx_prefix_cache_persisted_entries_on_disk 5.0" in text
+
+    def test_two_models_get_two_label_sets_and_an_unloaded_one_drops_out(self, collector):
+        both = {"a": _state(), "b": _state(counters={**_state()["counters"], "hits": 9})}
+        text = _scrape(collector, cache_states=both)
+        assert 'vllm_mlx_prefix_cache_hits{model="a"} 3.0' in text
+        assert 'vllm_mlx_prefix_cache_hits{model="b"} 9.0' in text
+        later = _scrape(collector, cache_states={"a": _state()})
+        assert 'model="b"' not in later
+        assert 'vllm_mlx_prefix_cache_hits{model="a"} 3.0' in later
+
+    def test_an_engine_that_reports_nothing_gets_no_series_not_zeros(self, collector):
+        unreported = {"counters": {"value": "unreported", "reason": "x"},
+                      "memory_limit": {"value": "unreported", "reason": "x"}}
+        text = _scrape(collector, cache_states={"m": unreported})
+        assert 'vllm_mlx_prefix_cache_hits{model="m"}' not in text
+        assert "vllm_mlx_prefix_cache_memory_limit_bytes{" not in text
+
+    def test_missing_cache_state_exports_no_per_model_series(self, collector):
+        text = _scrape(collector)
+        assert "vllm_mlx_prefix_cache_hits{" not in text
+        assert "vllm_mlx_prefix_cache_persistence_applies 0.0" in text
+
+    def test_the_unlabeled_gauges_say_whether_the_engine_reports(self, collector):
+        class Quiet:
+            def get_stats(self):
+                return {}
+
+        assert "vllm_mlx_cache_stats_reported 0.0" in _scrape(collector, engine=Quiet())
+
+        class WithCache(Quiet):
+            def get_stats(self):
+                return {"memory_aware_cache": {"hits": 2, "discarded_hits": 1}}
+
+        text = _scrape(collector, engine=WithCache())
+        assert "vllm_mlx_cache_stats_reported 1.0" in text
+        assert "vllm_mlx_cache_discarded_hits 1.0" in text
+
+    def test_the_simple_engines_trie_counters_reach_the_cache_gauges(self, collector):
+        class Simple:
+            def get_stats(self):
+                return {"engine_type": "simple"}
+
+            def get_cache_stats(self):
+                return {"hits": 4, "misses": 1, "tokens_saved": 900, "entry_count": 2,
+                        "current_memory_mb": 1.0}
+
+        text = _scrape(collector, engine=Simple())
+        assert 'vllm_mlx_cache_type{cache_type="prefix_trie_cache"} 1.0' in text
+        assert "vllm_mlx_cache_hits 4.0" in text
+        assert "vllm_mlx_cache_tokens_saved 900.0" in text
+        assert "vllm_mlx_cache_stats_reported 1.0" in text
+
+    def test_endpoint_exports_the_single_model_series(self, metrics_client):
+        client, server, collector = metrics_client
+        collector.configure(enabled=True)
+
+        class Eng(FakeEngine):
+            def get_cache_stats(self):
+                return {"hits": 7, "misses": 2, "tokens_saved": 50, "entry_count": 1,
+                        "current_memory_mb": 1.0,
+                        "memory_limit": {"bytes": 1 << 20, "source": "fallback_8gb"}}
+
+        server._engine = Eng()
+        text = client.get("/metrics").text
+        assert 'vllm_mlx_prefix_cache_hits{model="metrics-model"} 7.0' in text
+        assert 'source="fallback_8gb"' in text
+
+    def test_endpoint_survives_a_cache_state_failure(self, metrics_client):
+        client, server, collector = metrics_client
+        collector.configure(enabled=True)
+
+        class Broken(FakeEngine):
+            def get_cache_stats(self):
+                raise RuntimeError("boom")
+
+        server._engine = Broken()
+        response = client.get("/metrics")
+        assert response.status_code == 200
+
+    def test_endpoint_exports_every_loaded_registry_model(self, metrics_client, monkeypatch):
+        client, server, collector = metrics_client
+        collector.configure(enabled=True)
+
+        def eng(hits):
+            class E(FakeEngine):
+                def get_cache_stats(self):
+                    return {"hits": hits, "misses": 0, "tokens_saved": 1, "entry_count": 1,
+                            "current_memory_mb": 1.0}
+
+            return E()
+
+        class Manager:
+            def get_metrics_engine(self):
+                return eng(1)
+
+            def loaded_engines(self):
+                return [("alpha", eng(1)), ("beta", eng(5))]
+
+            async def shutdown(self):
+                return None
+
+        monkeypatch.setattr(server, "_model_manager", Manager())
+        text = client.get("/metrics").text
+        assert 'vllm_mlx_prefix_cache_hits{model="alpha"} 1.0' in text
+        assert 'vllm_mlx_prefix_cache_hits{model="beta"} 5.0' in text
+
+    def test_a_model_name_with_quotes_and_newlines_is_escaped(self, collector):
+        text = _scrape(collector, cache_states={'we"ird\nname': _state()})
+        assert 'model="we\\"ird\\nname"' in text
+
+    def test_an_engine_without_top_level_hits_does_not_feed_the_trie_fallback(self, collector):
+        class Other:
+            def get_stats(self):
+                return {}
+
+            def get_cache_stats(self):
+                return {"mllm_cache": {"entries": 1}}
+
+        text = _scrape(collector, engine=Other())
+        assert 'cache_type="prefix_trie_cache"} 0.0' in text
+        assert "vllm_mlx_cache_stats_reported 0.0" in text
+
+    def test_a_scrape_asks_the_engine_for_cache_stats_once(self, metrics_client):
+        client, server, collector = metrics_client
+        collector.configure(enabled=True)
+        calls = []
+
+        class Eng(FakeEngine):
+            def get_stats(self):
+                return {}
+
+            def get_cache_stats(self):
+                calls.append(1)
+                return {"hits": 1, "misses": 0, "tokens_saved": 1, "entry_count": 1,
+                        "current_memory_mb": 1.0}
+
+        server._engine = Eng()
+        client.get("/metrics")
+        assert len(calls) == 1
+
+    def test_persistence_does_not_apply_when_no_engine_is_loaded(self, metrics_client):
+        client, server, collector = metrics_client
+        collector.configure(enabled=True)
+        assert server._engine is None
+        assert "vllm_mlx_prefix_cache_persistence_applies 0.0" in client.get("/metrics").text

@@ -25,7 +25,7 @@ that does not follow behavior, **missing** when absent. "Unreported" below is th
 | `cache_state` block | **real** (this PR): engine class, launch options, inert options, versions; counters `unreported` with a reason | **real**; the batched MLLM engine nests its stats under `prefix_cache`, which `cache_state` unwraps | top level says "registry mode keeps no single default engine"; per model under `models`, where `engine.continuous_batching` comes from the model's engine class and `launch_options`/`inert_options` are `unreported` (registry entries choose their own engine, so the CLI flags do not describe them) |
 | Persisted prefix cache (`persistence`) | not loaded or saved (no hooks): `persistence.applies: false` with the engine class named. In the single-model lazy-load mode `applies` is true until the engine is loaded and may turn false once a Simple engine is in place | loaded and saved per `--prefix-cache-*` | **not applicable**: `persistence.applies: false` (eejd/py-vllm-mlx#41) |
 | `GET /v1/status` cache section | **missing** (`cache` key absent in the probe; per the code, `--prefix-trie-cache` stats come from `SimpleEngine.get_stats` and are not in `/v1/cache/stats`; the trie was off in the probe, so this is not verified live) | **real** (same numbers as `engine_cache`) | only `model_manager` |
-| `GET /metrics` prefix-cache series | **missing**; only `vllm_mlx_metal_memory_bytes{kind="cache"}` | **missing**; same | **missing** (eejd/py-vllm-mlx#42) |
+| `GET /metrics` prefix-cache series | the unlabeled `vllm_mlx_cache_*` gauges plus per-model `vllm_mlx_prefix_cache_*` series from the trie counters when the trie cache is on (eejd/py-vllm-mlx#42); the unlabeled gauges are zero-fill with `vllm_mlx_cache_stats_reported 0` otherwise, and no per-model series is exported | `vllm_mlx_cache_*` gauges (hits, misses, evictions, tokens saved, entries, memory, limit, `discarded_hits`) plus per-model `vllm_mlx_prefix_cache_*` series incl. the limit's derivation (`source` label) | per-model `vllm_mlx_prefix_cache_*` series for every loaded model; the unlabeled gauges describe the most recently used one |
 | `DELETE /v1/cache` | clears (nothing material to clear) | clears: entries and counters back to 0, next request cold again (probe: entry_count 2 -> 0, hits 2 -> 0) | per the engine |
 | MLLM engines | text-only requests that consult the prefix cache report the reused prompt tokens (prefix hit: the matched prefix; exact hit: all but the last token; miss or fall-through: 0) and settle the cache counters like the text scheduler; media requests and cache-off engines report nothing (`None`, omitted from `usage`). The Responses API carries the same value as `usage.input_tokens_details.cached_tokens` and omits the object when the engine does not report it (eejd/py-vllm-mlx#43). OpenAI's schema lists `input_tokens_details` as required; a made-up `{"cached_tokens": 0}` would make a warm request on a non-reporting engine look cold to any tool that verifies cache conditions, so the field is left out instead (clients that read it unconditionally should treat absence as unknown) | same | same |
 
@@ -124,6 +124,16 @@ quantization is on; they are now quantized on load under the same rule as fresh 
 | Issue | Gap |
 |---|---|
 | #41 | registry mode never loads or saves persisted caches |
-| #42 | no cache series in `/metrics` |
 | #43 | Responses API / MLLM cached-token counts are constants |
 | #44 | Simple engine reports no reuse |
+
+## `/metrics` and the original probe
+
+The probe first reported `/metrics` as having no prefix-cache series. The batched engine always exported
+the unlabeled `vllm_mlx_cache_*` gauges; the probe's filter kept the first 20 lines containing "cache",
+and the HTTP histogram lines for `/v1/cache/stats` filled that quota before the gauges. The filter now
+keeps only cache series. What was really missing, and is added in #42: the Simple engine's trie counters,
+`discarded_hits`, the memory limit's derivation, persisted-cache state, a `model` label, and a
+`vllm_mlx_cache_stats_reported` gauge that says whether the unlabeled gauges are data or zero-fill (an
+unlabeled gauge cannot be omitted; the per-model series are simply absent for an engine that reports
+nothing). The hit/miss/eviction/token series are gauges, as the existing `vllm_mlx_cache_*` ones are, because `DELETE /v1/cache` resets them: read them with `delta()`/`deriv()`, not `rate()`/`increase()`. A 0 in an unlabeled gauge whose own field is absent for that engine (for example the memory limit on the Simple engine) still means "not reported"; `vllm_mlx_cache_stats_reported` only says the counters are. The Simple engine reports its trie memory in binary megabytes, like the other engines.

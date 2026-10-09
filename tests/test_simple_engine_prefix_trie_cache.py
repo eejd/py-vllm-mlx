@@ -637,3 +637,44 @@ async def test_the_system_snapshot_cache_can_be_switched_off(monkeypatch):
 async def _empty_stream():
     return
     yield
+
+
+async def test_stats_never_wait_for_a_worker_holding_the_trie_lock():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    fake = _growing_responses([ord("X")])
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+    ):
+        await _collect(engine, MESSAGES)
+    entries, nbytes = engine._prefix_trie_cache_snapshot()
+    assert entries == 1 and nbytes > 0
+
+    holder = threading.Thread(target=lambda: None)
+    with engine._prefix_trie_cache_lock:  # a worker mid-copy
+        done = []
+        holder = threading.Thread(
+            target=lambda: done.append(engine._prefix_trie_cache_snapshot())
+        )
+        holder.start()
+        holder.join(timeout=2)
+        assert not holder.is_alive(), "the snapshot blocked on the lock"
+    assert done == [(entries, nbytes)]  # last values seen
+
+
+async def test_cache_level_memory_is_in_binary_megabytes_like_the_other_engines():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    fake = _growing_responses([ord("X")])
+    def big_cache(*_):
+        layer = GrowingCache()
+        layer.nbytes = 3 * 1024 * 1024
+        return [layer]
+
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=big_cache),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+    ):
+        await _collect(engine, MESSAGES)
+    _, nbytes = engine._prefix_trie_cache_snapshot()
+    assert nbytes == 3 * 1024 * 1024
+    assert engine.get_cache_stats()["current_memory_mb"] == 3.0

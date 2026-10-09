@@ -223,7 +223,7 @@ class MetricsCollector:
             ),
             "cache_hits": Gauge(
                 "vllm_mlx_cache_hits",
-                "Cache hits since startup/reset.",
+                "Cache hits since startup/reset (a gauge: DELETE /v1/cache resets it).",
                 registry=registry,
             ),
             "cache_misses": Gauge(
@@ -259,6 +259,80 @@ class MetricsCollector:
             "cache_tokens_saved": Gauge(
                 "vllm_mlx_cache_tokens_saved",
                 "Prompt tokens saved by cache reuse since startup/reset.",
+                registry=registry,
+            ),
+            "cache_stats_reported": Gauge(
+                "vllm_mlx_cache_stats_reported",
+                "1 when the engine reports prefix-cache counters; the vllm_mlx_cache_* "
+                "gauges above are 0 (not data) when this is 0.",
+                registry=registry,
+            ),
+            "cache_discarded_hits": Gauge(
+                "vllm_mlx_cache_discarded_hits",
+                "Prefix-cache hits the scheduler credited but did not use.",
+                registry=registry,
+            ),
+            "pc_hits": Gauge(
+                "vllm_mlx_prefix_cache_hits",
+                "Prefix-cache hits since startup/reset, per model (a gauge: DELETE /v1/cache resets it).",
+                ["model"],
+                registry=registry,
+            ),
+            "pc_misses": Gauge(
+                "vllm_mlx_prefix_cache_misses",
+                "Prefix-cache misses since startup/reset, per model.",
+                ["model"],
+                registry=registry,
+            ),
+            "pc_discarded_hits": Gauge(
+                "vllm_mlx_prefix_cache_discarded_hits",
+                "Hits credited by the cache but not used by the scheduler, per model.",
+                ["model"],
+                registry=registry,
+            ),
+            "pc_evictions": Gauge(
+                "vllm_mlx_prefix_cache_evictions",
+                "Prefix-cache evictions since startup/reset, per model.",
+                ["model"],
+                registry=registry,
+            ),
+            "pc_tokens_saved": Gauge(
+                "vllm_mlx_prefix_cache_tokens_saved",
+                "Prompt tokens saved by prefix-cache reuse since startup/reset, per model.",
+                ["model"],
+                registry=registry,
+            ),
+            "pc_entries": Gauge(
+                "vllm_mlx_prefix_cache_entries",
+                "Prefix-cache entries, per model.",
+                ["model"],
+                registry=registry,
+            ),
+            "pc_memory_bytes": Gauge(
+                "vllm_mlx_prefix_cache_memory_bytes",
+                "Prefix-cache memory in use, per model.",
+                ["model"],
+                registry=registry,
+            ),
+            "pc_memory_limit_bytes": Gauge(
+                "vllm_mlx_prefix_cache_memory_limit_bytes",
+                "Effective prefix-cache memory limit, per model; source says how it was derived.",
+                ["model", "source"],
+                registry=registry,
+            ),
+            "pc_persist_applies": Gauge(
+                "vllm_mlx_prefix_cache_persistence_applies",
+                "1 when persisted prefix-cache loading/saving applies to this server.",
+                registry=registry,
+            ),
+            "pc_persist_loaded": Gauge(
+                "vllm_mlx_prefix_cache_persisted_entries_loaded",
+                "Entries loaded from the persisted prefix cache at startup.",
+                registry=registry,
+            ),
+            "pc_persist_on_disk": Gauge(
+                "vllm_mlx_prefix_cache_persisted_entries_on_disk",
+                "Entries present in the persisted prefix-cache directory at startup.",
                 registry=registry,
             ),
             "model_registry_entries": Gauge(
@@ -370,6 +444,7 @@ class MetricsCollector:
         *,
         engine: Any | None,
         mcp_manager: Any | None,
+        engine_cache: dict | None = None,
     ) -> None:
         assert self._prom is not None
 
@@ -415,8 +490,33 @@ class MetricsCollector:
                 cache_type = candidate
                 cache_stats = stats[candidate]
                 break
+        if cache_stats is None and engine is not None:
+            # The Simple engine reports its prefix-trie counters through
+            # get_cache_stats() (top-level hits/misses/...), not get_stats().
+            simple_stats = engine_cache
+            if simple_stats is None:
+                try:
+                    simple_stats = engine.get_cache_stats()
+                except Exception:
+                    simple_stats = None
+            if isinstance(simple_stats, dict) and "hits" in simple_stats:
+                cache_type = "prefix_trie_cache"
+                cache_stats = simple_stats
 
-        for candidate in ("none", "prefix_cache", "memory_aware_cache", "paged_cache"):
+        self._prom["cache_stats_reported"].set(1 if isinstance(cache_stats, dict) else 0)
+        self._prom["cache_discarded_hits"].set(
+            _coerce_float(cache_stats.get("discarded_hits", 0))
+            if isinstance(cache_stats, dict)
+            else 0
+        )
+
+        for candidate in (
+            "none",
+            "prefix_cache",
+            "memory_aware_cache",
+            "paged_cache",
+            "prefix_trie_cache",
+        ):
             self._prom["cache_type"].labels(cache_type=candidate).set(
                 1 if cache_type == candidate else 0
             )
@@ -499,17 +599,84 @@ class MetricsCollector:
         self._prom["mcp_total_servers"].set(total)
         self._prom["mcp_tools_available"].set(tools)
 
+    def _update_cache_state_gauges(
+        self,
+        cache_states: dict[str, dict] | None,
+        persistence: dict | None,
+    ) -> None:
+        """Per-model prefix-cache series from the ``cache_state`` blocks.
+
+        Rebuilt from the live state on every scrape (stale models drop out). A model whose
+        engine reports no counters gets no series; an unreported value is never exported as 0.
+        """
+        assert self._prom is not None
+        per_model = (
+            "pc_hits",
+            "pc_misses",
+            "pc_discarded_hits",
+            "pc_evictions",
+            "pc_tokens_saved",
+            "pc_entries",
+            "pc_memory_bytes",
+        )
+        for key in (*per_model, "pc_memory_limit_bytes"):
+            self._prom[key].clear()
+        fields = {
+            "pc_hits": "hits",
+            "pc_misses": "misses",
+            "pc_discarded_hits": "discarded_hits",
+            "pc_evictions": "evictions",
+            "pc_tokens_saved": "tokens_saved",
+            "pc_entries": "entry_count",
+        }
+        for model, state in (cache_states or {}).items():
+            counters = (state or {}).get("counters")
+            if isinstance(counters, dict) and "hits" in counters:
+                for key, field in fields.items():
+                    if field in counters:
+                        self._prom[key].labels(model=model).set(
+                            _coerce_float(counters[field])
+                        )
+                if "current_memory_mb" in counters:
+                    self._prom["pc_memory_bytes"].labels(model=model).set(
+                        _coerce_float(counters["current_memory_mb"]) * 1024 * 1024
+                    )
+            limit = (state or {}).get("memory_limit")
+            if isinstance(limit, dict) and "bytes" in limit:
+                self._prom["pc_memory_limit_bytes"].labels(
+                    model=model, source=str(limit.get("source", "unknown"))
+                ).set(_coerce_float(limit["bytes"]))
+
+        persistence = persistence or {}
+        dirs = [d for d in (persistence.get("dirs") or {}).values() if isinstance(d, dict)]
+        self._prom["pc_persist_applies"].set(1 if persistence.get("applies") else 0)
+        self._prom["pc_persist_loaded"].set(
+            sum(_coerce_int(d.get("loaded")) for d in dirs)
+        )
+        self._prom["pc_persist_on_disk"].set(
+            sum(_coerce_int(d.get("entries_on_disk")) for d in dirs)
+        )
+
     def render_metrics(
         self,
         *,
         engine: Any | None,
         mcp_manager: Any | None,
+        cache_states: dict[str, dict] | None = None,
+        persistence: dict | None = None,
+        engine_cache: dict | None = None,
     ) -> tuple[bytes, str]:
+        # Synchronous on purpose: the clear/set/generate sequence below is only safe
+        # because scrapes cannot interleave on the event loop. Call it from threads
+        # only behind a lock.
         if not self._enabled:
             raise RuntimeError("metrics_disabled")
         if self._prom is None:
             self._init_prometheus()
-        self._update_engine_gauges(engine=engine, mcp_manager=mcp_manager)
+        self._update_engine_gauges(
+            engine=engine, mcp_manager=mcp_manager, engine_cache=engine_cache
+        )
+        self._update_cache_state_gauges(cache_states, persistence)
         return (
             self._prom["generate_latest"](self._prom["registry"]),
             self._prom["content_type"],

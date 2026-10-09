@@ -683,14 +683,24 @@ class SimpleEngine(BaseEngine):
             logger.debug("Prefix trie cache insert skipped (%s)", e)
 
     def _prefix_trie_cache_snapshot(self) -> tuple[int, int]:
-        """Return current prompt-trie entry and byte counts."""
-        with self._prefix_trie_cache_lock:
+        """Return current prompt-trie entry and byte counts.
+
+        Called from stats endpoints on the event loop. A generation worker holds
+        the lock while it deep-copies a cache entry, so never wait for it: if it
+        is busy, report the last values seen (stale by at most one copy).
+        """
+        if not self._prefix_trie_cache_lock.acquire(blocking=False):
+            return getattr(self, "_prefix_trie_last_snapshot", (0, 0))
+        try:
             entries = (
                 len(self._prefix_trie_cache)
                 if self._prefix_trie_cache is not None
                 else 0
             )
             nbytes = self._prefix_trie_cache.nbytes if self._prefix_trie_cache else 0
+        finally:
+            self._prefix_trie_cache_lock.release()
+        self._prefix_trie_last_snapshot = (entries, nbytes)
         return entries, nbytes
 
     @property
@@ -3573,7 +3583,9 @@ class SimpleEngine(BaseEngine):
                     "misses": stats["misses"],
                     "tokens_saved": stats["tokens_saved"],
                     "entry_count": trie_entries,
-                    "current_memory_mb": round(trie_bytes / 1e6, 1),
+                    # Binary MB, like the memory-aware cache, so consumers convert
+                    # to bytes the same way for every engine.
+                    "current_memory_mb": round(trie_bytes / (1024 * 1024), 3),
                     "prefix_trie_cache": {"enabled": True, **stats},
                 }
             )
