@@ -141,6 +141,7 @@ from .api.responses_models import (
     ResponseReasoningTextPart,
     ResponseTextContentPart,
     ResponsesRequest,
+    ResponsesInputTokenDetails,
     ResponsesUsage,
 )
 from .api.tool_calling import (
@@ -2987,8 +2988,14 @@ def _build_response_object(
     completion_tokens: int,
     finish_reason: str | None,
     response_id: str | None = None,
+    cached_tokens: int | None = None,
 ) -> ResponseObject:
-    """Build a full Responses API object."""
+    """Build a full Responses API object.
+
+    ``cached_tokens`` is the engine's count of prompt tokens served from the
+    prefix cache; ``None`` means the engine does not report it, and then
+    ``usage.input_tokens_details`` is omitted rather than shown as 0.
+    """
     response = ResponseObject(
         id=response_id or _new_response_item_id("resp"),
         model=_model_name or request.model,
@@ -3010,6 +3017,13 @@ def _build_response_object(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            input_tokens_details=(
+                None
+                if cached_tokens is None
+                else ResponsesInputTokenDetails(
+                    cached_tokens=max(0, int(cached_tokens))
+                )
+            ),
         ),
     )
     if finish_reason == "length":
@@ -3115,6 +3129,7 @@ async def _run_responses_request(
         prompt_tokens=output.prompt_tokens,
         completion_tokens=output.completion_tokens,
         finish_reason=output.finish_reason,
+        cached_tokens=getattr(output, "cached_tokens", None),
     )
 
     persisted_messages = _responses_request_to_persisted_messages(request)
@@ -3163,6 +3178,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
 
     prompt_tokens = 0
     completion_tokens = 0
+    cached_tokens: int | None = None
     finish_reason = None
     last_output = None
     raw_accumulated_text = ""
@@ -3295,6 +3311,8 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             prompt_tokens = output.prompt_tokens
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
+        if getattr(output, "cached_tokens", None) is not None:
+            cached_tokens = output.cached_tokens
 
         delta_text = output.new_text or ""
         output_finished = bool(getattr(output, "finished", False))
@@ -3582,6 +3600,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         completion_tokens=completion_tokens,
         finish_reason=finish_reason,
         response_id=response_id,
+        cached_tokens=cached_tokens,
     )
 
     if request.store and last_output is not None:

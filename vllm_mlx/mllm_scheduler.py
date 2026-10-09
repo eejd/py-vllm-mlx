@@ -135,6 +135,9 @@ class MLLMRequest:
     num_output_tokens: int = 0
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Prompt tokens served from the prefix cache; None = the cache was not
+    # consulted (media request, cache off) and nothing is reported.
+    cached_tokens: Optional[int] = None
 
     # Timing
     first_token_time: Optional[float] = None
@@ -676,6 +679,18 @@ class MLLMScheduler:
             if response.specprefill_outcome is not None:
                 request.specprefill_outcome = response.specprefill_outcome
 
+            generator = getattr(self, "batch_generator", None)
+            if request.cached_tokens is None and generator is not None:
+                reused = generator.pop_cached_tokens(request_id)
+                if reused is not None:
+                    # The generator already clamps to the real input length;
+                    # this only guards against a larger token estimate.
+                    request.cached_tokens = (
+                        min(reused, request.num_prompt_tokens)
+                        if request.num_prompt_tokens > 0
+                        else reused
+                    )
+
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
                 output = RequestOutput(
@@ -732,6 +747,7 @@ class MLLMScheduler:
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
                 specprefill_outcome=request.specprefill_outcome,
+                cached_tokens=request.cached_tokens,
             )
 
             # Check if finished
@@ -1214,7 +1230,7 @@ class MLLMScheduler:
                     "tokens_per_second": None,
                     "ttft_s": None,
                     "cache_hit_type": None,
-                    "cached_tokens": None,  # not reported by the MLLM scheduler
+                    "cached_tokens": None,  # not looked up yet
                 }
             )
 
@@ -1259,7 +1275,7 @@ class MLLMScheduler:
                     "tokens_per_second": tok_s,
                     "ttft_s": ttft,
                     "cache_hit_type": None,
-                    "cached_tokens": None,  # not reported by the MLLM scheduler
+                    "cached_tokens": req.cached_tokens,
                 }
             )
 

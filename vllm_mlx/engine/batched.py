@@ -881,6 +881,7 @@ class BatchedEngine(BaseEngine):
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
                 specprefill_outcome=getattr(output, "specprefill_outcome", None),
+                cached_tokens=getattr(output, "cached_tokens", None),
             )
 
         # Use LLM engine for text-only (non-MLLM models)
@@ -980,6 +981,7 @@ class BatchedEngine(BaseEngine):
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
                     specprefill_outcome=getattr(output, "specprefill_outcome", None),
+                    cached_tokens=getattr(output, "cached_tokens", None),
                 )
             return
 

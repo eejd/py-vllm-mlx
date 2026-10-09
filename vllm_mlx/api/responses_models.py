@@ -13,7 +13,7 @@ import uuid
 from typing import Literal
 from typing import Any
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_serializer
 
 
 class ResponseTextFormat(BaseModel):
@@ -126,12 +126,19 @@ class ResponsesUsage(BaseModel):
     input_tokens: int
     output_tokens: int
     total_tokens: int
-    input_tokens_details: ResponsesInputTokenDetails = Field(
-        default_factory=ResponsesInputTokenDetails
-    )
+    # Present only when the engine reports how many input tokens came from the
+    # prefix cache; omitted (not 0) when it does not.
+    input_tokens_details: ResponsesInputTokenDetails | None = None
     output_tokens_details: ResponsesOutputTokenDetails = Field(
         default_factory=ResponsesOutputTokenDetails
     )
+
+    @model_serializer(mode="wrap")
+    def _omit_unreported_details(self, handler):
+        data = handler(self)
+        if data.get("input_tokens_details") is None:
+            data.pop("input_tokens_details", None)
+        return data
 
 
 class ResponseError(BaseModel):

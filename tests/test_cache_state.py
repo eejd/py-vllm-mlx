@@ -484,6 +484,42 @@ async def test_batched_engine_generate_and_stream_carry_cached_tokens(cached):
     assert [o.cached_tokens for o in streamed] == [cached]
 
 
+class _FakeMLLMScheduler:
+    def __init__(self, cached):
+        self.cached = cached
+
+    def _out(self):
+        return RequestOutput(
+            request_id="r", output_text="hi", new_text="hi", output_token_ids=[1],
+            finished=True, finish_reason="stop", prompt_tokens=12, completion_tokens=1,
+            cached_tokens=self.cached,
+        )
+
+    async def generate(self, **kwargs):
+        return self._out()
+
+    async def add_request_async(self, **kwargs):
+        return "r"
+
+    async def stream_outputs(self, request_id):
+        yield self._out()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cached", [None, 0, 9])
+async def test_batched_mllm_branches_carry_cached_tokens(cached):
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    eng = BatchedEngine.__new__(BatchedEngine)
+    eng._loaded = True
+    eng._is_mllm = True
+    eng._default_mllm_draft = False
+    eng._mllm_scheduler = _FakeMLLMScheduler(cached)
+    assert (await eng.generate("p")).cached_tokens == cached
+    streamed = [o async for o in eng.stream_generate("p")]
+    assert [o.cached_tokens for o in streamed] == [cached]
+
+
 # --- registry mode: per-model state ----------------------------------------------------------
 
 
