@@ -1180,22 +1180,23 @@ Examples:
         default=True,
         help="Enable prefix caching for repeated prompts (default: enabled with "
         "--continuous-batching). Without --continuous-batching the Simple engine "
-        "reuses prompt prefixes only when this flag is given explicitly (or with "
-        "--prefix-trie-cache), through its prefix-trie cache; the other cache "
-        "options below are continuous-batching only",
+        "always reuses a system-prompt KV snapshot and, when this flag is given "
+        "explicitly (or with --prefix-trie-cache), also reuses conversation "
+        "prefixes through its prefix-trie cache; the other cache options below "
+        "are continuous-batching only",
     )
     serve_parser.add_argument(
         "--disable-prefix-cache",
         action="store_true",
-        help="Disable prefix caching (also turns off the Simple engine's "
-        "prefix-trie cache)",
+        help="Disable prefix caching (with the Simple engine: turns off both its "
+        "prefix-trie cache and its system-prompt KV snapshot cache)",
     )
     serve_parser.add_argument(
         "--prefix-cache-size",
         type=int,
         default=100,
         help="Max entries in prefix cache (default: 100, legacy mode only; "
-        "continuous batching only, ignored with a warning by the Simple engine)",
+        "continuous batching only, ignored by the Simple engine)",
     )
     serve_parser.add_argument(
         "--prefix-cache-dir",
@@ -1213,7 +1214,7 @@ Examples:
         help="auto: load at start and save at stop (default); none: never read or "
         "write the persisted cache; load-only: start from the preserved cache and "
         "never modify it; save-only: start cold and save at stop. Continuous "
-        "batching only; ignored with a warning by the Simple engine",
+        "batching only; ignored by the Simple engine",
     )
     serve_parser.add_argument(
         "--prefix-cache-reset",
@@ -1222,7 +1223,7 @@ Examples:
         help="Delete this model's persisted prefix-cache entries before loading "
         "(start), after the shutdown save (stop), or both (default: never). Only "
         "the persistence files in the model's cache directory are deleted. "
-        "Continuous batching only; ignored with a warning by the Simple engine",
+        "Continuous batching only; ignored by the Simple engine",
     )
     # Memory-aware cache options (recommended for large models)
     serve_parser.add_argument(
@@ -1689,8 +1690,7 @@ Examples:
         ):
             action.help = (
                 action.help.rstrip()
-                + " (continuous batching only; ignored with a warning by the "
-                "Simple engine)"
+                + " (continuous batching only; ignored by the Simple engine)"
             )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")

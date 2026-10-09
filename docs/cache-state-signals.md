@@ -62,20 +62,30 @@ not used at all. The server prints a startup warning naming each of them, `cache
 lists them, and `--help` marks them "continuous batching only" (ash#703). In the probe all four
 1537-token requests took 0.15-0.22 s with no pattern and the `system_kv_cache` counters stayed at 0.
 
-What the Simple engine can do is reuse prefixes through its prefix-trie cache (mlx-lm's
-`LRUPromptCache`), so `--enable-prefix-cache` is honored there (eejd/py-vllm-mlx#44):
+What the Simple engine can do is reuse prefixes through two caches: the system-prompt KV snapshot (always
+on for pure-LLM streaming chat) and, when asked for, the prefix-trie cache (mlx-lm's `LRUPromptCache`).
+`--enable-prefix-cache` and `--disable-prefix-cache` are honored there (eejd/py-vllm-mlx#44):
 
 * Giving `--enable-prefix-cache` explicitly (its default is on, which cannot be told from "not asked")
-  or `--prefix-trie-cache` turns the trie cache on; `--disable-prefix-cache` turns it off again. Without
-  either, Simple mode behaves as before.
-* Pure-LLM non-streaming chat takes the streaming implementation when the trie cache is on, because
-  only that path consults a cache (`model.chat` never did). Requests with stop strings, logits
-  processors, penalties, top-k/min-p, MTP, SpecPrefill or a bounded KV cache still bypass it.
+  or `--prefix-trie-cache` turns the trie cache on. `--disable-prefix-cache` turns off both caches (the
+  snapshot cache through `VLLM_MLX_SYSTEM_KV_CACHE=0`, which the CLI sets for the process) and says so at
+  startup. Without either flag Simple mode behaves as before. The trie holds up to 32 entries and is not
+  byte-bounded unless `--prefix-trie-cache-memory-mb` is given.
+* Pure-LLM non-streaming chat takes the streaming implementation when the trie cache is on and the
+  request is one the cache can serve, because only that path consults a cache (`model.chat` never did).
+  Requests with stop strings, logits processors, penalties or top-k/min-p, and engines running MTP,
+  SpecPrefill with a draft model, `--max-kv-size` or `--mllm`, keep the old path (the CLI warns when the
+  engine setup keeps the trie from engaging). Through the cache path `enable_thinking` follows the
+  streaming defaults, messages are normalized for the template, `completion_tokens` counts streamed
+  tokens and `tokens` is empty, as with any streamed request.
 * Each response carries `usage.prompt_tokens_details.cached_tokens`: the trie's tokens saved (all but
   the last token on an exact repeat), the system-prefix snapshot's token count on a snapshot hit, 0 on a
   miss, and nothing for a request that never consulted a cache.
 * `/v1/cache/stats` `engine_cache` has top-level `hits`, `misses`, `tokens_saved`, `entry_count` and
-  `current_memory_mb` (trie counters), so `cache_state.counters` is filled instead of `unreported`.
+  `current_memory_mb`, which are the **trie** counters, so `cache_state.counters` is filled instead of
+  `unreported`. System-snapshot hits are counted in `system_kv_cache.counters` and are not in the
+  top-level numbers, so `cached_tokens` on a snapshot hit has no matching `hits` increment.
+* `DELETE /v1/cache` drops the trie and zeroes its counters along with the snapshots.
 
 ## The `cache_state` block
 

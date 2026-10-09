@@ -564,3 +564,76 @@ async def test_trie_cache_works_with_an_unhashable_model_object():
     assert stats["skips"] == 0
     assert stats["inserts"] == 2 and stats["hits"] == 1
     assert second[-1].cached_tokens > 0
+
+
+async def test_clearing_the_runtime_caches_drops_the_trie_and_its_counters():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    fake = _growing_responses([ord("X")])
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+    ):
+        await _collect(engine, MESSAGES)
+        assert engine.get_cache_stats()["entry_count"] == 1
+        result = engine.clear_runtime_caches()
+        assert result["prefix_trie_cache"]["dropped_entries"] == 1
+        assert engine.get_cache_stats()["entry_count"] == 0
+        assert engine.get_cache_stats()["hits"] == 0
+        # the next identical request is cold again
+        again = await _collect(engine, MESSAGES)
+    assert again[-1].cached_tokens == 0
+
+
+async def test_non_streaming_chat_that_the_cache_cannot_serve_keeps_the_old_path():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    called = []
+
+    def fake_chat(*_a, **_k):
+        called.append(True)
+        return SimpleNamespace(text="hi", tokens=[1], finish_reason="stop")
+
+    engine._model.chat = fake_chat
+    engine._run_blocking_serialized = lambda fn, *a, **k: _await(fn(*a, **k))
+    # stop strings make the request uncacheable; it must not change path
+    out = await engine.chat(MESSAGES, max_tokens=4, stop=["###"])
+    assert called and out.text == "hi" and out.cached_tokens is None
+
+
+async def test_non_streaming_chat_keeps_the_specprefill_outcome():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    outcome = object()
+
+    async def fake_stream_chat(*_a, **_k):
+        from vllm_mlx.engine.base import GenerationOutput
+
+        yield GenerationOutput(text="ok", finished=True, finish_reason="stop",
+                               specprefill_outcome=outcome, cached_tokens=3)
+
+    engine.stream_chat = fake_stream_chat
+    out = await engine.chat(MESSAGES, max_tokens=4)
+    assert out.specprefill_outcome is outcome and out.cached_tokens == 3
+
+
+async def test_the_system_snapshot_cache_can_be_switched_off(monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_CACHE", "0")
+    engine = _engine()
+    assert engine._system_kv_cache_enabled is False
+    fake = _growing_responses([ord("X")])
+    messages = [
+        {"role": "system", "content": "Rules"},
+        {"role": "user", "content": "first"},
+    ]
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+        patch.object(engine, "stream_generate") as uncached,
+    ):
+        uncached.side_effect = lambda **_: _empty_stream()
+        await _collect(engine, messages)
+    assert engine.get_cache_stats()["system_kv_cache"]["counters"]["stores"] == 0
+    assert fake.seen_prompts == []  # the cache path never ran
+
+
+async def _empty_stream():
+    return
+    yield
