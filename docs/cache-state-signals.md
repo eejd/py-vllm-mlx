@@ -19,8 +19,8 @@ that does not follow behavior, **missing** when absent. "Unreported" below is th
 
 | Signal | Simple | Batched (`--continuous-batching`) | Registry `--models-config` (simple / batched models) |
 |---|---|---|---|
-| `usage.prompt_tokens_details.cached_tokens` per request | **missing** (omitted, never a fake 0) | **real** (this PR): cold 0, exact repeat 0, shared prefix 1532 of 1539 | same as the model's engine mode |
-| `engine_cache` counters (`hits`, `misses`, `evictions`, `tokens_saved`, `entry_count`, `current_memory_mb`) | **missing**: only `system_kv_cache` (capacity 4, all counters 0 in the probe) | **real**, but see the exact-repeat caveat below | `engine_cache` is null at top level (no default engine); per-model under `models` (this PR) |
+| `usage.prompt_tokens_details.cached_tokens` per request | **real with the trie cache on** (`--enable-prefix-cache` / `--prefix-trie-cache`), omitted otherwise (never a fake 0) | **real** (this PR): cold 0, exact repeat 0, shared prefix 1532 of 1539 | same as the model's engine mode |
+| `engine_cache` counters (`hits`, `misses`, `evictions`, `tokens_saved`, `entry_count`, `current_memory_mb`) | **trie counters at the top level when the trie cache is on**; `system_kv_cache` (capacity 4) stays nested | **real**, but see the exact-repeat caveat below | `engine_cache` is null at top level (no default engine); per-model under `models` (this PR) |
 | Effective memory limit and how it was derived | n/a (no memory-aware cache) | **real** (this PR): `memory_limit` = `{source: percent_of_available, percent, available_bytes, bytes}`; was invisible before | per model |
 | `cache_state` block | **real** (this PR): engine class, launch options, inert options, versions; counters `unreported` with a reason | **real**; the batched MLLM engine nests its stats under `prefix_cache`, which `cache_state` unwraps | top level says "registry mode keeps no single default engine"; per model under `models`, where `engine.continuous_batching` comes from the model's engine class and `launch_options`/`inert_options` are `unreported` (registry entries choose their own engine, so the CLI flags do not describe them) |
 | Persisted prefix cache (`persistence`) | not loaded or saved (no hooks): `persistence.applies: false` with the engine class named. In the single-model lazy-load mode `applies` is true until the engine is loaded and may turn false once a Simple engine is in place | loaded and saved per `--prefix-cache-*` | **not applicable**: `persistence.applies: false` (eejd/py-vllm-mlx#41) |
@@ -53,18 +53,29 @@ are not settled. An exact SSD promotion, a paged hit that ends on a block bounda
 hit are rewound by one position like a memory-cache exact hit (or prefilled when the layers cannot be
 rewound), so the last token is never in the KV cache twice (#47).
 
-## Why the Simple engine shows no warm speedup
+## The Simple engine and the prefix cache
 
 `serve` builds a `SchedulerConfig` only with `--continuous-batching` (`cli.py`); in Simple mode
-`scheduler_config=None`, so `--enable-prefix-cache`, the memory-aware cache, `--cache-memory-*`,
-KV-cache quantization, the paged cache and the SSD tier are not used at all. Its only reuse is the
-system-KV LRU and the optional `--prefix-trie-cache`. In the probe all four 1537-token requests took
-0.15-0.22 s with no pattern, and `system_kv_cache` counters stayed at 0. This is also why
-`--kv-cache-quantization` is inert in Simple mode (ash#703).
+`scheduler_config=None`, so the memory-aware cache, `--cache-memory-*`, KV-cache quantization, the
+paged cache, the SSD tier and the persisted-cache options (`--prefix-cache-dir/-persist/-reset`) are
+not used at all. The server prints a startup warning naming each of them, `cache_state.inert_options`
+lists them, and `--help` marks them "continuous batching only" (ash#703). In the probe all four
+1537-token requests took 0.15-0.22 s with no pattern and the `system_kv_cache` counters stayed at 0.
 
-This PR does not change that behavior. It makes it visible: the server prints a startup warning naming
-the inert flags, and `cache_state.inert_options` lists them (eejd/py-vllm-mlx#44 tracks whether Simple
-mode should reuse prefixes).
+What the Simple engine can do is reuse prefixes through its prefix-trie cache (mlx-lm's
+`LRUPromptCache`), so `--enable-prefix-cache` is honored there (eejd/py-vllm-mlx#44):
+
+* Giving `--enable-prefix-cache` explicitly (its default is on, which cannot be told from "not asked")
+  or `--prefix-trie-cache` turns the trie cache on; `--disable-prefix-cache` turns it off again. Without
+  either, Simple mode behaves as before.
+* Pure-LLM non-streaming chat takes the streaming implementation when the trie cache is on, because
+  only that path consults a cache (`model.chat` never did). Requests with stop strings, logits
+  processors, penalties, top-k/min-p, MTP, SpecPrefill or a bounded KV cache still bypass it.
+* Each response carries `usage.prompt_tokens_details.cached_tokens`: the trie's tokens saved (all but
+  the last token on an exact repeat), the system-prefix snapshot's token count on a snapshot hit, 0 on a
+  miss, and nothing for a request that never consulted a cache.
+* `/v1/cache/stats` `engine_cache` has top-level `hits`, `misses`, `tokens_saved`, `entry_count` and
+  `current_memory_mb` (trie counters), so `cache_state.counters` is filled instead of `unreported`.
 
 ## The `cache_state` block
 

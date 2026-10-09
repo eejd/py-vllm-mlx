@@ -24,6 +24,23 @@ from .cli_arg_types import (
 )
 from .tool_parsers import ToolParserManager
 
+
+
+class _ExplicitStoreTrue(argparse.Action):
+    """``store_true`` that also records that the flag was given on the command line.
+
+    ``--enable-prefix-cache`` defaults to True, so its value alone cannot tell the
+    Simple engine whether the user asked for prefix reuse.
+    """
+
+    def __init__(self, option_strings, dest, default=True, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, default=default, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, True)
+        setattr(namespace, f"{self.dest}_explicit", True)
+
+
 _TOOL_PARSER_CHOICES = ToolParserManager.list_registered()
 _TOOL_PARSER_HELP = (
     "Select the tool call parser for the model. Options: "
@@ -105,6 +122,12 @@ def serve_command(args):
     # ignores some the user set: the prefix cache, KV quantization, paged cache and SSD tier belong
     # to the continuous-batching scheduler; the Simple engine does not use them.
     from . import cache_state
+
+    # The Simple engine reuses prompt prefixes through its prefix-trie cache; an explicit
+    # --enable-prefix-cache asks for it and --disable-prefix-cache turns it off.
+    note = cache_state.apply_simple_prefix_cache_flags(args)
+    if note:
+        print(note)
 
     server.set_cache_launch_options(cache_state.launch_options(args))
     # Registry entries choose their own engine, so the global flags cannot be called inert there.
@@ -1153,20 +1176,26 @@ Examples:
     )
     serve_parser.add_argument(
         "--enable-prefix-cache",
-        action="store_true",
+        action=_ExplicitStoreTrue,
         default=True,
-        help="Enable prefix caching for repeated prompts (default: enabled)",
+        help="Enable prefix caching for repeated prompts (default: enabled with "
+        "--continuous-batching). Without --continuous-batching the Simple engine "
+        "reuses prompt prefixes only when this flag is given explicitly (or with "
+        "--prefix-trie-cache), through its prefix-trie cache; the other cache "
+        "options below are continuous-batching only",
     )
     serve_parser.add_argument(
         "--disable-prefix-cache",
         action="store_true",
-        help="Disable prefix caching",
+        help="Disable prefix caching (also turns off the Simple engine's "
+        "prefix-trie cache)",
     )
     serve_parser.add_argument(
         "--prefix-cache-size",
         type=int,
         default=100,
-        help="Max entries in prefix cache (default: 100, legacy mode only)",
+        help="Max entries in prefix cache (default: 100, legacy mode only; "
+        "continuous batching only, ignored with a warning by the Simple engine)",
     )
     serve_parser.add_argument(
         "--prefix-cache-dir",
@@ -1174,7 +1203,8 @@ Examples:
         default=None,
         help="Base directory of the persisted prefix cache; each model keeps its "
         "own subdirectory (default: $VLLM_MLX_PREFIX_CACHE_DIR, else "
-        "~/.cache/vllm-mlx/prefix_cache)",
+        "~/.cache/vllm-mlx/prefix_cache). Continuous batching only; ignored with "
+        "a warning by the Simple engine",
     )
     serve_parser.add_argument(
         "--prefix-cache-persist",
@@ -1182,7 +1212,8 @@ Examples:
         default="auto",
         help="auto: load at start and save at stop (default); none: never read or "
         "write the persisted cache; load-only: start from the preserved cache and "
-        "never modify it; save-only: start cold and save at stop",
+        "never modify it; save-only: start cold and save at stop. Continuous "
+        "batching only; ignored with a warning by the Simple engine",
     )
     serve_parser.add_argument(
         "--prefix-cache-reset",
@@ -1190,7 +1221,8 @@ Examples:
         default="never",
         help="Delete this model's persisted prefix-cache entries before loading "
         "(start), after the shutdown save (stop), or both (default: never). Only "
-        "the persistence files in the model's cache directory are deleted",
+        "the persistence files in the model's cache directory are deleted. "
+        "Continuous batching only; ignored with a warning by the Simple engine",
     )
     # Memory-aware cache options (recommended for large models)
     serve_parser.add_argument(
@@ -1645,6 +1677,21 @@ Examples:
         action="store_true",
         help="Offline mode — only use locally cached models",
     )
+    serve_parser.set_defaults(enable_prefix_cache_explicit=False)
+    # Say in --help which options the Simple engine ignores (it also warns at startup).
+    from .cache_state import CONTINUOUS_BATCHING_ONLY
+
+    for action in serve_parser._actions:
+        if (
+            any(opt in CONTINUOUS_BATCHING_ONLY for opt in action.option_strings)
+            and action.help
+            and "continuous batching only" not in action.help.lower()
+        ):
+            action.help = (
+                action.help.rstrip()
+                + " (continuous batching only; ignored with a warning by the "
+                "Simple engine)"
+            )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
     bench_parser.add_argument("model", type=str, help="Model to benchmark")

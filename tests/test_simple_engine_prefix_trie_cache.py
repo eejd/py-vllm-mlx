@@ -277,9 +277,11 @@ async def test_existing_exact_snapshot_hit_wins_before_prefix_trie_lookup():
         patch("mlx_lm.models.cache.make_prompt_cache", return_value=[FakeCache()]),
         patch("mlx_lm.stream_generate", side_effect=_responses([ord("Y")])),
     ):
-        await _collect(engine, messages)
+        chunks = await _collect(engine, messages)
 
     assert engine.get_stats()["prefix_trie_cache"]["lookups"] == 0
+    # a system-prefix snapshot hit reports the tokens it supplied
+    assert chunks[-1].cached_tokens == system_token_count
 
 
 async def test_system_snapshot_rejects_shorter_trie_before_materializing_cache():
@@ -399,3 +401,166 @@ async def test_prefix_trie_cache_is_cleared_on_stop():
     stats = engine.get_stats()["prefix_trie_cache"]
     assert stats["entries"] == 0
     assert stats["hits"] == 0
+
+
+class GrowingCache:
+    """A trimmable cache that remembers how many positions it holds."""
+
+    nbytes = 8
+
+    def __init__(self):
+        self.offset = 0
+        self.state = (
+            mx.array([[1]], dtype=mx.float32),
+            mx.array([[2]], dtype=mx.float32),
+        )
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+
+def _growing_responses(tokens):
+    def fake_stream_generate(*_args, **kwargs):
+        fake_stream_generate.seen_prompts.append(kwargs["prompt"].tolist())
+        for layer in kwargs["prompt_cache"]:
+            layer.offset += len(kwargs["prompt"].tolist())
+        for token in tokens:
+            for layer in kwargs["prompt_cache"]:
+                layer.offset += 1
+            yield SimpleNamespace(text=chr(token), token=token, finish_reason="stop")
+
+    fake_stream_generate.seen_prompts = []
+    return fake_stream_generate
+
+
+MESSAGES = [{"role": "user", "content": "the same question twice"}]
+
+
+async def test_exact_repeat_reports_the_tokens_the_cache_supplied():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    fake = _growing_responses([ord("X")])
+
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+    ):
+        first = await _collect(engine, MESSAGES)
+        second = await _collect(engine, MESSAGES)
+
+    prompt_tokens = first[-1].prompt_tokens
+    assert first[-1].cached_tokens == 0
+    # all but the last prompt token come from the cache; only that one is fed
+    assert second[-1].cached_tokens == prompt_tokens - 1
+    assert fake.seen_prompts[1] == [FakeTokenizer().encode(
+        FakeTokenizer().apply_chat_template(MESSAGES))[-1]]
+
+
+async def test_non_streaming_chat_uses_the_cache_when_it_is_enabled():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    engine._model.chat = lambda *a, **k: pytest.fail("model.chat bypasses the cache")
+    fake = _growing_responses([ord("X")])
+
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+    ):
+        first = await engine.chat(MESSAGES, max_tokens=4, temperature=0.0, top_p=1.0)
+        second = await engine.chat(MESSAGES, max_tokens=4, temperature=0.0, top_p=1.0)
+
+    assert first.cached_tokens == 0
+    assert second.cached_tokens == second.prompt_tokens - 1
+    assert second.text == "X"
+
+
+async def test_non_streaming_chat_is_unchanged_when_the_cache_is_off():
+    engine = _engine()
+    called = []
+
+    def fake_chat(*_a, **_k):
+        called.append(True)
+        return SimpleNamespace(text="hi", tokens=[1], finish_reason="stop")
+
+    engine._model.chat = fake_chat
+    engine._run_blocking_serialized = lambda fn, *a, **k: _await(fn(*a, **k))
+    out = await engine.chat(MESSAGES, max_tokens=4)
+    assert called and out.cached_tokens is None
+
+
+async def _await(value):
+    return value
+
+
+async def test_cache_stats_expose_the_trie_counters_at_the_top_level():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    assert engine.get_cache_stats()["hits"] == 0
+    fake = _growing_responses([ord("X")])
+
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+    ):
+        await _collect(engine, MESSAGES)
+        await _collect(engine, MESSAGES)
+
+    stats = engine.get_cache_stats()
+    assert stats["hits"] == 1
+    assert stats["misses"] == 1
+    assert stats["tokens_saved"] > 0
+    assert stats["entry_count"] >= 1
+
+
+async def test_cache_stats_have_no_top_level_counters_when_the_trie_is_off():
+    assert "hits" not in (_engine().get_cache_stats() or {})
+
+
+async def test_cache_state_counters_are_filled_for_the_simple_engine():
+    from vllm_mlx import cache_state
+
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    fake = _growing_responses([ord("X")])
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+    ):
+        await _collect(engine, MESSAGES)
+        await _collect(engine, MESSAGES)
+
+    state = cache_state.build(
+        engine=engine,
+        launch=None,
+        engine_cache=engine.get_cache_stats(),
+        persistence={"policy": {}, "dirs": {}},
+        registry_mode=False,
+    )
+    assert state["counters"]["hits"] == 1
+    assert state["counters"]["misses"] == 1
+    assert state["counters"]["tokens_saved"] > 0
+
+
+class UnhashableModel(FakeModel):
+    """Loaded mlx modules are unhashable; the trie must not be keyed by one."""
+
+    __hash__ = None
+
+
+async def test_trie_cache_works_with_an_unhashable_model_object():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    engine._model = SimpleNamespace(model=UnhashableModel(), tokenizer=FakeTokenizer())
+    fake = _growing_responses([ord("X")])
+
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake),
+    ):
+        await _collect(engine, MESSAGES)
+        second = await _collect(engine, MESSAGES)
+
+    stats = engine.get_stats()["prefix_trie_cache"]
+    assert stats["skips"] == 0
+    assert stats["inserts"] == 2 and stats["hits"] == 1
+    assert second[-1].cached_tokens > 0

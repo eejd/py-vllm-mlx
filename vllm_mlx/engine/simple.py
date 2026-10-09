@@ -567,13 +567,17 @@ class SimpleEngine(BaseEngine):
         if prefix_trie is None:
             return None, None, 0
 
+        # LRUPromptCache keys its trie by this value, so it must be hashable; the
+        # loaded model object is not (every lookup and insert used to be skipped
+        # on real models). One engine serves one model, so its name is the key.
+        trie_key = self._model_name
         self._prefix_trie_cache_stats["lookups"] += 1
         try:
             with self._prefix_trie_cache_lock:
                 if minimum_tokens_saved > 0:
                     candidate_tokens_saved = self._peek_prefix_trie_tokens_saved(
                         prefix_trie,
-                        model,
+                        trie_key,
                         tokens,
                     )
                     if (
@@ -582,7 +586,7 @@ class SimpleEngine(BaseEngine):
                     ):
                         self._prefix_trie_cache_stats["skips"] += 1
                         return None, None, 0
-                trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(model, tokens)
+                trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(trie_key, tokens)
             if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
                 self._prefix_trie_cache_stats["misses"] += 1
                 return None, None, 0
@@ -668,7 +672,7 @@ class SimpleEngine(BaseEngine):
             return
         try:
             with self._prefix_trie_cache_lock:
-                prefix_trie.insert_cache(model, cache_key, prompt_cache)
+                prefix_trie.insert_cache(self._model_name, cache_key, prompt_cache)
             self._prefix_trie_cache_stats["inserts"] += 1
         except Exception as e:
             self._prefix_trie_cache_stats["skips"] += 1
@@ -1620,7 +1624,14 @@ class SimpleEngine(BaseEngine):
                 finish_reason=final_output.finish_reason,
                 mtp_drafts=final_output.mtp_drafts,
                 mtp_accepted=final_output.mtp_accepted,
+                cached_tokens=final_output.cached_tokens,
             )
+
+        # With the prefix-trie cache on, pure-LLM chat takes the streaming
+        # implementation too: only that path consults the cache and reports how
+        # many prompt tokens it supplied (``model.chat`` below never does).
+        if self._prefix_trie_cache_enabled and not self._is_mllm:
+            return await aggregate_stream_chat()
 
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
         # local models, while the streaming path completes normally. Reuse the
@@ -2195,6 +2206,10 @@ class SimpleEngine(BaseEngine):
             def _emit_error(exc: BaseException) -> None:
                 loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
 
+            # Prompt tokens the cache supplied for this request; set by the
+            # worker before the first token and read when outputs are yielded.
+            cached_tokens_box: list[int | None] = [None]
+
             def _run_with_cache() -> None:
                 from mlx_lm import stream_generate as mlx_stream_generate
                 from mlx_lm.models.cache import make_prompt_cache
@@ -2241,7 +2256,9 @@ class SimpleEngine(BaseEngine):
 
                 if prefix_trie_hit:
                     bc = local_hit_snapshot
+                    cached_tokens_box[0] = trie_tokens_saved
                 elif cache_hit:
+                    cached_tokens_box[0] = system_token_count
                     bc = make_prompt_cache(model)
                     # Restore from the closure-local reference captured at the
                     # gate, never from ``self._system_kv_cache`` directly:
@@ -2256,6 +2273,7 @@ class SimpleEngine(BaseEngine):
                         self._system_kv_cache.move_to_end(system_hash)
                     self._system_kv_cache_stats["hits"] += 1
                 elif kv_cache_eligible:
+                    cached_tokens_box[0] = 0
                     bc = make_prompt_cache(model)
                     sys_arr = mx.array(system_tokens)
                     step = self._prefill_step_size
@@ -2307,6 +2325,7 @@ class SimpleEngine(BaseEngine):
                         cache_mb,
                     )
                 else:
+                    cached_tokens_box[0] = 0
                     bc = make_prompt_cache(model)
 
                 prompt_tokens_for_decode = (
@@ -2389,6 +2408,7 @@ class SimpleEngine(BaseEngine):
                         completion_tokens=token_count,
                         finished=finished,
                         finish_reason=finish_reason,
+                        cached_tokens=cached_tokens_box[0],
                     )
                     if finished:
                         break
@@ -3514,6 +3534,21 @@ class SimpleEngine(BaseEngine):
         model is multimodal, the MLLM's own cache stats.
         """
         result: dict[str, Any] = {}
+        if self._prefix_trie_cache_enabled:
+            # Top-level counters in the shape the other engines report, so
+            # ``cache_state.counters`` is filled for the Simple engine too.
+            trie_entries, trie_bytes = self._prefix_trie_cache_snapshot()
+            stats = self._prefix_trie_cache_stats
+            result.update(
+                {
+                    "hits": stats["hits"],
+                    "misses": stats["misses"],
+                    "tokens_saved": stats["tokens_saved"],
+                    "entry_count": trie_entries,
+                    "current_memory_mb": round(trie_bytes / 1e6, 1),
+                    "prefix_trie_cache": {"enabled": True, **stats},
+                }
+            )
         if self._supports_system_kv_cache:
             counters = dict(self._system_kv_cache_stats)
             denom = counters["hits"] + counters["misses"]
