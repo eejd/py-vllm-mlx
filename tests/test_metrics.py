@@ -715,3 +715,43 @@ class TestPrefixCacheSeries:
         text = client.get("/metrics").text
         assert 'vllm_mlx_prefix_cache_hits{model="alpha"} 1.0' in text
         assert 'vllm_mlx_prefix_cache_hits{model="beta"} 5.0' in text
+
+    def test_a_model_name_with_quotes_and_newlines_is_escaped(self, collector):
+        text = _scrape(collector, cache_states={'we"ird\nname': _state()})
+        assert 'model="we\\"ird\\nname"' in text
+
+    def test_an_engine_without_top_level_hits_does_not_feed_the_trie_fallback(self, collector):
+        class Other:
+            def get_stats(self):
+                return {}
+
+            def get_cache_stats(self):
+                return {"mllm_cache": {"entries": 1}}
+
+        text = _scrape(collector, engine=Other())
+        assert 'cache_type="prefix_trie_cache"} 0.0' in text
+        assert "vllm_mlx_cache_stats_reported 0.0" in text
+
+    def test_a_scrape_asks_the_engine_for_cache_stats_once(self, metrics_client):
+        client, server, collector = metrics_client
+        collector.configure(enabled=True)
+        calls = []
+
+        class Eng(FakeEngine):
+            def get_stats(self):
+                return {}
+
+            def get_cache_stats(self):
+                calls.append(1)
+                return {"hits": 1, "misses": 0, "tokens_saved": 1, "entry_count": 1,
+                        "current_memory_mb": 1.0}
+
+        server._engine = Eng()
+        client.get("/metrics")
+        assert len(calls) == 1
+
+    def test_persistence_does_not_apply_when_no_engine_is_loaded(self, metrics_client):
+        client, server, collector = metrics_client
+        collector.configure(enabled=True)
+        assert server._engine is None
+        assert "vllm_mlx_prefix_cache_persistence_applies 0.0" in client.get("/metrics").text

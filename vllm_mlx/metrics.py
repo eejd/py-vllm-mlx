@@ -223,7 +223,7 @@ class MetricsCollector:
             ),
             "cache_hits": Gauge(
                 "vllm_mlx_cache_hits",
-                "Cache hits since startup/reset.",
+                "Cache hits since startup/reset (a gauge: DELETE /v1/cache resets it).",
                 registry=registry,
             ),
             "cache_misses": Gauge(
@@ -274,7 +274,7 @@ class MetricsCollector:
             ),
             "pc_hits": Gauge(
                 "vllm_mlx_prefix_cache_hits",
-                "Prefix-cache hits since startup/reset, per model.",
+                "Prefix-cache hits since startup/reset, per model (a gauge: DELETE /v1/cache resets it).",
                 ["model"],
                 registry=registry,
             ),
@@ -444,6 +444,7 @@ class MetricsCollector:
         *,
         engine: Any | None,
         mcp_manager: Any | None,
+        engine_cache: dict | None = None,
     ) -> None:
         assert self._prom is not None
 
@@ -492,10 +493,12 @@ class MetricsCollector:
         if cache_stats is None and engine is not None:
             # The Simple engine reports its prefix-trie counters through
             # get_cache_stats() (top-level hits/misses/...), not get_stats().
-            try:
-                simple_stats = engine.get_cache_stats()
-            except Exception:
-                simple_stats = None
+            simple_stats = engine_cache
+            if simple_stats is None:
+                try:
+                    simple_stats = engine.get_cache_stats()
+                except Exception:
+                    simple_stats = None
             if isinstance(simple_stats, dict) and "hits" in simple_stats:
                 cache_type = "prefix_trie_cache"
                 cache_stats = simple_stats
@@ -661,12 +664,18 @@ class MetricsCollector:
         mcp_manager: Any | None,
         cache_states: dict[str, dict] | None = None,
         persistence: dict | None = None,
+        engine_cache: dict | None = None,
     ) -> tuple[bytes, str]:
+        # Synchronous on purpose: the clear/set/generate sequence below is only safe
+        # because scrapes cannot interleave on the event loop. Call it from threads
+        # only behind a lock.
         if not self._enabled:
             raise RuntimeError("metrics_disabled")
         if self._prom is None:
             self._init_prometheus()
-        self._update_engine_gauges(engine=engine, mcp_manager=mcp_manager)
+        self._update_engine_gauges(
+            engine=engine, mcp_manager=mcp_manager, engine_cache=engine_cache
+        )
         self._update_cache_state_gauges(cache_states, persistence)
         return (
             self._prom["generate_latest"](self._prom["registry"]),

@@ -4429,33 +4429,44 @@ async def metrics():
     engine = (
         _model_manager.get_metrics_engine() if _model_manager is not None else _engine
     )
+    # Gathered once per scrape; every stats call below runs on the event loop.
+    persistence = _persistence_snapshot()
+    if engine is None:
+        persistence = {**persistence, "applies": False}
     cache_states: dict[str, dict] = {}
+    engine_cache = None
     try:
         if _model_manager is not None:
+            registry_states = _registry_cache_states(persistence)
             cache_states = {
-                name: entry["cache_state"]
-                for name, entry in _registry_cache_states().items()
+                name: entry["cache_state"] for name, entry in registry_states.items()
             }
+            for name, loaded in _model_manager.loaded_engines():
+                if loaded is engine and name in registry_states:
+                    engine_cache = registry_states[name]["engine_cache"]
         elif _engine is not None:
-            stats = (
+            engine_cache = (
                 _engine.get_cache_stats() if hasattr(_engine, "get_cache_stats") else None
             )
             cache_states = {
                 _model_name or "default": _cache_state.build(
                     engine=_engine,
                     launch=_cache_launch_options,
-                    engine_cache=stats,
-                    persistence=_persistence_snapshot(),
+                    engine_cache=engine_cache,
+                    persistence=persistence,
                     registry_mode=False,
                 )
             }
     except Exception as exc:  # noqa: BLE001 - a scrape must not fail on cache stats
-        logger.debug("metrics: cache state unavailable (%s)", exc)
+        logger.warning(
+            "metrics: cache state unavailable (%s)", _sanitize_log_text(exc, limit=200)
+        )
     payload, content_type = _metrics.render_metrics(
         engine=engine,
         mcp_manager=_mcp_manager,
         cache_states=cache_states,
-        persistence=_persistence_snapshot(),
+        persistence=persistence,
+        engine_cache=engine_cache if isinstance(engine_cache, dict) else None,
     )
     return Response(content=payload, headers={"Content-Type": content_type})
 
@@ -4619,9 +4630,10 @@ def _persistence_snapshot() -> dict:
     return snapshot
 
 
-def _registry_cache_states() -> dict:
+def _registry_cache_states(persistence: dict | None = None) -> dict:
     """Per loaded model: engine cache stats and cache_state (registry mode serves several)."""
     out: dict[str, dict] = {}
+    persistence = persistence if persistence is not None else _persistence_snapshot()
     for name, engine in _model_manager.loaded_engines():
         stats = None
         if hasattr(engine, "get_cache_stats"):
@@ -4635,7 +4647,7 @@ def _registry_cache_states() -> dict:
                 engine=engine,
                 launch=_cache_launch_options,
                 engine_cache=stats,
-                persistence=_persistence_snapshot(),
+                persistence=persistence,
                 registry_mode=True,
             ),
         }
