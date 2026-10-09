@@ -729,3 +729,128 @@ def test_boolean_attributes_are_not_mistaken_for_quantization_bits():
             self.group_size = True
 
     assert sig(Odd()) == "none"
+
+
+@pytest.fixture(autouse=True)
+def _restore_system_kv_env():
+    """apply_simple_prefix_cache_flags sets this process-wide switch; undo it per test."""
+    import os
+
+    saved = os.environ.get("VLLM_MLX_SYSTEM_KV_CACHE")
+    yield
+    if saved is None:
+        os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
+    else:
+        os.environ["VLLM_MLX_SYSTEM_KV_CACHE"] = saved
+
+
+# --- the Simple engine and the prefix-cache flags (#44) ------------------------------------------
+
+
+def test_enable_prefix_cache_is_recorded_only_when_given():
+    assert _args().enable_prefix_cache_explicit is False
+    assert _args("--enable-prefix-cache").enable_prefix_cache_explicit is True
+    assert _args("--enable-prefix-cache").enable_prefix_cache is True
+    # the default value is still on, for the continuous-batching scheduler
+    assert _args().enable_prefix_cache is True
+
+
+def test_explicit_enable_turns_on_the_simple_engines_trie_cache():
+    ns = _args("--enable-prefix-cache")
+    note = cache_state.apply_simple_prefix_cache_flags(ns)
+    assert ns.prefix_trie_cache is True
+    assert "prefix-trie cache" in note
+
+
+def test_simple_engine_stays_as_it_was_without_an_explicit_flag():
+    import os
+
+    os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
+    ns = _args()
+    assert cache_state.apply_simple_prefix_cache_flags(ns) is None
+    assert ns.prefix_trie_cache is False
+    assert "VLLM_MLX_SYSTEM_KV_CACHE" not in os.environ
+
+
+def test_disable_prefix_cache_turns_off_the_trie_and_the_system_snapshot_cache(monkeypatch):
+    import os
+
+    os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
+    ns = _args("--prefix-trie-cache", "--disable-prefix-cache")
+    note = cache_state.apply_simple_prefix_cache_flags(ns)
+    assert "prefix-trie cache and its system-prompt KV snapshot cache" in note
+    assert ns.prefix_trie_cache is False
+    assert os.environ["VLLM_MLX_SYSTEM_KV_CACHE"] == "0"
+    os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
+    both = _args("--enable-prefix-cache", "--disable-prefix-cache")
+    cache_state.apply_simple_prefix_cache_flags(both)
+    assert both.prefix_trie_cache is False
+    os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
+    # on its own the flag still says what it turned off (never silent)
+    lone = cache_state.apply_simple_prefix_cache_flags(_args("--disable-prefix-cache"))
+    assert "system-prompt KV snapshot cache" in lone
+    os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
+
+
+def test_continuous_batching_leaves_the_prefix_cache_flags_alone(monkeypatch):
+    import os
+
+    os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
+    ns = _args("--continuous-batching", "--enable-prefix-cache", "--disable-prefix-cache")
+    assert cache_state.apply_simple_prefix_cache_flags(ns) is None
+    assert ns.prefix_trie_cache is False
+    assert "VLLM_MLX_SYSTEM_KV_CACHE" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "extra,named",
+    [
+        (["--enable-mtp"], "--enable-mtp"),
+        (["--max-kv-size", "4096"], "--max-kv-size"),
+        (["--mllm"], "--mllm"),
+        (["--specprefill", "--specprefill-draft-model", "d"], "--specprefill"),
+    ],
+)
+def test_the_trie_cache_warns_when_the_engine_setup_keeps_it_from_engaging(extra, named):
+    note = cache_state.apply_simple_prefix_cache_flags(_args("--enable-prefix-cache", *extra))
+    assert "cannot engage" in note and named in note
+
+
+def test_the_persistence_options_are_reported_as_ignored_by_the_simple_engine():
+    ns = _args(
+        "--prefix-cache-dir", "/x", "--prefix-cache-persist", "none",
+        "--prefix-cache-reset", "start",
+    )
+    assert cache_state.inert_options(ns) == [
+        "--prefix-cache-dir", "--prefix-cache-persist", "--prefix-cache-reset",
+    ]
+    assert cache_state.inert_options(
+        _args("--continuous-batching", "--prefix-cache-dir", "/x")
+    ) == []
+
+
+def test_flags_the_simple_engine_honors_are_not_reported_as_ignored():
+    for flag in ("--enable-prefix-cache", "--disable-prefix-cache", "--prefix-trie-cache"):
+        assert cache_state.inert_options(_args(flag)) == [], flag
+
+
+def test_help_says_which_options_the_simple_engine_ignores():
+    import argparse
+
+    parser = create_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    serve = sub.choices["serve"]
+    by_flag = {opt: act for act in serve._actions for opt in act.option_strings}
+    for flag in cache_state.CONTINUOUS_BATCHING_ONLY:
+        assert "continuous batching only" in by_flag[flag].help.lower(), flag
+        assert "Simple engine" in by_flag[flag].help, flag
+    # the options the Simple engine honors say so rather than claiming to be ignored
+    assert "explicitly" in by_flag["--enable-prefix-cache"].help
+    assert "system-prompt KV snapshot" in by_flag["--disable-prefix-cache"].help
+    assert "ignored by the Simple engine" not in by_flag["--enable-prefix-cache"].help
+    # rendering the help must not choke on the added text
+    import contextlib
+    import io
+
+    with contextlib.redirect_stdout(io.StringIO()), pytest.raises(SystemExit):
+        parser.parse_args(["serve", "--help"])

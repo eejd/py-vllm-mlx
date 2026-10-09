@@ -290,6 +290,10 @@ class SimpleEngine(BaseEngine):
         # main agent and any sub-agents with different toolsets can coexist
         # without thrashing a single snapshot slot.
         # Value is (snapshot_list, system_token_count).
+        # ``--disable-prefix-cache`` sets VLLM_MLX_SYSTEM_KV_CACHE=0 for Simple-engine serving.
+        self._system_kv_cache_enabled = os.environ.get(
+            "VLLM_MLX_SYSTEM_KV_CACHE", "1"
+        ).strip().lower() not in ("0", "false", "off", "no")
         self._system_kv_capacity = max(
             1, int(os.environ.get("VLLM_MLX_SYSTEM_KV_SLOTS", "4"))
         )
@@ -567,13 +571,17 @@ class SimpleEngine(BaseEngine):
         if prefix_trie is None:
             return None, None, 0
 
+        # LRUPromptCache keys its trie by this value, so it must be hashable; the
+        # loaded model object is not (every lookup and insert used to be skipped
+        # on real models). One engine serves one model, so its name is the key.
+        trie_key = self._model_name
         self._prefix_trie_cache_stats["lookups"] += 1
         try:
             with self._prefix_trie_cache_lock:
                 if minimum_tokens_saved > 0:
                     candidate_tokens_saved = self._peek_prefix_trie_tokens_saved(
                         prefix_trie,
-                        model,
+                        trie_key,
                         tokens,
                     )
                     if (
@@ -582,7 +590,7 @@ class SimpleEngine(BaseEngine):
                     ):
                         self._prefix_trie_cache_stats["skips"] += 1
                         return None, None, 0
-                trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(model, tokens)
+                trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(trie_key, tokens)
             if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
                 self._prefix_trie_cache_stats["misses"] += 1
                 return None, None, 0
@@ -668,7 +676,7 @@ class SimpleEngine(BaseEngine):
             return
         try:
             with self._prefix_trie_cache_lock:
-                prefix_trie.insert_cache(model, cache_key, prompt_cache)
+                prefix_trie.insert_cache(self._model_name, cache_key, prompt_cache)
             self._prefix_trie_cache_stats["inserts"] += 1
         except Exception as e:
             self._prefix_trie_cache_stats["skips"] += 1
@@ -1620,7 +1628,19 @@ class SimpleEngine(BaseEngine):
                 finish_reason=final_output.finish_reason,
                 mtp_drafts=final_output.mtp_drafts,
                 mtp_accepted=final_output.mtp_accepted,
+                cached_tokens=final_output.cached_tokens,
+                specprefill_outcome=final_output.specprefill_outcome,
             )
+
+        # With the prefix-trie cache on, pure-LLM chat takes the streaming
+        # implementation too: only that path consults the cache and reports how
+        # many prompt tokens it supplied (``model.chat`` below never does).
+        if (
+            self._prefix_trie_cache_enabled
+            and not self._is_mllm
+            and not self._cache_blocking_controls(kwargs)
+        ):
+            return await aggregate_stream_chat()
 
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
         # local models, while the streaming path completes normally. Reuse the
@@ -1697,6 +1717,75 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=len(output.tokens),
                 finish_reason=output.finish_reason,
             )
+
+    def _cache_blocking_controls(self, kwargs: dict[str, Any]) -> list[str]:
+        """Request or engine features the prefix-cache path cannot honor.
+
+        The cache branch of ``stream_chat`` drives mlx-lm directly; a request or
+        engine that needs anything else must use the uncached path. An empty
+        list means the cache can serve the request.
+        """
+        cache_blocking_controls: list[str] = []
+        if kwargs.get("stop"):
+            cache_blocking_controls.append("stop")
+        if kwargs.get("logits_processors"):
+            cache_blocking_controls.append("logits_processors")
+        if (kwargs.get("top_k") or 0) > 0:
+            cache_blocking_controls.append("top_k")
+        if (kwargs.get("min_p") or 0.0) > 0.0:
+            cache_blocking_controls.append("min_p")
+        if (kwargs.get("presence_penalty") or 0.0) != 0.0:
+            cache_blocking_controls.append("presence_penalty")
+        if (kwargs.get("repetition_penalty") or 1.0) != 1.0:
+            cache_blocking_controls.append("repetition_penalty")
+
+        # Engine-feature gate.
+        # The cache branch also bypasses engine-level features that
+        # ``self.stream_generate`` (and the ``MLXLanguageModel.stream_generate``
+        # wrapper underneath it) layer on top of ``mlx_lm.stream_generate``.
+        # Same correctness reasoning as the decode-control gate: cache-eligible
+        # and uncached requests must decode under identical engine semantics, so
+        # skip the cache branch when any of these are active.
+        # Specifically:
+        #   - ``self._mtp`` injects ``mtp=True`` and ``num_draft_tokens`` into
+        #     the mlx-lm call (see ``MLXLanguageModel.stream_generate``).
+        #   - A loaded SpecPrefill draft model (``self._draft_model is not None``,
+        #     set when ``specprefill_enabled`` + ``specprefill_draft_model`` are
+        #     configured at engine init) routes large prompts through
+        #     ``_stream_generate_specprefill`` instead of the plain stream path.
+        #   - A per-request ``specprefill`` override from ``extra_body`` (popped
+        #     by the wrapper from ``kwargs``) can force or suppress SpecPrefill
+        #     for a single request.
+        #     ``specprefill=False`` is a meaningful suppression signal — gate on
+        #     ``is not None`` rather than truthiness so the wrapper sees it.
+        #   - ``self._max_kv_size`` (when > 0) caps the prompt cache; the cache
+        #     branch builds its cache with ``make_prompt_cache(model)`` and has
+        #     no equivalent bound.
+        if self._mtp:
+            cache_blocking_controls.append("mtp")
+        if self._draft_model is not None:
+            cache_blocking_controls.append("specprefill_loaded")
+        if kwargs.get("specprefill") is not None:
+            cache_blocking_controls.append("specprefill_request_override")
+        if (self._max_kv_size or 0) > 0:
+            cache_blocking_controls.append("max_kv_size")
+        # Sliding-window models build their prompt cache from RotatingKVCache
+        # entries whose ``.state`` aliases buffers that ``update_and_fetch``
+        # mutates in place. Snapshot capture would corrupt the cached prefix
+        # on the next decode. Probed once at start; ``False`` if the model
+        # exposes any non-KVCache entries or the probe failed.
+        if not self._supports_system_kv_cache:
+            cache_blocking_controls.append("non_kv_cache_class")
+        # The system-prefix probe (re-renders the conversation with two different
+        # user contents and compares the rendered strings) goes through
+        # ``tokenizer.apply_chat_template``. When the harmony rendering path is
+        # active the actual prompt is built by ``openai-harmony`` instead, so the
+        # probe and the prompt would diverge and the cache would never hit.
+        # Falling back to the uncached path keeps correctness without splitting
+        # the probe across both renderers.
+        if getattr(self, "use_harmony_rendering", False):
+            cache_blocking_controls.append("harmony_rendering")
+        return cache_blocking_controls
 
     async def stream_chat(
         self,
@@ -2041,66 +2130,7 @@ class SimpleEngine(BaseEngine):
         # server.py always supplies the no-op defaults (``top_k=0``, ``min_p=0.0``,
         # ``presence_penalty=0.0``, ``repetition_penalty=1.0``); compare against those
         # rather than ``key in kwargs`` so the common path still hits the cache.
-        cache_blocking_controls: list[str] = []
-        if kwargs.get("stop"):
-            cache_blocking_controls.append("stop")
-        if kwargs.get("logits_processors"):
-            cache_blocking_controls.append("logits_processors")
-        if (kwargs.get("top_k") or 0) > 0:
-            cache_blocking_controls.append("top_k")
-        if (kwargs.get("min_p") or 0.0) > 0.0:
-            cache_blocking_controls.append("min_p")
-        if (kwargs.get("presence_penalty") or 0.0) != 0.0:
-            cache_blocking_controls.append("presence_penalty")
-        if (kwargs.get("repetition_penalty") or 1.0) != 1.0:
-            cache_blocking_controls.append("repetition_penalty")
-
-        # Engine-feature gate.
-        # The cache branch also bypasses engine-level features that
-        # ``self.stream_generate`` (and the ``MLXLanguageModel.stream_generate``
-        # wrapper underneath it) layer on top of ``mlx_lm.stream_generate``.
-        # Same correctness reasoning as the decode-control gate: cache-eligible
-        # and uncached requests must decode under identical engine semantics, so
-        # skip the cache branch when any of these are active.
-        # Specifically:
-        #   - ``self._mtp`` injects ``mtp=True`` and ``num_draft_tokens`` into
-        #     the mlx-lm call (see ``MLXLanguageModel.stream_generate``).
-        #   - A loaded SpecPrefill draft model (``self._draft_model is not None``,
-        #     set when ``specprefill_enabled`` + ``specprefill_draft_model`` are
-        #     configured at engine init) routes large prompts through
-        #     ``_stream_generate_specprefill`` instead of the plain stream path.
-        #   - A per-request ``specprefill`` override from ``extra_body`` (popped
-        #     by the wrapper from ``kwargs``) can force or suppress SpecPrefill
-        #     for a single request.
-        #     ``specprefill=False`` is a meaningful suppression signal — gate on
-        #     ``is not None`` rather than truthiness so the wrapper sees it.
-        #   - ``self._max_kv_size`` (when > 0) caps the prompt cache; the cache
-        #     branch builds its cache with ``make_prompt_cache(model)`` and has
-        #     no equivalent bound.
-        if self._mtp:
-            cache_blocking_controls.append("mtp")
-        if self._draft_model is not None:
-            cache_blocking_controls.append("specprefill_loaded")
-        if kwargs.get("specprefill") is not None:
-            cache_blocking_controls.append("specprefill_request_override")
-        if (self._max_kv_size or 0) > 0:
-            cache_blocking_controls.append("max_kv_size")
-        # Sliding-window models build their prompt cache from RotatingKVCache
-        # entries whose ``.state`` aliases buffers that ``update_and_fetch``
-        # mutates in place. Snapshot capture would corrupt the cached prefix
-        # on the next decode. Probed once at start; ``False`` if the model
-        # exposes any non-KVCache entries or the probe failed.
-        if not self._supports_system_kv_cache:
-            cache_blocking_controls.append("non_kv_cache_class")
-        # The system-prefix probe (re-renders the conversation with two different
-        # user contents and compares the rendered strings) goes through
-        # ``tokenizer.apply_chat_template``. When the harmony rendering path is
-        # active the actual prompt is built by ``openai-harmony`` instead, so the
-        # probe and the prompt would diverge and the cache would never hit.
-        # Falling back to the uncached path keeps correctness without splitting
-        # the probe across both renderers.
-        if getattr(self, "use_harmony_rendering", False):
-            cache_blocking_controls.append("harmony_rendering")
+        cache_blocking_controls = self._cache_blocking_controls(kwargs)
 
         if cache_blocking_controls:
             logger.info(
@@ -2122,7 +2152,11 @@ class SimpleEngine(BaseEngine):
             prefix_trie_eligible = bool(full_tokens_list)
 
         system_prefix_text = None
-        if not cache_blocking_controls and hasattr(tokenizer, "apply_chat_template"):
+        if (
+            not cache_blocking_controls
+            and self._system_kv_cache_enabled
+            and hasattr(tokenizer, "apply_chat_template")
+        ):
             system_prefix_text = build_system_prompt_cache_prefix(
                 tokenizer,
                 messages,
@@ -2195,6 +2229,10 @@ class SimpleEngine(BaseEngine):
             def _emit_error(exc: BaseException) -> None:
                 loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
 
+            # Prompt tokens the cache supplied for this request; set by the
+            # worker before the first token and read when outputs are yielded.
+            cached_tokens_box: list[int | None] = [None]
+
             def _run_with_cache() -> None:
                 from mlx_lm import stream_generate as mlx_stream_generate
                 from mlx_lm.models.cache import make_prompt_cache
@@ -2241,7 +2279,9 @@ class SimpleEngine(BaseEngine):
 
                 if prefix_trie_hit:
                     bc = local_hit_snapshot
+                    cached_tokens_box[0] = trie_tokens_saved
                 elif cache_hit:
+                    cached_tokens_box[0] = system_token_count
                     bc = make_prompt_cache(model)
                     # Restore from the closure-local reference captured at the
                     # gate, never from ``self._system_kv_cache`` directly:
@@ -2256,6 +2296,7 @@ class SimpleEngine(BaseEngine):
                         self._system_kv_cache.move_to_end(system_hash)
                     self._system_kv_cache_stats["hits"] += 1
                 elif kv_cache_eligible:
+                    cached_tokens_box[0] = 0
                     bc = make_prompt_cache(model)
                     sys_arr = mx.array(system_tokens)
                     step = self._prefill_step_size
@@ -2307,6 +2348,7 @@ class SimpleEngine(BaseEngine):
                         cache_mb,
                     )
                 else:
+                    cached_tokens_box[0] = 0
                     bc = make_prompt_cache(model)
 
                 prompt_tokens_for_decode = (
@@ -2389,6 +2431,7 @@ class SimpleEngine(BaseEngine):
                         completion_tokens=token_count,
                         finished=finished,
                         finish_reason=finish_reason,
+                        cached_tokens=cached_tokens_box[0],
                     )
                     if finished:
                         break
@@ -2758,7 +2801,12 @@ class SimpleEngine(BaseEngine):
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
 
-        if has_system and self._text_model is not None and not cache_blocking_controls:
+        if (
+            has_system
+            and self._text_model is not None
+            and not cache_blocking_controls
+            and self._system_kv_cache_enabled
+        ):
             # Find system prefix boundary in full prompt text.
             # ChatML format: system section ends where first non-system message begins.
             # Works with tools (rendered inside system section by Qwen templates).
@@ -3514,6 +3562,21 @@ class SimpleEngine(BaseEngine):
         model is multimodal, the MLLM's own cache stats.
         """
         result: dict[str, Any] = {}
+        if self._prefix_trie_cache_enabled:
+            # Top-level counters in the shape the other engines report, so
+            # ``cache_state.counters`` is filled for the Simple engine too.
+            trie_entries, trie_bytes = self._prefix_trie_cache_snapshot()
+            stats = self._prefix_trie_cache_stats
+            result.update(
+                {
+                    "hits": stats["hits"],
+                    "misses": stats["misses"],
+                    "tokens_saved": stats["tokens_saved"],
+                    "entry_count": trie_entries,
+                    "current_memory_mb": round(trie_bytes / 1e6, 1),
+                    "prefix_trie_cache": {"enabled": True, **stats},
+                }
+            )
         if self._supports_system_kv_cache:
             counters = dict(self._system_kv_cache_stats)
             denom = counters["hits"] + counters["misses"]
@@ -3556,6 +3619,21 @@ class SimpleEngine(BaseEngine):
             except Exception:
                 pass
             result["system_kv_cache"] = {"dropped_entries": dropped}
+
+        if self._prefix_trie_cache_enabled:
+            with self._prefix_trie_cache_lock:
+                trie = self._prefix_trie_cache
+                dropped = len(trie) if trie is not None else 0
+                self._prefix_trie_cache = None
+            for key in self._prefix_trie_cache_stats:
+                self._prefix_trie_cache_stats[key] = 0
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
+            result["prefix_trie_cache"] = {"dropped_entries": dropped}
 
         if self._is_mllm and self._model is not None:
             self._model.clear_cache()

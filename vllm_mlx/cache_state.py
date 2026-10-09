@@ -25,7 +25,9 @@ UNREPORTED = "unreported"
 # CLI flag -> (argparse attribute, parser default). Flags that only take effect with
 # --continuous-batching. tests/test_cache_state.py checks the defaults against the real parser.
 CONTINUOUS_BATCHING_ONLY: dict[str, tuple[str, Any]] = {
-    "--disable-prefix-cache": ("disable_prefix_cache", False),
+    "--prefix-cache-dir": ("prefix_cache_dir", None),
+    "--prefix-cache-persist": ("prefix_cache_persist", "auto"),
+    "--prefix-cache-reset": ("prefix_cache_reset", "never"),
     "--cache-memory-mb": ("cache_memory_mb", None),
     "--cache-memory-percent": ("cache_memory_percent", 0.20),
     "--no-memory-aware-cache": ("no_memory_aware_cache", False),
@@ -41,6 +43,58 @@ CONTINUOUS_BATCHING_ONLY: dict[str, tuple[str, Any]] = {
     "--max-cache-blocks": ("max_cache_blocks", 1000),
     "--chunked-prefill-tokens": ("chunked_prefill_tokens", 0),
 }
+
+
+def apply_simple_prefix_cache_flags(args: Any) -> str | None:
+    """Make ``--enable-prefix-cache`` / ``--disable-prefix-cache`` mean something to the Simple engine.
+
+    The Simple engine reuses prompt prefixes through two caches: the prefix-trie cache (off unless
+    asked for) and the system-prompt KV snapshot cache (on). An explicit ``--enable-prefix-cache``
+    turns the trie cache on. ``--disable-prefix-cache`` turns both off (the snapshot cache through
+    ``VLLM_MLX_SYSTEM_KV_CACHE=0``, which the engine reads), even if ``--prefix-trie-cache`` was
+    given. Returns the lines to print when the flags changed the setup or the cache cannot engage.
+    """
+    if getattr(args, "continuous_batching", False):
+        return None
+    import os
+
+    lines: list[str] = []
+    if getattr(args, "disable_prefix_cache", False):
+        os.environ["VLLM_MLX_SYSTEM_KV_CACHE"] = "0"
+        was_on = getattr(args, "prefix_trie_cache", False)
+        args.prefix_trie_cache = False
+        lines.append(
+            "Prefix cache: --disable-prefix-cache turns off the Simple engine's "
+            + ("prefix-trie cache and its " if was_on else "")
+            + "system-prompt KV snapshot cache"
+        )
+        return "\n".join(lines)
+    if getattr(args, "enable_prefix_cache_explicit", False) and not getattr(
+        args, "prefix_trie_cache", False
+    ):
+        args.prefix_trie_cache = True
+        lines.append(
+            "Prefix cache: --enable-prefix-cache enables the Simple engine's prefix-trie cache "
+            "(pure-LLM chat; requests with stop strings, logits processors, penalties or "
+            "top-k/min-p sampling bypass it)"
+        )
+    if getattr(args, "prefix_trie_cache", False):
+        blockers = []
+        if getattr(args, "enable_mtp", False):
+            blockers.append("--enable-mtp")
+        if getattr(args, "specprefill", False) and getattr(args, "specprefill_draft_model", None):
+            blockers.append("--specprefill with a draft model")
+        if (getattr(args, "max_kv_size", None) or 0) > 0:
+            blockers.append("--max-kv-size")
+        if getattr(args, "mllm", False):
+            blockers.append("--mllm")
+        if blockers:
+            lines.append(
+                "Warning: the Simple engine's prefix-trie cache cannot engage together with "
+                + ", ".join(blockers)
+                + "; those requests use the uncached path"
+            )
+    return "\n".join(lines) or None
 
 
 def inert_options(args: Any) -> list[str]:
