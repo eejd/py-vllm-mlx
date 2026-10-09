@@ -1041,12 +1041,21 @@ class ModelManager:
         try:
             resolved_source = await self._resolve_source(entry)
             loaded = await self._instantiate_model(entry, resolved_source)
-        except Exception as exc:
-            async with self._condition:
-                current = self._loading.pop(pending.model_name, None)
-                if current is pending and not current.future.done():
-                    current.future.set_exception(exc)
-                self._condition.notify_all()
+        except BaseException as exc:
+            # Also on cancellation (a client that disconnects during a first load): the
+            # reservation and the pending future must be released or every later
+            # acquire of this model waits on a future nobody will resolve.
+            failure = (
+                exc
+                if isinstance(exc, Exception)
+                else RuntimeError("Model load was cancelled")
+            )
+            with suspend_cancellation():
+                async with self._condition:
+                    current = self._loading.pop(pending.model_name, None)
+                    if current is pending and not current.future.done():
+                        current.future.set_exception(failure)
+                    self._condition.notify_all()
             raise
 
         async with self._condition:
@@ -1267,7 +1276,15 @@ class ModelManager:
             except BaseException:
                 # A load that cannot finish its setup must not leave a started engine behind.
                 with suspend_cancellation():
-                    await engine.stop()
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        # Keep the hook's own error as the cause the caller sees.
+                        logger.warning(
+                            "Stopping model %s after a failed load hook also failed",
+                            config.entry.name,
+                            exc_info=True,
+                        )
                 raise
         return LoadedModel(config=config, engine=engine)
 

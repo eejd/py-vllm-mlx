@@ -53,7 +53,9 @@ that must survive reloads.
 **Registry mode (`--models-config`)** loads and saves persisted caches per model (eejd/py-vllm-mlx#41).
 The model manager restores a model's cache right after its cold load and saves it just before every
 unload (idle unload, eviction for memory, preemption, shutdown), each in its own subdirectory named
-for the model's real path, the same directory single-model serving uses. The options are the global
+for the model's `source` as written in the models file (a path or a repo id), the same directory
+single-model serving uses for that argument. Two entries with the same source share one directory
+(the server warns at startup); do not load them at the same time. The options are the global
 `--prefix-cache-*` flags; there is no per-model setting in the models file. Only entries served by
 the continuous-batching engine have the hooks: a Simple-engine entry is skipped, with a warning when
 persistence options were given, and `GET /v1/cache/stats` shows `persistence.applies: false` for that

@@ -1387,3 +1387,63 @@ def test_a_manager_without_hooks_behaves_as_before(tmp_path):
         await manager.shutdown()
 
     asyncio.run(_run())
+
+
+def test_cancelling_a_load_during_the_hook_does_not_wedge_the_model(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        gate = asyncio.Event()
+        stopped: list[FakeEngine] = []
+        calls = {"n": 0}
+
+        async def on_loaded(config, engine) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await gate.wait()  # a slow restore the client gives up on
+
+        class Tracked(FakeEngine):
+            async def stop(self) -> None:
+                await super().stop()
+                stopped.append(self)
+
+        manager = ModelManager(
+            _manager_config(budget_gb=8), registry, _defaults(),
+            engine_factory=lambda config: Tracked(config),
+            on_engine_loaded=on_loaded,
+        )
+        first = asyncio.create_task(manager.acquire("alpha"))
+        await asyncio.sleep(0.1)
+        assert calls["n"] == 1
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert len(stopped) == 1
+        assert manager._loading == {}  # nothing left pending
+        # the model can be loaded again
+        lease = await asyncio.wait_for(manager.acquire("alpha"), timeout=2)
+        await lease.release()
+        await manager.shutdown()
+
+    asyncio.run(_run())
+
+
+def test_a_stop_failure_after_a_failed_load_hook_keeps_the_hooks_error(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+
+        async def on_loaded(config, engine) -> None:
+            raise RuntimeError("restore failed")
+
+        class BadStop(FakeEngine):
+            async def stop(self) -> None:
+                raise OSError("stop failed")
+
+        manager = ModelManager(
+            _manager_config(budget_gb=8), registry, _defaults(),
+            engine_factory=lambda config: BadStop(config),
+            on_engine_loaded=on_loaded,
+        )
+        with pytest.raises(RuntimeError, match="restore failed"):
+            await manager.acquire("alpha")
+
+    asyncio.run(_run())

@@ -1817,14 +1817,15 @@ def _persistence_requested() -> bool:
 async def _registry_restore_engine_state(config, engine: BaseEngine) -> None:
     """Load a registry model's persisted prefix cache after its cold load.
 
-    Keyed on the real model path, like single-model serving, so a model has one cache
-    directory however it is served. Reset-at-start applies on every cold load, including a
+    Keyed on the source as configured (a path or a repo id), which is what single-model
+    serving keys on, so a model has one cache directory however it is served and a new
+    snapshot of a repo id does not orphan its directory. Reset-at-start applies on every cold load, including a
     reload after an idle unload.
     """
     if hasattr(engine, "load_cache_from_disk"):
         await _run_blocking_engine_cache_io(
             functools.partial(
-                _load_prefix_cache_from_disk, model_key=config.resolved_source
+                _load_prefix_cache_from_disk, model_key=config.entry.source
             ),
             engine,
         )
@@ -1842,7 +1843,7 @@ async def _registry_persist_engine_state(config, engine: BaseEngine) -> None:
     if hasattr(engine, "save_cache_to_disk"):
         await _run_blocking_engine_cache_io(
             functools.partial(
-                _save_prefix_cache_to_disk, model_key=config.resolved_source
+                _save_prefix_cache_to_disk, model_key=config.entry.source
             ),
             engine,
         )
@@ -4426,6 +4427,17 @@ def load_model_registry(
     _model_path = None
     _model_name = None
     _default_max_tokens = defaults.max_tokens
+    sources: dict[str, str] = {}
+    for entry_name, entry in registry.items():
+        other = sources.setdefault(entry.source, entry_name)
+        if other != entry_name:
+            logger.warning(
+                "Models %s and %s share the source %s and therefore one persisted "
+                "prefix-cache directory; do not load them at the same time",
+                other,
+                entry_name,
+                entry.source,
+            )
     _model_manager = ModelManager(
         manager_config,
         registry,

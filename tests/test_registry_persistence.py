@@ -38,7 +38,8 @@ def _config(tmp_path, name):
     source = tmp_path / "models" / name
     source.mkdir(parents=True, exist_ok=True)
     return SimpleNamespace(
-        resolved_source=str(source), entry=SimpleNamespace(name=name)
+        resolved_source=str(source),
+        entry=SimpleNamespace(name=name, source=str(source)),
     )
 
 
@@ -62,7 +63,7 @@ def test_each_model_loads_from_and_saves_to_its_own_directory(tmp_path):
         assert a.loaded_from != b.loaded_from
         assert str(tmp_path / "cache") in a.loaded_from[0]
         # the same key as single-model serving: the real model path
-        assert Path(a.loaded_from[0]).name == server._get_cache_dir(ca.resolved_source).split("/")[-1]
+        assert a.loaded_from[0] == server._get_cache_dir(ca.entry.source)
         state = server._persistence_snapshot()["dirs"]
         assert {d["loaded"] for d in state.values()} == {2, 0}
 
@@ -89,7 +90,7 @@ def test_reset_at_start_applies_on_every_cold_load(tmp_path):
             PersistencePolicy(base_dir=str(tmp_path / "cache"), persist="save-only", reset="start")
         )
         engine, cfg = CachingEngine(), _config(tmp_path, "alpha")
-        cache_dir = Path(server._get_cache_dir(cfg.resolved_source))
+        cache_dir = Path(server._get_cache_dir(cfg.entry.source))
         for _ in range(2):  # a load, then a reload after an unload
             cache_dir.mkdir(parents=True, exist_ok=True)
             (cache_dir / "index.json").write_text("{}")
@@ -150,3 +151,36 @@ def test_the_manager_is_built_with_the_persistence_hooks(tmp_path, monkeypatch):
     server.load_model_registry(str(cfg), defaults=_defaults())
     assert captured["on_engine_loaded"] is server._registry_restore_engine_state
     assert captured["on_engine_unloading"] is server._registry_persist_engine_state
+
+
+def test_a_repo_id_source_keeps_one_directory_across_snapshots_and_modes(tmp_path):
+    async def _run():
+        engine = CachingEngine()
+        # two revisions of one repo id resolve to different snapshot paths
+        for rev in ("aaa", "bbb"):
+            cfg = SimpleNamespace(
+                resolved_source=f"/hf/models--org--m/snapshots/{rev}",
+                entry=SimpleNamespace(name="m", source="org/m"),
+            )
+            await server._registry_restore_engine_state(cfg, engine)
+        assert engine.loaded_from[0] == engine.loaded_from[1]
+        # and it is the directory single-model serving derives from the same argument
+        assert engine.loaded_from[0] == server._get_cache_dir("org/m")
+
+    asyncio.run(_run())
+
+
+def test_two_entries_with_one_source_are_warned_about(tmp_path, monkeypatch, caplog):
+    (tmp_path / "m").mkdir()
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(
+        "manager:\n  memory_budget_gb: 8\nmodels:\n"
+        f"  - name: a\n    path: {tmp_path / 'm'}\n    estimated_memory_gb: 1\n"
+        f"  - name: b\n    path: {tmp_path / 'm'}\n    estimated_memory_gb: 1\n"
+    )
+    from tests.test_model_registry import _defaults
+
+    monkeypatch.setattr(server, "_model_manager", None)
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        server.load_model_registry(str(cfg), defaults=_defaults())
+    assert "share the source" in caplog.text
