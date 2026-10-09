@@ -49,7 +49,9 @@ discrepancy; there the per-request value is the truthful one.
 Known limits: on an exact repeat only the last prompt token is fed to the batch generator, so a request with
 `repetition_penalty` or custom logits processors sees just that token as context (as partial-prefix hits
 already do); a request aborted before it is scheduled keeps its credit in `hits`; the SSD-tier and MLLM paths
-are not settled.
+are not settled. An exact SSD promotion, a paged hit that ends on a block boundary and a legacy prefix-cache
+hit are rewound by one position like a memory-cache exact hit (or prefilled when the layers cannot be
+rewound), so the last token is never in the KV cache twice (#47).
 
 ## Why the Simple engine shows no warm speedup
 

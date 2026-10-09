@@ -1776,41 +1776,39 @@ class Scheduler:
                 # corrupted context (measured: same prompt, different output).
                 # Entries stored post-prefill cover the full key, so drop the
                 # cache and prefill instead of guessing which kind this is.
-                if getattr(request, "cache_hit_type", None) in {
-                    "exact",
-                    "supersequence",
-                }:
-                    reusable = request.prompt_cache is not None and all(
-                        _is_exactly_rewindable(layer)
-                        for layer in request.prompt_cache
+                # This holds for every hit kind with an empty remainder
+                # (memory-cache exact/supersequence, promoted SSD entries,
+                # paged and legacy prefix-cache hits): each of them hands back
+                # a state that covers the whole key.
+                reusable = request.prompt_cache is not None and all(
+                    _is_exactly_rewindable(layer)
+                    for layer in request.prompt_cache
+                )
+                if reusable:
+                    # Rewind one position on a copy (the stored entry is
+                    # untouched) and feed just the last token: the model
+                    # then sees each position exactly once.
+                    request.prompt_cache = _trim_cache_offset(
+                        request.prompt_cache, 1
                     )
-                    if reusable:
-                        # Rewind one position on a copy (the stored entry is
-                        # untouched) and feed just the last token: the model
-                        # then sees each position exactly once.
-                        request.prompt_cache = _trim_cache_offset(
-                            request.prompt_cache, 1
-                        )
-                        request.cached_tokens = len(request.prompt_token_ids) - 1
-                        request.remaining_tokens = request.prompt_token_ids[-1:]
-                        tokens_to_process = request.remaining_tokens
-                        self._settle_cache_use(request, request.cached_tokens)
-                    else:
-                        # Non-rewindable state (hybrid/recurrent layers):
-                        # prefill instead of duplicating the last token.
-                        logger.debug(
-                            "[cache] %s match on a non-rewindable entry; "
-                            "prefilling to avoid duplicating the last token",
-                            request.cache_hit_type,
-                        )
-                        cache_to_use = None
-                        request.prompt_cache = None
-                        request.cached_tokens = 0
-                        request.remaining_tokens = request.prompt_token_ids
-                        tokens_to_process = request.prompt_token_ids
-                        self._settle_cache_use(request, 0)
+                    request.cached_tokens = len(request.prompt_token_ids) - 1
+                    request.remaining_tokens = request.prompt_token_ids[-1:]
+                    tokens_to_process = request.remaining_tokens
+                    self._settle_cache_use(request, request.cached_tokens)
                 else:
-                    tokens_to_process = request.prompt_token_ids[-1:]
+                    # Non-rewindable state (hybrid/recurrent layers):
+                    # prefill instead of duplicating the last token.
+                    logger.debug(
+                        "[cache] %s match on a non-rewindable entry; "
+                        "prefilling to avoid duplicating the last token",
+                        request.cache_hit_type,
+                    )
+                    cache_to_use = None
+                    request.prompt_cache = None
+                    request.cached_tokens = 0
+                    request.remaining_tokens = request.prompt_token_ids
+                    tokens_to_process = request.prompt_token_ids
+                    self._settle_cache_use(request, 0)
             elif request.remaining_tokens:
                 tokens_to_process = request.remaining_tokens
             else:
