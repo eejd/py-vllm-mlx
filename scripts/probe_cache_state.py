@@ -90,7 +90,10 @@ def wait_ready(proc, base, seconds=300):
 def cache_lines(metrics_text):
     if not isinstance(metrics_text, str):
         return []
-    return [ln for ln in metrics_text.splitlines() if "cache" in ln.lower() and not ln.startswith("#")][:20]
+    # Only the cache series: a plain "cache" match also caught the HTTP histogram lines for
+    # /v1/cache/stats, and a [:20] cap then cut the real cache gauges off (py-vllm-mlx#42).
+    prefixes = ("vllm_mlx_cache_", "vllm_mlx_prefix_cache_", 'vllm_mlx_metal_memory_bytes{kind="cache"}')
+    return [ln for ln in metrics_text.splitlines() if ln.startswith(prefixes)]
 
 
 def snapshot(base):

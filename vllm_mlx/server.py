@@ -4429,9 +4429,33 @@ async def metrics():
     engine = (
         _model_manager.get_metrics_engine() if _model_manager is not None else _engine
     )
+    cache_states: dict[str, dict] = {}
+    try:
+        if _model_manager is not None:
+            cache_states = {
+                name: entry["cache_state"]
+                for name, entry in _registry_cache_states().items()
+            }
+        elif _engine is not None:
+            stats = (
+                _engine.get_cache_stats() if hasattr(_engine, "get_cache_stats") else None
+            )
+            cache_states = {
+                _model_name or "default": _cache_state.build(
+                    engine=_engine,
+                    launch=_cache_launch_options,
+                    engine_cache=stats,
+                    persistence=_persistence_snapshot(),
+                    registry_mode=False,
+                )
+            }
+    except Exception as exc:  # noqa: BLE001 - a scrape must not fail on cache stats
+        logger.debug("metrics: cache state unavailable (%s)", exc)
     payload, content_type = _metrics.render_metrics(
         engine=engine,
         mcp_manager=_mcp_manager,
+        cache_states=cache_states,
+        persistence=_persistence_snapshot(),
     )
     return Response(content=payload, headers={"Content-Type": content_type})
 
