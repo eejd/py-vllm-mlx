@@ -73,13 +73,21 @@ def _mock_engine(*outputs):
     return engine
 
 
-def _output(text: str, prompt_tokens: int = 7, completion_tokens: int = 3):
-    return SimpleNamespace(
+def _output(
+    text: str,
+    prompt_tokens: int = 7,
+    completion_tokens: int = 3,
+    cached_tokens: int | None = None,
+):
+    out = SimpleNamespace(
         text=text,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         finish_reason="stop",
     )
+    if cached_tokens is not None:
+        out.cached_tokens = cached_tokens
+    return out
 
 
 def _stream_output(
@@ -87,8 +95,9 @@ def _stream_output(
     prompt_tokens: int = 7,
     completion_tokens: int = 1,
     finish_reason: str | None = None,
+    cached_tokens: int | None = None,
 ):
-    return SimpleNamespace(
+    out = SimpleNamespace(
         new_text=new_text,
         text=new_text,
         prompt_tokens=prompt_tokens,
@@ -96,6 +105,9 @@ def _stream_output(
         finish_reason=finish_reason,
         finished=finish_reason is not None,
     )
+    if cached_tokens is not None:
+        out.cached_tokens = cached_tokens
+    return out
 
 
 def _parse_sse_events(body: str) -> list[tuple[str, dict]]:
@@ -972,3 +984,78 @@ class TestResponsesEndpoint:
         body = resp.json()
         assert body["status"] == "incomplete"
         assert body["incomplete_details"] == {"reason": "max_output_tokens"}
+
+
+class TestResponsesCachedTokens:
+    """usage.input_tokens_details.cached_tokens is the engine's value, or absent."""
+
+    def test_reported_cached_tokens_reach_the_response(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Hi", prompt_tokens=40, cached_tokens=39))
+        body = client.post(
+            "/v1/responses", json={"model": "test-model", "input": "hello"}
+        ).json()
+        assert body["usage"]["input_tokens_details"] == {"cached_tokens": 39}
+
+    def test_a_reported_zero_is_kept(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Hi", cached_tokens=0))
+        body = client.post(
+            "/v1/responses", json={"model": "test-model", "input": "hello"}
+        ).json()
+        assert body["usage"]["input_tokens_details"] == {"cached_tokens": 0}
+
+    def test_unreported_cached_tokens_are_omitted_not_zero(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Hi"))
+        body = client.post(
+            "/v1/responses", json={"model": "test-model", "input": "hello"}
+        ).json()
+        assert "input_tokens_details" not in body["usage"]
+        assert body["usage"]["output_tokens_details"] == {"reasoning_tokens": 0}
+
+    def test_streaming_completed_event_carries_the_last_reported_value(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine()
+        engine._stream_outputs = [
+            _stream_output("Hel", prompt_tokens=40, cached_tokens=39),
+            _stream_output("lo", prompt_tokens=40, finish_reason="stop"),
+        ]
+        srv._engine = engine
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "hello", "stream": True},
+        )
+        events = _parse_sse_events(resp.text)
+        completed = [p for t, p in events if t == "response.completed"]
+        assert completed[0]["response"]["usage"]["input_tokens_details"] == {
+            "cached_tokens": 39
+        }
+
+    def test_streaming_without_a_report_omits_the_details(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine()
+        engine._stream_outputs = [_stream_output("Hi", finish_reason="stop")]
+        srv._engine = engine
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "hello", "stream": True},
+        )
+        events = _parse_sse_events(resp.text)
+        completed = [p for t, p in events if t == "response.completed"]
+        assert "input_tokens_details" not in completed[0]["response"]["usage"]
+
+    def test_stored_response_keeps_the_details(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Hi", cached_tokens=5))
+        body = client.post(
+            "/v1/responses", json={"model": "test-model", "input": "hello"}
+        ).json()
+        stored = srv._responses_store[body["id"]]["response"]
+        assert stored.usage.input_tokens_details.cached_tokens == 5

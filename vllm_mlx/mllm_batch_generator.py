@@ -663,6 +663,12 @@ class MLLMBatchGenerator:
         # Per-request prefill progress: request_id → (processed_tokens, total_tokens)
         self._prefill_progress: Dict[str, Tuple[int, int]] = {}
 
+        # Prompt tokens served from the prefix cache, per request, recorded
+        # only for requests that consulted it. The scheduler reads each value
+        # once (``pop_cached_tokens``); the bound keeps requests that are
+        # aborted before their first response from accumulating.
+        self._cache_reuse: Dict[str, int] = {}
+
         # Aborted request IDs — checked between prefill chunks to allow
         # early termination when a client disconnects during long prefill.
         # Set operations are GIL-protected, safe across event-loop and
@@ -866,6 +872,42 @@ class MLLMBatchGenerator:
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
+    def _reuse_table(self) -> Dict[str, int]:
+        # Created on first use so generators built without ``__init__`` (test
+        # doubles) work too.
+        table = self.__dict__.get("_cache_reuse")
+        if table is None:
+            table = self._cache_reuse = {}
+        return table
+
+    def _record_cache_use(self, req: Any, credited: int, used: int) -> None:
+        """Record how much of the prompt the prefix cache really supplied.
+
+        ``credited`` is what ``fetch`` counted as saved; when the request used
+        less (a fall-through to full prefill, or an exact hit that replays its
+        last token) the difference is taken back from the cache counters.
+        """
+        total = getattr(req, "input_ids", None)
+        limit = int(total.shape[-1]) if total is not None else None
+        used = max(0, int(used))
+        if limit is not None:
+            used = min(used, limit)
+        table = self._reuse_table()
+        table[req.request_id] = used
+        while len(table) > 4096:
+            table.pop(next(iter(table)))
+        if credited > used:
+            settle = getattr(self.prefix_cache, "settle_hit", None)
+            if callable(settle):
+                try:
+                    settle(credited, used)
+                except Exception:
+                    logger.debug("prefix cache settle_hit failed", exc_info=True)
+
+    def pop_cached_tokens(self, request_id: str) -> Optional[int]:
+        """Prompt tokens the prefix cache supplied; None if it was not consulted."""
+        return self._reuse_table().pop(request_id, None)
+
     def abort_prefill(self, request_id: str) -> None:
         """Signal that a request's prefill should be aborted.
 
@@ -876,6 +918,7 @@ class MLLMBatchGenerator:
         has been committed successfully, the entry is valid independent of
         the request and may remain reusable after a later disconnect.
         """
+        self._reuse_table().pop(request_id, None)
         with self._prefix_checkpoint_lock:
             self._aborted_request_ids.add(request_id)
             state = self._request_prefix_checkpoints.pop(request_id, None)
@@ -2013,9 +2056,12 @@ class MLLMBatchGenerator:
                 cached_kv = None
                 remaining_ids = None
                 cached_last_logits = None
+                cache_consulted = False
+                cache_credited = 0
                 if self.prefix_cache is not None and is_text_only_prefix_cache_request(
                     req
                 ):
+                    cache_consulted = True
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     fetch_auxiliary = getattr(
                         self.prefix_cache, "fetch_exact_auxiliary", None
@@ -2030,12 +2076,16 @@ class MLLMBatchGenerator:
                             input_ids_list
                         )
                         cached_last_logits = exact_aux["last_logits"]
+                        if cached_kv is not None:
+                            cache_credited = len(input_ids_list) - len(remaining_ids)
                     else:
                         # Ordinary rewindable caches retain historical prefix
                         # matching by stripping the generated think suffix.
                         S = self._think_suffix_len
                         lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
                         cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
+                        if cached_kv is not None:
+                            cache_credited = len(lookup_ids) - len(remaining_ids)
                         if cached_kv is not None and S > 0:
                             remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 
@@ -2099,6 +2149,9 @@ class MLLMBatchGenerator:
                         len(input_ids_list),
                         len(input_ids_list),
                     )
+                    self._record_cache_use(
+                        req, cache_credited, len(input_ids_list)
+                    )
                 elif cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
                     # The prepared cache is an isolated recursive copy.
@@ -2107,6 +2160,7 @@ class MLLMBatchGenerator:
                     cached_count = len(input_ids_list) - len(remaining_ids)
                     total_tokens = len(input_ids_list)
                     remaining_count = len(remaining_ids)
+                    self._record_cache_use(req, cache_credited, cached_count)
 
                     with mx.stream(MLLMBatchGenerator._stream):
                         step = self.prefill_step_size
@@ -2204,6 +2258,7 @@ class MLLMBatchGenerator:
                     request_cache = prepared_cache
                     last_token = req.input_ids[:, -1:]
                     total_tokens = len(input_ids_list)
+                    self._record_cache_use(req, cache_credited, total_tokens - 1)
                     self._prefill_progress[req.request_id] = (
                         total_tokens,
                         total_tokens,
@@ -2236,6 +2291,8 @@ class MLLMBatchGenerator:
 
                 else:
                     # Cache miss — full forward pass
+                    if cache_consulted:
+                        self._record_cache_use(req, cache_credited, 0)
                     request_cache = make_prompt_cache(
                         self.language_model,
                         max_kv_size=self.max_kv_size or None,
@@ -4106,11 +4163,14 @@ def install_chunked_prefill_mllm(
                 cached_kv = None
                 remaining_ids = None
                 cached_count = 0
+                cache_consulted = False
+                cache_credited = 0
                 total_tokens = input_ids.shape[1]
 
                 if batch_gen.prefix_cache is not None and (
                     is_text_only_prefix_cache_request(text_only_req)
                 ):
+                    cache_consulted = True
                     input_ids_list = input_ids.reshape(-1).tolist()
                     fetch_auxiliary = getattr(
                         batch_gen.prefix_cache, "fetch_exact_auxiliary", None
@@ -4127,6 +4187,8 @@ def install_chunked_prefill_mllm(
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
                     cached_kv, remaining_ids = batch_gen.prefix_cache.fetch(lookup_ids)
+                    if cached_kv is not None:
+                        cache_credited = len(lookup_ids) - len(remaining_ids)
                     if cached_kv is not None and S > 0:
                         remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 
@@ -4179,6 +4241,11 @@ def install_chunked_prefill_mllm(
                     remaining = input_ids
                     cached_count = 0
                     remaining_count = total_tokens
+
+                if cache_consulted:
+                    batch_gen._record_cache_use(
+                        text_only_req, cache_credited, cached_count
+                    )
 
                 checkpoint_at = None
                 checkpoint_key = None
