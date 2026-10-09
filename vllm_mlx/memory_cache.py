@@ -1977,9 +1977,21 @@ class MemoryAwarePrefixCache:
                     self._config.kv_quantize
                     and len(tokens) >= self._config.kv_min_quantize_tokens
                 ):
-                    cache = _quantize_cache(
-                        cache, self._config.kv_bits, self._config.kv_group_size
-                    )
+                    try:
+                        quantized = _quantize_cache(
+                            cache, self._config.kv_bits, self._config.kv_group_size
+                        )
+                        # Materialize now so the fp16 sources are released
+                        # (prepare_store does the same via the detach helper).
+                        with self._copy_lock:
+                            cache = _detach_cache_for_storage(quantized)
+                    except Exception as e:
+                        # e.g. head_dim not divisible by the group size: keep
+                        # the entry unquantized rather than dropping it.
+                        logger.warning(
+                            f"[cache_persist] entry {i} kept unquantized: "
+                            f"{type(e).__name__}: {e}"
+                        )
 
                 # Estimate memory
                 memory = estimate_kv_cache_memory(cache)

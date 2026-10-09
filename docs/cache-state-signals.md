@@ -46,6 +46,11 @@ container layers, an entry rejected by the KV bound, a failed cache insert) is t
 `tokens_saved`, counted as a miss and in `discarded_hits`. Engines older than this change still show the
 discrepancy; there the per-request value is the truthful one.
 
+Known limits: on an exact repeat only the last prompt token is fed to the batch generator, so a request with
+`repetition_penalty` or custom logits processors sees just that token as context (as partial-prefix hits
+already do); a request aborted before it is scheduled keeps its credit in `hits`; the SSD-tier and MLLM paths
+are not settled.
+
 ## Why the Simple engine shows no warm speedup
 
 `serve` builds a `SchedulerConfig` only with `--continuous-batching` (`cli.py`); in Simple mode

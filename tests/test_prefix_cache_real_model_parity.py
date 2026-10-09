@@ -71,7 +71,7 @@ def _generate(scheduler, request_id, prompt, max_tokens=4):
     )
     scheduler.add_request(request)
     emitted = []
-    for _ in range(32):
+    for _ in range(max_tokens + 28):
         result = scheduler.step()
         for output in result.outputs:
             emitted.extend(output.new_token_ids)
@@ -113,15 +113,19 @@ def test_real_kv_cache_identical_prompt_matches_cold_without_replay():
 
     warm = _scheduler(model, tokenizer)
     prompt = _long_prompt(tokenizer)
-    first_tokens, _ = _generate(warm, "kv-first", prompt)
+    first_tokens, _ = _generate(warm, "kv-first", prompt, max_tokens=16)
     assert first_tokens
 
     entries = list(warm.memory_aware_cache._entries)
     assert len(entries) == 1
     assert list(entries[0]) == prompt + first_tokens
 
-    replay_tokens, replay_request = _generate(warm, "kv-identical", prompt)
-    cold_tokens, _ = _generate(_scheduler(model, tokenizer), "kv-cold", prompt)
+    replay_tokens, replay_request = _generate(
+        warm, "kv-identical", prompt, max_tokens=16
+    )
+    cold_tokens, _ = _generate(
+        _scheduler(model, tokenizer), "kv-cold", prompt, max_tokens=16
+    )
 
     assert replay_tokens == cold_tokens == first_tokens, (
         f"warm={replay_tokens} cold={cold_tokens} first={first_tokens} "

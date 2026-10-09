@@ -84,7 +84,6 @@ class SchedulingPolicy(Enum):
 
 
 @dataclass
-
 class SchedulerConfig:
     """Configuration for the scheduler."""
 
@@ -782,7 +781,6 @@ def _mtp_status_snapshot(batch_generator) -> Dict[str, Any]:
     if callable(get_mtp_stats):
         return {"mtp": get_mtp_stats()}
     return {}
-
 
 
 def _is_exactly_rewindable(layer: Any) -> bool:

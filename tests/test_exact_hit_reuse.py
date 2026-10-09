@@ -189,11 +189,64 @@ def test_settle_hit_partial_and_full_and_never_negative():
     assert min(_stats(cache)) >= 0
 
 
-def test_discarded_hits_is_reported_in_the_stats():
-    cache = MemoryAwarePrefixCache(
-        _Model(), MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1)
-    )
+def test_discarded_hits_is_reported_in_the_stats_and_cache_state():
+    sched, cache, _ = _setup(PROMPT[:5], max_kv_size=64)
     assert cache.get_stats()["discarded_hits"] == 0
+    _run(sched, PROMPT)
+    assert cache.get_stats()["discarded_hits"] == 1
+    from vllm_mlx import cache_state
+
+    assert "discarded_hits" in cache_state._COUNTER_KEYS
+
+
+def test_exact_reuse_with_kv_quantization_on():
+    sched, cache, rec = _setup(None)
+    cache = MemoryAwarePrefixCache(
+        _Model(),
+        MemoryCacheConfig(
+            max_memory_mb=64,
+            min_prefix_tokens=1,
+            kv_quantize=True,
+            kv_bits=8,
+            kv_group_size=64,
+            kv_min_quantize_tokens=4,
+        ),
+    )
+    sched.memory_aware_cache = cache
+    assert cache.store(PROMPT, [_kv(8, dim=64) for _ in range(LAYERS)])
+    request = _run(sched, PROMPT)
+
+    assert request.cached_tokens == 7
+    assert rec.calls[0]["prompts"] == [[8]]
+    assert all(
+        not isinstance(layer, _QuantizedCacheWrapper) for layer in rec.calls[0]["caches"][0]
+    )
+    assert [layer.offset for layer in rec.calls[0]["caches"][0]] == [7] * LAYERS
+    assert _stats(cache) == (1, 0, 7, 0)
+
+
+def test_reschedule_after_an_error_takes_the_whole_hit_back_once():
+    sched, cache, _ = _setup(PROMPT[:5])
+    request = _run(sched, PROMPT)
+    assert _stats(cache) == (1, 0, 5, 0)
+    request.status = __import__("vllm_mlx.request", fromlist=["RequestStatus"]).RequestStatus.RUNNING
+    sched.running[request.request_id] = request
+    sched._reschedule_running_requests()
+    assert _stats(cache) == (0, 1, 0, 1)
+    sched._settle_cache_use(request, 0)
+    assert _stats(cache) == (0, 1, 0, 1)
+
+
+def test_a_recurrent_layer_is_not_rewindable():
+    from vllm_mlx.scheduler import _is_exactly_rewindable
+
+    assert not _is_exactly_rewindable(cache_mod.ArraysCache(size=2))
+
+
+def test_a_container_layer_is_not_rewindable():
+    from vllm_mlx.scheduler import _is_exactly_rewindable
+
+    assert not _is_exactly_rewindable(cache_mod.CacheList(_kv(4), _kv(4)))
 
 
 # --- #40: persisted entries are quantized on load like fresh ones ---------------
@@ -265,6 +318,35 @@ def test_quantized_size_decides_whether_an_entry_fits(tmp_path):
         ),
     )
     assert tight.load_from_disk(str(tmp_path)) == 1
+    # negative control: the same limit refuses the unquantized entry
+    fp_tight = MemoryAwarePrefixCache(
+        _Model(),
+        MemoryCacheConfig(max_memory_mb=max(limit_mb, 0.01), min_prefix_tokens=1),
+    )
+    assert fp_tight.load_from_disk(str(tmp_path)) == 0
+
+
+def test_an_entry_that_cannot_be_quantized_is_kept_unquantized(tmp_path):
+    src = MemoryAwarePrefixCache(
+        _Model(), MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1)
+    )
+    assert src.store(list(range(8)), [_kv(8, dim=48) for _ in range(LAYERS)])
+    assert src.save_to_disk(str(tmp_path))
+    quant = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4)
+    assert quant.load_from_disk(str(tmp_path)) == 1  # dim 48 % 64 != 0
+    layers = next(iter(quant._entries.values())).cache
+    assert not any(isinstance(layer, _QuantizedCacheWrapper) for layer in layers)
+
+
+def test_quantized_store_save_load_round_trip_stays_quantized(tmp_path):
+    src = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4)
+    assert src.store(list(range(8)), [_kv(8, dim=64) for _ in range(LAYERS)])
+    assert src.save_to_disk(str(tmp_path))
+    dst = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4)
+    assert dst.load_from_disk(str(tmp_path)) == 1
+    layers = next(iter(dst._entries.values())).cache
+    assert all(isinstance(layer, _QuantizedCacheWrapper) for layer in layers)
+    assert dst._current_memory == src._current_memory
 
 
 def test_rotating_windows_are_never_treated_as_rewindable_even_if_they_claim_to_be():
