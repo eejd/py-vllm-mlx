@@ -1059,3 +1059,127 @@ class TestResponsesCachedTokens:
         ).json()
         stored = srv._responses_store[body["id"]]["response"]
         assert stored.usage.input_tokens_details.cached_tokens == 5
+
+
+class TestResponsesRegistryRouting:
+    """Registry mode: /v1/responses serves request.model through the manager (#54)."""
+
+    @pytest.fixture()
+    def registry(self, monkeypatch):
+        import vllm_mlx.server as srv
+        from vllm_mlx.model_registry import ModelLease
+
+        engines = {
+            "alpha": _mock_engine(_output("from alpha", cached_tokens=11)),
+            "beta": _mock_engine(_output("from beta")),
+        }
+        for name, eng in engines.items():
+            eng._stream_outputs = [
+                _stream_output(f"stream {name}", finish_reason="stop", cached_tokens=3)
+            ]
+        manager = SimpleNamespace(
+            active_requests=0,
+            acquired=[],
+            registered_model_names=list(engines),
+            has_model=lambda name: name in engines,
+        )
+
+        async def acquire(model_name):
+            if model_name == "broken":
+                raise RuntimeError("model failed to load")
+            manager.active_requests += 1
+            manager.acquired.append(model_name)
+
+            async def release():
+                manager.active_requests -= 1
+
+            return ModelLease(manager, model_name, engines[model_name], release)
+
+        manager.acquire = acquire
+        manager.engines = engines
+        monkeypatch.setattr(srv, "_model_manager", manager)
+        monkeypatch.setattr(srv, "_model_name", None)
+        monkeypatch.setattr(srv, "_active_request_contexts", {})
+        srv._engine = None  # nothing global to fall back on
+        return manager
+
+    def test_each_request_is_served_by_its_own_model(self, client, registry):
+        for name, text in (("alpha", "from alpha"), ("beta", "from beta")):
+            resp = client.post("/v1/responses", json={"model": name, "input": "hi"})
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["output"][0]["content"][0]["text"] == text
+        assert registry.acquired == ["alpha", "beta"]
+        assert registry.engines["alpha"].chat.await_count == 1
+        assert registry.engines["beta"].chat.await_count == 1
+
+    def test_cached_tokens_come_from_the_requested_models_engine(self, client, registry):
+        body = client.post(
+            "/v1/responses", json={"model": "alpha", "input": "hi"}
+        ).json()
+        assert body["usage"]["input_tokens_details"] == {"cached_tokens": 11}
+        body = client.post("/v1/responses", json={"model": "beta", "input": "hi"}).json()
+        assert "input_tokens_details" not in body["usage"]
+
+    def test_lease_is_released_after_a_response(self, client, registry):
+        import vllm_mlx.server as srv
+
+        client.post("/v1/responses", json={"model": "alpha", "input": "hi"})
+        assert registry.active_requests == 0
+        assert srv._active_request_contexts == {}
+
+    def test_streaming_is_served_by_the_requested_model_and_released(
+        self, client, registry
+    ):
+        import vllm_mlx.server as srv
+
+        resp = client.post(
+            "/v1/responses", json={"model": "beta", "input": "hi", "stream": True}
+        )
+        assert resp.status_code == 200, resp.text
+        events = _parse_sse_events(resp.text)
+        completed = [p for t, p in events if t == "response.completed"]
+        assert "stream beta" in json.dumps(completed[0])
+        assert completed[0]["response"]["usage"]["input_tokens_details"] == {
+            "cached_tokens": 3
+        }
+        assert registry.engines["beta"]._stream_calls
+        assert not registry.engines["alpha"]._stream_calls
+        assert registry.active_requests == 0
+        assert srv._active_request_contexts == {}
+
+    def test_engine_failure_releases_the_lease(self, client, registry):
+        registry.engines["alpha"].chat = AsyncMock(side_effect=RuntimeError("boom"))
+        with pytest.raises(RuntimeError):
+            client.post("/v1/responses", json={"model": "alpha", "input": "hi"})
+        assert registry.active_requests == 0
+
+    def test_unknown_model_is_rejected_without_a_lease(self, client, registry):
+        resp = client.post("/v1/responses", json={"model": "nope", "input": "hi"})
+        assert resp.status_code == 404
+        assert registry.acquired == []
+        assert registry.active_requests == 0
+
+    def test_load_failure_is_503_and_leaks_nothing(self, client, registry):
+        registry.has_model = lambda name: True
+        resp = client.post("/v1/responses", json={"model": "broken", "input": "hi"})
+        assert resp.status_code == 503
+        assert "failed to load" in resp.text
+        assert registry.active_requests == 0
+
+    def test_blocked_media_url_releases_the_lease(self, client, registry, monkeypatch):
+        import vllm_mlx.server as srv
+        from vllm_mlx.models.mllm import UnsafeRemoteURLError
+
+        def blocked(_messages):
+            raise UnsafeRemoteURLError("private address")
+
+        monkeypatch.setattr(srv, "_validate_remote_media_urls", blocked)
+        for stream in (False, True):
+            resp = client.post(
+                "/v1/responses",
+                json={"model": "alpha", "input": "hi", "stream": stream},
+            )
+            assert resp.status_code == 400, resp.text
+            assert registry.acquired.count("alpha") == (2 if stream else 1)
+            assert registry.active_requests == 0
