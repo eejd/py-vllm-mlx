@@ -326,6 +326,9 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+`/v1/chat/completions`, `/v1/completions` and `/v1/responses` all resolve the
+request's `model` through the registry (the same lazy load and lease).
+
 Then repeat with a second model id to verify:
 
 - lazy load works

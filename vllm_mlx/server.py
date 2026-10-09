@@ -3083,10 +3083,16 @@ def _prepare_responses_request(
     request: ResponsesRequest,
     *,
     validate_remote_media: bool = True,
+    engine: BaseEngine | None = None,
 ) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
-    """Prepare a Responses request for execution on the chat engine."""
+    """Prepare a Responses request for execution on the chat engine.
+
+    ``engine`` is the engine the caller already acquired for ``request.model``
+    (registry mode); without it the single global engine serves the request.
+    """
     _validate_model_name(request.model)
-    engine = get_engine()
+    if engine is None:
+        engine = get_engine()
     chat_request = _responses_request_to_chat_request(request)
 
     if chat_request.messages:
@@ -3128,17 +3134,23 @@ def _prepare_responses_request(
 
 def _prepare_streaming_responses_request(
     request: ResponsesRequest,
+    engine: BaseEngine | None = None,
 ) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
     """Prepare a streaming Responses request after eager URL validation."""
-    return _prepare_responses_request(request, validate_remote_media=False)
+    return _prepare_responses_request(
+        request, validate_remote_media=False, engine=engine
+    )
 
 
 async def _run_responses_request(
     request: ResponsesRequest,
     raw_request: Request,
+    engine: BaseEngine | None = None,
 ) -> tuple[ResponseObject | None, list[dict]]:
     """Execute a Responses API request against the backend chat engine."""
-    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(
+        request, engine=engine
+    )
 
     timeout = _default_timeout
     output = await _wait_with_disconnect(
@@ -3190,11 +3202,15 @@ async def _run_responses_request(
     return response_object, persisted_messages
 
 
-async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
+async def _stream_responses_request(
+    request: ResponsesRequest, engine: BaseEngine | None = None
+) -> AsyncIterator[str]:
     """Execute a Responses API request and stream SSE events incrementally."""
-    engine, chat_request, messages, chat_kwargs = _prepare_streaming_responses_request(
-        request
-    )
+    if engine is None:
+        prepared = _prepare_streaming_responses_request(request)
+    else:
+        prepared = _prepare_streaming_responses_request(request, engine=engine)
+    engine, chat_request, messages, chat_kwargs = prepared
     tool_request_context = chat_request.model_dump()
 
     response_id = _new_response_item_id("resp")
@@ -6455,20 +6471,49 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             detail=_OUTLINES_BACKEND_UNAVAILABLE_DETAIL,
         )
     await _preflight_response_format_backend(raw_request)
+
+    # Registry mode: resolve (and lazily load) the engine for request.model and
+    # hold its lease for the whole request, as chat/completions do. Single-model
+    # serving keeps using the global engine.
+    engine: BaseEngine | None = None
+    release_on_exit = False
+    if _model_manager is not None:
+        total_timeout, deadline = _start_request_budget(None)
+        engine = await _acquire_default_engine_for_request(
+            raw_request,
+            total_timeout=total_timeout,
+            deadline=deadline,
+            model=request.model,
+        )
+        if engine is None:
+            return Response(status_code=499)
+        release_on_exit = True
+
     try:
         if request.stream:
             chat_request = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
-            return StreamingResponse(
-                _disconnect_guard(_stream_responses_request(request), raw_request),
+            response = StreamingResponse(
+                _disconnect_guard(
+                    _stream_responses_request(request, engine=engine),
+                    raw_request,
+                    cleanup=_make_release_cleanup(raw_request)
+                    if engine is not None
+                    else None,
+                ),
                 media_type="text/event-stream",
             )
+            release_on_exit = False
+            return response
 
         response_object, _persisted_messages = await _run_responses_request(
-            request, raw_request
+            request, raw_request, engine=engine
         )
     except UnsafeRemoteURLError as exc:
         _raise_remote_media_http_error(exc)
+    finally:
+        if release_on_exit:
+            await _release_engine_for_request(raw_request)
 
     if response_object is None:
         return Response(status_code=499)
