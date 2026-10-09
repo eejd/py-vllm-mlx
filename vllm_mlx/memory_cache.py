@@ -312,6 +312,11 @@ class CacheStats:
     # failure).  Fail-closed trades a leak for a cache miss; this makes
     # those misses observable instead of silent.
     store_rejections: int = 0
+    # Hits that fetch() credited and the scheduler then did not use (a stale
+    # or incompatible entry, or a full-coverage match it could not rewind).
+    # They are removed from ``hits``/``tokens_saved`` and counted as misses,
+    # so those counters describe reuse that actually happened.
+    discarded_hits: int = 0
 
     @property
     def hit_rate(self) -> float:
@@ -336,6 +341,7 @@ class CacheStats:
             "memory_utilization": round(self.memory_utilization, 4),
             "entry_count": self.entry_count,
             "store_rejections": self.store_rejections,
+            "discarded_hits": self.discarded_hits,
         }
 
 
@@ -1560,6 +1566,27 @@ class MemoryAwarePrefixCache:
         )
         return True
 
+    def settle_hit(self, credited: int, used: int) -> None:
+        """Correct the counters for a hit the caller used only in part.
+
+        ``fetch()`` credits ``credited`` tokens at lookup time. A caller that
+        then reuses fewer (``used``, possibly 0) reports it here so ``hits``
+        and ``tokens_saved`` count reuse, not lookups. Fully unused hits move
+        from ``hits`` to ``misses`` and are counted in ``discarded_hits``.
+        """
+        credited = max(int(credited), 0)
+        used = min(max(int(used), 0), credited)
+        if credited == used:
+            return
+        with self._memory_lock:
+            self._stats.tokens_saved = max(
+                self._stats.tokens_saved - (credited - used), 0
+            )
+            if used == 0:
+                self._stats.hits = max(self._stats.hits - 1, 0)
+                self._stats.misses += 1
+                self._stats.discarded_hits += 1
+
     def clone_for_replay(self, cache: list[Any]) -> list[Any] | None:
         """Return independently owned backing for a mutating model replay."""
         try:
@@ -1943,6 +1970,16 @@ class MemoryAwarePrefixCache:
 
                 # Load KV cache
                 cache = load_prompt_cache(entry_path)
+
+                # Same rule as prepare_store(): a restored entry must be
+                # held (and accounted) as a freshly computed one is.
+                if (
+                    self._config.kv_quantize
+                    and len(tokens) >= self._config.kv_min_quantize_tokens
+                ):
+                    cache = _quantize_cache(
+                        cache, self._config.kv_bits, self._config.kv_group_size
+                    )
 
                 # Estimate memory
                 memory = estimate_kv_cache_memory(cache)

@@ -127,12 +127,13 @@ def test_real_kv_cache_identical_prompt_matches_cold_without_replay():
         f"warm={replay_tokens} cold={cold_tokens} first={first_tokens} "
         f"hit={replay_request.cache_hit_type} cached={replay_request.cached_tokens}"
     )
-    assert replay_request.cached_tokens == 0
-    assert replay_request.remaining_tokens == prompt
-    assert replay_request.cached_tokens + len(replay_request.remaining_tokens) == len(
-        prompt
-    )
+    # Plain KV layers are rewound one position and only the last token is fed.
+    assert replay_request.cached_tokens == len(prompt) - 1
+    assert replay_request.remaining_tokens == prompt[-1:]
     assert len(warm.memory_aware_cache._entries) == 1
+    stats = warm.memory_aware_cache.get_stats()
+    assert stats["hits"] == 1 and stats["discarded_hits"] == 0
+    assert stats["tokens_saved"] == len(prompt) - 1
 
 
 def test_real_hybrid_qwen_next_turn_matches_cold():

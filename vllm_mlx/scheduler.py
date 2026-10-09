@@ -23,7 +23,12 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
-from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+from .memory_cache import (
+    MemoryAwarePrefixCache,
+    MemoryCacheConfig,
+    _is_cache_layer_trimmable,
+    _trim_cache_offset,
+)
 from .mlx_cache_compat import (
     copy_state,
     restore_from_state,
@@ -79,6 +84,7 @@ class SchedulingPolicy(Enum):
 
 
 @dataclass
+
 class SchedulerConfig:
     """Configuration for the scheduler."""
 
@@ -778,6 +784,21 @@ def _mtp_status_snapshot(batch_generator) -> Dict[str, Any]:
     return {}
 
 
+
+def _is_exactly_rewindable(layer: Any) -> bool:
+    """Whether dropping the last position of a stored layer is exact.
+
+    Plain (or quantized) KV layers can be cut back by one position. Rotating
+    windows, recurrent state and container layers cannot be reasoned about
+    here, so those prompts are prefilled instead.
+    """
+    from mlx_lm.models.cache import RotatingKVCache
+
+    if isinstance(layer, RotatingKVCache):
+        return False
+    return _is_cache_layer_trimmable(layer)
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -1256,6 +1277,16 @@ class Scheduler:
 
         return all(_matches(r, e) for r, e in zip(cache, reference))
 
+    def _settle_cache_use(self, request: Any, used: int) -> None:
+        """Tell the prefix cache how much of its credited hit was reused."""
+        credited = getattr(request, "cache_credit_tokens", 0)
+        if credited <= used:
+            return
+        request.cache_credit_tokens = used
+        cache = self.memory_aware_cache
+        if cache is not None:
+            cache.settle_hit(credited, used)
+
     def _evict_incompatible_entry(self, request: Any) -> None:
         """Drop a rejected entry from the shared prefix cache."""
         cache = self.memory_aware_cache
@@ -1553,6 +1584,7 @@ class Scheduler:
                     list(matched_key) if matched_key is not None else None
                 )
                 request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
+                request.cache_credit_tokens = request.cached_tokens
                 request.remaining_tokens = remaining
                 logger.info(
                     f"[cache_fetch] request={request.request_id[:12]} HIT "
@@ -1750,16 +1782,35 @@ class Scheduler:
                     "exact",
                     "supersequence",
                 }:
-                    logger.debug(
-                        "[cache] %s match on a full-coverage entry; "
-                        "prefilling to avoid duplicating the last token",
-                        request.cache_hit_type,
+                    reusable = request.prompt_cache is not None and all(
+                        _is_exactly_rewindable(layer)
+                        for layer in request.prompt_cache
                     )
-                    cache_to_use = None
-                    request.prompt_cache = None
-                    request.cached_tokens = 0
-                    request.remaining_tokens = request.prompt_token_ids
-                    tokens_to_process = request.prompt_token_ids
+                    if reusable:
+                        # Rewind one position on a copy (the stored entry is
+                        # untouched) and feed just the last token: the model
+                        # then sees each position exactly once.
+                        request.prompt_cache = _trim_cache_offset(
+                            request.prompt_cache, 1
+                        )
+                        request.cached_tokens = len(request.prompt_token_ids) - 1
+                        request.remaining_tokens = request.prompt_token_ids[-1:]
+                        tokens_to_process = request.remaining_tokens
+                        self._settle_cache_use(request, request.cached_tokens)
+                    else:
+                        # Non-rewindable state (hybrid/recurrent layers):
+                        # prefill instead of duplicating the last token.
+                        logger.debug(
+                            "[cache] %s match on a non-rewindable entry; "
+                            "prefilling to avoid duplicating the last token",
+                            request.cache_hit_type,
+                        )
+                        cache_to_use = None
+                        request.prompt_cache = None
+                        request.cached_tokens = 0
+                        request.remaining_tokens = request.prompt_token_ids
+                        tokens_to_process = request.prompt_token_ids
+                        self._settle_cache_use(request, 0)
                 else:
                     tokens_to_process = request.prompt_token_ids[-1:]
             elif request.remaining_tokens:
@@ -1791,6 +1842,7 @@ class Scheduler:
                 self._evict_incompatible_entry(request)
                 request.prompt_cache = None
                 request.cached_tokens = 0
+                self._settle_cache_use(request, 0)
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
@@ -1807,6 +1859,7 @@ class Scheduler:
                 # only the prompt's suffix.
                 request.prompt_cache = None
                 request.cached_tokens = 0
+                self._settle_cache_use(request, 0)
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
@@ -1870,6 +1923,7 @@ class Scheduler:
                     cache_to_use = None
                     request.prompt_cache = None
                     request.cached_tokens = 0
+                    self._settle_cache_use(request, 0)
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
                     insert_kwargs["caches"] = None
@@ -2583,6 +2637,7 @@ class Scheduler:
             request.batch_uid = None
             request.prompt_cache = None
             request.cached_tokens = 0
+            self._settle_cache_use(request, 0)
             request.remaining_tokens = request.prompt_token_ids
 
             # Move to waiting queue (at front for priority)
