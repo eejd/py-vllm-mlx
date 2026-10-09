@@ -75,6 +75,8 @@ def test_exact_ssd_hit_is_rewound_and_feeds_one_token():
 
 def test_exact_ssd_hit_on_a_rotating_window_is_prefilled():
     sched, _, rec, request, _ = _ssd_scheduler(layer_factory=_rotating)
+    # Let the entry past the KV-bound check so the rewind guard decides.
+    sched._restored_cache_matches_kv_bound = lambda cache: True
     sched._schedule_waiting()
 
     assert request.cached_tokens == 0
@@ -149,7 +151,52 @@ def test_legacy_prefix_cache_non_rewindable_exact_hit_is_prefilled():
     sched, _, rec = _setup(None)
     sched.memory_aware_cache = None
     sched.prefix_cache = _LegacyFake(layer_factory=_rotating)
+    sched._restored_cache_matches_kv_bound = lambda cache: True
     request = _run(sched, PROMPT)
 
     assert request.cached_tokens == 0
     assert rec.calls[0]["prompts"] == [PROMPT]
+
+
+def _rotating_layer_dict(tokens=8, max_size=4):
+    return {
+        "keys": mx.zeros((1, 1, tokens, 4)).tolist(),
+        "values": mx.zeros((1, 1, tokens, 4)).tolist(),
+        "offset": tokens,
+        "max_size": max_size,
+        "keep": 0,
+        "step": 256,
+        "_idx": tokens,
+    }
+
+
+def test_rotating_window_restored_from_ssd_is_not_rewindable():
+    from vllm_mlx.scheduler import _is_exactly_rewindable
+
+    sched, _, _ = _setup(None)
+    layers = sched._reconstruct_ssd_layers([_rotating_layer_dict()])
+    assert layers is not None
+    assert not _is_exactly_rewindable(layers[0])
+
+
+def test_exact_ssd_hit_on_a_restored_rotating_window_is_prefilled():
+    sched, _, rec, request, _ = _ssd_scheduler()
+    sched._ssd_tier._read_entry = lambda tokens, path: [
+        _rotating_layer_dict() for _ in range(LAYERS)
+    ]
+    del sched._reconstruct_ssd_layers  # use the real reconstruction
+    sched._restored_cache_matches_kv_bound = lambda cache: True
+    sched._schedule_waiting()
+
+    assert request.cached_tokens == 0
+    assert rec.calls[0]["prompts"] == [PROMPT]
+
+
+def test_native_quantized_kv_layer_is_not_rewindable():
+    from vllm_mlx.scheduler import _is_exactly_rewindable
+
+    plain = _kv(8, dim=64)
+    assert _is_exactly_rewindable(plain)
+    quantized = plain.to_quantized(group_size=32, bits=8)
+    assert isinstance(quantized.keys, (tuple, list))
+    assert not _is_exactly_rewindable(quantized)

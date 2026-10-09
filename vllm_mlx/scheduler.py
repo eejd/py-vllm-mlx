@@ -794,6 +794,15 @@ def _is_exactly_rewindable(layer: Any) -> bool:
 
     if isinstance(layer, RotatingKVCache):
         return False
+    # A rotating window restored from the SSD tier is rebuilt as a plain
+    # KVCache that carries the window's ``max_size``; it is still circular.
+    if getattr(layer, "max_size", None) is not None:
+        return False
+    # A native QuantizedKVCache keeps (data, scales, biases) sequences instead
+    # of one array, which ``_trim_cache_offset`` does not rewind.
+    keys = getattr(layer, "keys", None)
+    if isinstance(keys, (tuple, list)):
+        return False
     return _is_cache_layer_trimmable(layer)
 
 
