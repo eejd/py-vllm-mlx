@@ -50,11 +50,20 @@ on every cold load, including a reload after an idle unload, so `--prefix-cache-
 --prefix-cache-reset start` does not carry a cache across an idle cycle. Use `load-only` for a cache
 that must survive reloads.
 
-**Registry mode (`--models-config`) does not persist prefix caches at all**: its model manager never
-calls the load and save hooks, so these options have no effect there. The server prints a warning when
-they are given with `--models-config`, and `GET /v1/cache/stats` reports `persistence.applies: false`
-with the reason. (An earlier version of this guide said registry mode used one directory per model;
-that was wrong. It is the single-model lazy-load manager that passes the model name to the hooks.)
+**Registry mode (`--models-config`)** loads and saves persisted caches per model (eejd/py-vllm-mlx#41).
+The model manager restores a model's cache right after its cold load and saves it just before every
+unload (idle unload, eviction for memory, preemption, shutdown), each in its own subdirectory named
+for the model's `source` as written in the models file (a path or a repo id), the same directory
+single-model serving uses for that argument. Two entries with the same source share one directory
+(the server warns at startup); do not load them at the same time. The options are the global
+`--prefix-cache-*` flags; there is no per-model setting in the models file. Only entries served by
+the continuous-batching engine have the hooks: a Simple-engine entry is skipped, with a warning when
+persistence options were given, and `GET /v1/cache/stats` shows `persistence.applies: false` for that
+model with the reason. A reset at start applies on every cold load, including a reload after an
+unload, exactly as with `--auto-unload-idle-seconds`: use `load-only` for a cache that must survive
+reloads. A restore that fails (for example a reset that cannot be done safely) fails that model's
+load and stops its engine; a save that fails is logged and the unload proceeds. (An earlier version of
+this guide wrongly said registry mode used one directory per model before it did.)
 
 `python -m vllm_mlx.server` has no `--prefix-cache-*` flags; it honors `VLLM_MLX_PREFIX_CACHE_DIR`
 and otherwise behaves as `auto`/`never`. Persist and reset modes are options of `vllm-mlx serve`.

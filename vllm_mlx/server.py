@@ -1804,6 +1804,51 @@ async def _persist_engine_state(spec: ModelSpec, engine: BaseEngine) -> None:
         )
 
 
+def _persistence_requested() -> bool:
+    """Whether the user asked for anything but the default persisted-cache behavior."""
+    policy = _prefix_cache_policy
+    return (
+        policy.base_dir is not None
+        or policy.persist != "auto"
+        or policy.reset != "never"
+    )
+
+
+async def _registry_restore_engine_state(config, engine: BaseEngine) -> None:
+    """Load a registry model's persisted prefix cache after its cold load.
+
+    Keyed on the source as configured (a path or a repo id), which is what single-model
+    serving keys on, so a model has one cache directory however it is served and a new
+    snapshot of a repo id does not orphan its directory. Reset-at-start applies on every cold load, including a
+    reload after an idle unload.
+    """
+    if hasattr(engine, "load_cache_from_disk"):
+        await _run_blocking_engine_cache_io(
+            functools.partial(
+                _load_prefix_cache_from_disk, model_key=config.entry.source
+            ),
+            engine,
+        )
+    elif _persistence_requested():
+        logger.warning(
+            "Prefix-cache persistence options do not apply to model %s: %s has no "
+            "persisted prefix-cache hooks (continuous batching only)",
+            config.entry.name,
+            type(engine).__name__,
+        )
+
+
+async def _registry_persist_engine_state(config, engine: BaseEngine) -> None:
+    """Save a registry model's prefix cache before it is unloaded."""
+    if hasattr(engine, "save_cache_to_disk"):
+        await _run_blocking_engine_cache_io(
+            functools.partial(
+                _save_prefix_cache_to_disk, model_key=config.entry.source
+            ),
+            engine,
+        )
+
+
 def _activate_engine(engine: BaseEngine | None) -> BaseEngine | None:
     """Set the global engine pointer and refresh parser-sensitive state."""
     global _engine
@@ -4382,7 +4427,24 @@ def load_model_registry(
     _model_path = None
     _model_name = None
     _default_max_tokens = defaults.max_tokens
-    _model_manager = ModelManager(manager_config, registry, defaults)
+    sources: dict[str, str] = {}
+    for entry_name, entry in registry.items():
+        other = sources.setdefault(entry.source, entry_name)
+        if other != entry_name:
+            logger.warning(
+                "Models %s and %s share the source %s and therefore one persisted "
+                "prefix-cache directory; do not load them at the same time",
+                other,
+                entry_name,
+                entry.source,
+            )
+    _model_manager = ModelManager(
+        manager_config,
+        registry,
+        defaults,
+        on_engine_loaded=_registry_restore_engine_state,
+        on_engine_unloading=_registry_persist_engine_state,
+    )
 
     logger.info(
         "Loaded models config: %s (%d models, %.1f GB budget)",
@@ -4608,8 +4670,9 @@ async def status():
 def _persistence_snapshot() -> dict:
     """The persisted-prefix-cache policy and what startup/shutdown did to each directory.
 
-    ``applies`` is False in registry mode (``--models-config``): that path never loads or saves
-    a persisted prefix cache, so the policy is displayed but has no effect there.
+    ``applies`` is False when the engine has no persisted-cache hooks (the Simple engine). In
+    registry mode the policy applies per model, to each continuous-batching entry; see
+    ``_registry_cache_states`` for the per-model value.
     """
     snapshot = {
         "policy": _prefix_cache_policy.as_dict(),
@@ -4617,10 +4680,7 @@ def _persistence_snapshot() -> dict:
         "applies": True,
     }
     if _model_manager is not None:
-        snapshot["applies"] = False
-        snapshot["not_applied_reason"] = (
-            "registry mode (--models-config) does not load or save persisted prefix caches"
-        )
+        pass  # decided per model: only continuous-batching entries have the hooks
     elif _engine is not None and not hasattr(_engine, "load_cache_from_disk"):
         snapshot["applies"] = False
         snapshot["not_applied_reason"] = (
@@ -4641,13 +4701,23 @@ def _registry_cache_states(persistence: dict | None = None) -> dict:
                 stats = engine.get_cache_stats()
             except Exception as exc:  # noqa: BLE001
                 stats = {"error": f"engine cache stats failed: {exc}"}
+        model_persistence = persistence
+        if not hasattr(engine, "load_cache_from_disk"):
+            model_persistence = {
+                **persistence,
+                "applies": False,
+                "not_applied_reason": (
+                    f"{type(engine).__name__} has no persisted prefix-cache hooks "
+                    "(continuous batching only)"
+                ),
+            }
         out[name] = {
             "engine_cache": stats,
             "cache_state": _cache_state.build(
                 engine=engine,
                 launch=_cache_launch_options,
                 engine_cache=stats,
-                persistence=persistence,
+                persistence=model_persistence,
                 registry_mode=True,
             ),
         }

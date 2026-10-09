@@ -23,7 +23,7 @@ that does not follow behavior, **missing** when absent. "Unreported" below is th
 | `engine_cache` counters (`hits`, `misses`, `evictions`, `tokens_saved`, `entry_count`, `current_memory_mb`) | **trie counters at the top level when the trie cache is on**; `system_kv_cache` (capacity 4) stays nested | **real**, but see the exact-repeat caveat below | `engine_cache` is null at top level (no default engine); per-model under `models` (this PR) |
 | Effective memory limit and how it was derived | n/a (no memory-aware cache) | **real** (this PR): `memory_limit` = `{source: percent_of_available, percent, available_bytes, bytes}`; was invisible before | per model |
 | `cache_state` block | **real** (this PR): engine class, launch options, inert options, versions; counters `unreported` with a reason | **real**; the batched MLLM engine nests its stats under `prefix_cache`, which `cache_state` unwraps | top level says "registry mode keeps no single default engine"; per model under `models`, where `engine.continuous_batching` comes from the model's engine class and `launch_options`/`inert_options` are `unreported` (registry entries choose their own engine, so the CLI flags do not describe them) |
-| Persisted prefix cache (`persistence`) | not loaded or saved (no hooks): `persistence.applies: false` with the engine class named. In the single-model lazy-load mode `applies` is true until the engine is loaded and may turn false once a Simple engine is in place | loaded and saved per `--prefix-cache-*` | **not applicable**: `persistence.applies: false` (eejd/py-vllm-mlx#41) |
+| Persisted prefix cache (`persistence`) | not loaded or saved (no hooks): `persistence.applies: false` with the engine class named. In the single-model lazy-load mode `applies` is true until the engine is loaded and may turn false once a Simple engine is in place | loaded and saved per `--prefix-cache-*` | loaded after each cold load and saved before each unload, per model directory; `applies: false` for a Simple-engine entry (eejd/py-vllm-mlx#41) |
 | `GET /v1/status` cache section | **missing** (`cache` key absent in the probe; per the code, `--prefix-trie-cache` stats come from `SimpleEngine.get_stats` and are not in `/v1/cache/stats`; the trie was off in the probe, so this is not verified live) | **real** (same numbers as `engine_cache`) | only `model_manager` |
 | `GET /metrics` prefix-cache series | the unlabeled `vllm_mlx_cache_*` gauges plus per-model `vllm_mlx_prefix_cache_*` series from the trie counters when the trie cache is on (eejd/py-vllm-mlx#42); the unlabeled gauges are zero-fill with `vllm_mlx_cache_stats_reported 0` otherwise, and no per-model series is exported | `vllm_mlx_cache_*` gauges (hits, misses, evictions, tokens saved, entries, memory, limit, `discarded_hits`) plus per-model `vllm_mlx_prefix_cache_*` series incl. the limit's derivation (`source` label) | per-model `vllm_mlx_prefix_cache_*` series for every loaded model; the unlabeled gauges describe the most recently used one |
 | `DELETE /v1/cache` | clears (nothing material to clear) | clears: entries and counters back to 0, next request cold again (probe: entry_count 2 -> 0, hits 2 -> 0) | per the engine |
@@ -102,7 +102,7 @@ on for pure-LLM streaming chat) and, when asked for, the prefix-trie cache (mlx-
 | `inert_options` | flags the user set to a non-default value that this engine mode ignores |
 | `memory_limit` | `{bytes, source}` with `source` one of `explicit` (`max_memory_mb`), `percent_of_available` (plus `percent`, `available_bytes`: **RAM free at cache creation, so it differs between starts**), `fallback_8gb`; or `unreported` |
 | `counters` | `hits`, `misses`, `evictions`, `tokens_saved`, `entry_count`, `current_memory_mb`, `max_memory_mb`; or `unreported` with a reason. Monotonic until `DELETE /v1/cache` or a restart |
-| `persistence` | the existing block (`policy`, `dirs`) plus `applies` (false in registry mode and for engines without persistence hooks) and `not_applied_reason`. In registry mode every model shows the same server-wide block; it is not per model |
+| `persistence` | the existing block (`policy`, `dirs`) plus `applies` (false for engines without persistence hooks) and `not_applied_reason`. In registry mode the `dirs` block is server-wide (one directory per model) and `applies` is set per model |
 
 ## Fingerprint of a persisted cache
 
@@ -123,7 +123,6 @@ quantization is on; they are now quantized on load under the same rule as fresh 
 
 | Issue | Gap |
 |---|---|
-| #41 | registry mode never loads or saves persisted caches |
 | #43 | Responses API / MLLM cached-token counts are constants |
 | #44 | Simple engine reports no reuse |
 

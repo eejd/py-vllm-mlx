@@ -104,6 +104,9 @@ ContentionStrategy = Literal[
 ]
 
 EngineFactory = Callable[["ResolvedModelConfig"], BaseEngine]
+# Called with the resolved config and the engine: after a cold load has started the engine
+# (``on_engine_loaded``) and before an unload stops it (``on_engine_unloading``).
+EngineHook = Callable[["ResolvedModelConfig", BaseEngine], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -714,11 +717,15 @@ class ModelManager:
         defaults: RegistryServeDefaults,
         *,
         engine_factory: EngineFactory | None = None,
+        on_engine_loaded: EngineHook | None = None,
+        on_engine_unloading: EngineHook | None = None,
     ) -> None:
         self._config = manager_config
         self._registry = registry
         self._defaults = defaults
         self._engine_factory = engine_factory
+        self._on_engine_loaded = on_engine_loaded
+        self._on_engine_unloading = on_engine_unloading
         self._loaded: dict[str, LoadedModel] = {}
         self._loading: dict[str, PendingLoad] = {}
         self._unloading: dict[str, LoadedModel] = {}
@@ -1034,12 +1041,21 @@ class ModelManager:
         try:
             resolved_source = await self._resolve_source(entry)
             loaded = await self._instantiate_model(entry, resolved_source)
-        except Exception as exc:
-            async with self._condition:
-                current = self._loading.pop(pending.model_name, None)
-                if current is pending and not current.future.done():
-                    current.future.set_exception(exc)
-                self._condition.notify_all()
+        except BaseException as exc:
+            # Also on cancellation (a client that disconnects during a first load): the
+            # reservation and the pending future must be released or every later
+            # acquire of this model waits on a future nobody will resolve.
+            failure = (
+                exc
+                if isinstance(exc, Exception)
+                else RuntimeError("Model load was cancelled")
+            )
+            with suspend_cancellation():
+                async with self._condition:
+                    current = self._loading.pop(pending.model_name, None)
+                    if current is pending and not current.future.done():
+                        current.future.set_exception(failure)
+                    self._condition.notify_all()
             raise
 
         async with self._condition:
@@ -1077,6 +1093,15 @@ class ModelManager:
         async def _stop_engines() -> None:
             for loaded in unloads:
                 try:
+                    if self._on_engine_unloading is not None:
+                        try:
+                            await self._on_engine_unloading(loaded.config, loaded.engine)
+                        except Exception:
+                            logger.warning(
+                                "Unload hook failed for model %s; stopping it anyway",
+                                loaded.config.entry.name,
+                                exc_info=True,
+                            )
                     await loaded.engine.stop()
                 finally:
                     async with self._condition:
@@ -1245,6 +1270,22 @@ class ModelManager:
             )
 
         await engine.start()
+        if self._on_engine_loaded is not None:
+            try:
+                await self._on_engine_loaded(config, engine)
+            except BaseException:
+                # A load that cannot finish its setup must not leave a started engine behind.
+                with suspend_cancellation():
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        # Keep the hook's own error as the cause the caller sees.
+                        logger.warning(
+                            "Stopping model %s after a failed load hook also failed",
+                            config.entry.name,
+                            exc_info=True,
+                        )
+                raise
         return LoadedModel(config=config, engine=engine)
 
     async def _resolve_source(self, entry: RegisteredModel) -> str:

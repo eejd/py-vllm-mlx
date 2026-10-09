@@ -245,17 +245,6 @@ def test_nothing_is_inert_with_defaults_or_with_continuous_batching():
     assert cache_state.launch_options(cb)["kv_cache_quantization"]["effective"] is True
 
 
-def test_registry_mode_ignores_persistence_options_and_the_cli_says_so():
-    quiet = _args("--models-config", "m.yaml")
-    assert cache_state.registry_ignores_persistence(quiet) is False  # defaults: nothing to warn
-    for extra in (["--prefix-cache-dir", "/x"], ["--prefix-cache-persist", "none"],
-                  ["--prefix-cache-reset", "start"]):
-        ns = create_parser().parse_args(["serve", "--models-config", "m.yaml", *extra])
-        assert cache_state.registry_ignores_persistence(ns) is True, extra
-    # single-model serving honors them: no warning
-    assert cache_state.registry_ignores_persistence(_args("--prefix-cache-persist", "none")) is False
-
-
 # --- the cache_state block ------------------------------------------------------------------
 
 
@@ -523,7 +512,7 @@ async def test_batched_mllm_branches_carry_cached_tokens(cached):
 # --- registry mode: per-model state ----------------------------------------------------------
 
 
-def test_registry_mode_reports_each_loaded_model_and_that_persistence_does_not_apply(
+def test_registry_mode_reports_each_loaded_model_and_whether_persistence_applies_to_it(
     monkeypatch, tmp_path
 ):
     import vllm_mlx.server as server
@@ -531,8 +520,10 @@ def test_registry_mode_reports_each_loaded_model_and_that_persistence_does_not_a
     from vllm_mlx.prefix_cache_persistence import PersistencePolicy
 
     class Eng:
-        def __init__(self, hits):
+        def __init__(self, hits, persistent=True):
             self.hits = hits
+            if persistent:
+                self.load_cache_from_disk = lambda d: 0
 
         def get_cache_stats(self):
             return {"hits": self.hits, "misses": 0, "evictions": 0, "tokens_saved": 0,
@@ -540,7 +531,7 @@ def test_registry_mode_reports_each_loaded_model_and_that_persistence_does_not_a
 
     class Manager:
         def loaded_engines(self):
-            return [("a", Eng(1)), ("b", Eng(2))]
+            return [("a", Eng(1)), ("b", Eng(2, persistent=False))]
 
     server.set_prefix_cache_policy(PersistencePolicy(base_dir=str(tmp_path)))
     monkeypatch.setattr(server, "_engine", None)
@@ -555,8 +546,11 @@ def test_registry_mode_reports_each_loaded_model_and_that_persistence_does_not_a
     assert set(body["models"]) == {"a", "b"}
     assert body["models"]["a"]["cache_state"]["counters"]["hits"] == 1
     assert body["models"]["b"]["cache_state"]["counters"]["hits"] == 2
-    for p in (body["persistence"], body["models"]["a"]["cache_state"]["persistence"]):
-        assert p["applies"] is False and "registry mode" in p["not_applied_reason"]
+    # persistence applies to a continuous-batching model, not to a Simple one
+    assert body["persistence"]["applies"] is True
+    assert body["models"]["a"]["cache_state"]["persistence"]["applies"] is True
+    simple = body["models"]["b"]["cache_state"]["persistence"]
+    assert simple["applies"] is False and "no persisted prefix-cache hooks" in simple["not_applied_reason"]
 
 
 def test_persistence_applies_outside_registry_mode(monkeypatch):
