@@ -50,7 +50,7 @@ class _Fresh:
         return self
 
 
-def _generator(monkeypatch, stored_tokens=None, layer=_kv):
+def _generator(monkeypatch, stored_tokens=None, layer=_kv, think_suffix=0):
     cache = MemoryAwarePrefixCache(
         _Model(),
         MemoryCacheConfig(max_memory_mb=64, max_entries=10, min_prefix_tokens=1),
@@ -80,7 +80,7 @@ def _generator(monkeypatch, stored_tokens=None, layer=_kv):
     gen._prefix_checkpoint_lock = threading.Lock()
     gen._request_prefix_checkpoints = {}
     gen.prefix_cache = cache
-    gen._think_suffix_len = 0
+    gen._think_suffix_len = think_suffix
     gen.prefill_step_size = 512
     gen.language_model = lambda tokens, **kw: mx.zeros((1, tokens.shape[1], 4))
     gen._language_model_kwargs = lambda *a, **k: {}
@@ -220,3 +220,52 @@ def test_scheduler_status_reports_the_value():
     s, req = _mllm_scheduler(5)
     s._process_batch_responses([_Resp(1, 5)])
     assert req.cached_tokens == 5
+
+
+@pytest.mark.parametrize(
+    "stored,expected",
+    [
+        (PROMPT[:5], 5),  # prefix hit: the suffix tokens are always re-fed
+        (PROMPT[:6], 6),  # entry equals the lookup ids (prompt minus suffix)
+        (PROMPT[:3] + [90, 91, 92], 3),  # longest common prefix
+    ],
+)
+def test_think_suffix_does_not_change_what_is_credited_or_reported(
+    monkeypatch, stored, expected
+):
+    gen, cache = _generator(monkeypatch, stored, think_suffix=2)
+    MLLMBatchGenerator._process_prompts(gen, [_request()])
+
+    assert gen.pop_cached_tokens("r1") == expected
+    hits, _, saved, discarded = _stats(cache)
+    assert (hits, saved, discarded) == (1, expected, 0)
+
+
+def test_exact_hit_replayed_from_cached_logits_uses_every_token(monkeypatch):
+    gen, cache = _generator(monkeypatch, PROMPT)
+    gen.prefix_cache.fetch_exact_auxiliary = lambda ids: {
+        "last_logits": mx.zeros((1, 4))
+    }
+    MLLMBatchGenerator._process_prompts(gen, [_request()])
+
+    assert gen.pop_cached_tokens("r1") == 8
+    assert _stats(cache) == (1, 0, 8, 0)
+
+
+def test_clone_failure_falls_through_and_gives_the_hit_back(monkeypatch):
+    gen, cache = _generator(monkeypatch, PROMPT[:5])
+    gen._clone_prefix_for_replay = lambda cached: None
+    MLLMBatchGenerator._process_prompts(gen, [_request()])
+
+    assert gen.pop_cached_tokens("r1") == 0
+    assert _stats(cache) == (0, 1, 0, 1)
+
+
+def test_table_trim_survives_a_concurrent_change(monkeypatch):
+    class Racy(dict):
+        def pop(self, key, *default):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    gen, _ = _generator(monkeypatch, None)
+    gen._cache_reuse = Racy({f"x{i}": 1 for i in range(5000)})
+    gen._record_cache_use(_request(), 0, 3)  # must not raise

@@ -894,8 +894,12 @@ class MLLMBatchGenerator:
             used = min(used, limit)
         table = self._reuse_table()
         table[req.request_id] = used
-        while len(table) > 4096:
-            table.pop(next(iter(table)))
+        try:
+            while len(table) > 4096:
+                table.pop(next(iter(table)), None)
+        except (RuntimeError, StopIteration):
+            # An abort on another thread changed the table while we trimmed it.
+            pass
         if credited > used:
             settle = getattr(self.prefix_cache, "settle_hit", None)
             if callable(settle):

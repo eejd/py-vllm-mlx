@@ -683,7 +683,13 @@ class MLLMScheduler:
             if request.cached_tokens is None and generator is not None:
                 reused = generator.pop_cached_tokens(request_id)
                 if reused is not None:
-                    request.cached_tokens = min(reused, request.num_prompt_tokens)
+                    # The generator already clamps to the real input length;
+                    # this only guards against a larger token estimate.
+                    request.cached_tokens = (
+                        min(reused, request.num_prompt_tokens)
+                        if request.num_prompt_tokens > 0
+                        else reused
+                    )
 
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
