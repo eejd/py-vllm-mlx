@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # former silently sent the latter to the generic fallback below.
 _TEXT_MODEL_FAMILIES: tuple[tuple[str, str, tuple[str, str]], ...] = (
     ("gemma4", "mlx_lm.models.gemma4_text", ("Model", "ModelArgs")),
+    ("ministral3", "mlx_lm.models.ministral3", ("Model", "ModelArgs")),
 )
 
 # Fallback. qwen3_5.TextModel and TextModelArgs handle both dense and MoE
@@ -72,6 +73,34 @@ def _import_text_model_classes(model_type: str):
     return getattr(module, model_attr), getattr(module, args_attr)
 
 
+def _align_tied_embeddings(
+    args: Any, vlm_weights: list[tuple[str, mx.array]], model_type: str
+) -> None:
+    """Make ``args.tie_word_embeddings`` agree with the loaded vlm weights.
+
+    The vlm loader is the source of truth for the checkpoint: its language
+    model either owns an ``lm_head`` or reads logits through the embedding
+    table. The extracted TextModel's own argument default may differ (mlx-lm's
+    ``ministral3.ModelArgs`` defaults to tied, while Ministral-3 checkpoints
+    keep ``tie_word_embeddings: false`` at the top level, outside the
+    ``text_config`` it is built from). A skeleton without the ``lm_head`` the
+    weights carry silently drops it under ``strict=False`` and decodes through
+    the embeddings: garbage logits, no error.
+    """
+    if not hasattr(args, "tie_word_embeddings"):
+        return
+    has_lm_head = any(name.startswith("lm_head.") for name, _ in vlm_weights)
+    if bool(args.tie_word_embeddings) == has_lm_head:
+        logger.warning(
+            "model_type=%r: TextModel args say tie_word_embeddings=%s but the vlm "
+            "weights %s an lm_head; following the weights",
+            model_type,
+            args.tie_word_embeddings,
+            "carry" if has_lm_head else "have no",
+        )
+        args.tie_word_embeddings = not has_lm_head
+
+
 def build_text_model(
     vlm_model: Any, model_path: str | Path, *, enable_mtp: bool = True
 ) -> Any | None:
@@ -114,12 +143,14 @@ def build_text_model(
         # Build args with proper __post_init__ (handles partial_rotary_factor,
         # rope_scaling, head_dim derivation)
         args = TextModelArgs.from_dict(text_config)
+
+        vlm_lm = vlm_model.language_model
+        vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
+        _align_tied_embeddings(args, vlm_weights, model_type)
         text_model = TextModel(args)
 
         # Keep the ordinary text route independent from draft tensors unless
         # the serving engine explicitly enabled speculative MTP decoding.
-        vlm_lm = vlm_model.language_model
-        vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
         mtp_weights = _load_mtp_weights(model_path) if enable_mtp else []
 
         all_weight_names = set(name for name, _ in vlm_weights)
