@@ -63,6 +63,7 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`, `lfm2`, `minicpm`; see the tool-calling guide for the full list) | None |
 | `--models-config` | YAML registry file for multi-model serving | None |
 | `--memory-budget-gb` | Override the registry manager model-weight residency budget in GB. This is not a total runtime-memory limit and does not guarantee prevention of Metal/MLX OOM. | YAML manager budget |
+| `--fp32-matmul-precision` | Precision of float32 matmul, attention and convolution on GPUs with matrix units (Apple M5 and later): `highest` keeps full float32, `high` allows MLX's reduced TF32-class precision. Unset leaves MLX's default and `MLX_ENABLE_TF32` in effect. Half-precision and quantized models with half-precision activations are unaffected. Also accepted by `vllm-mlx bench`. | Unset (MLX default: `high`) |
 
 ### Examples
 

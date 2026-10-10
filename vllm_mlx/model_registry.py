@@ -1095,7 +1095,9 @@ class ModelManager:
                 try:
                     if self._on_engine_unloading is not None:
                         try:
-                            await self._on_engine_unloading(loaded.config, loaded.engine)
+                            await self._on_engine_unloading(
+                                loaded.config, loaded.engine
+                            )
                         except Exception:
                             logger.warning(
                                 "Unload hook failed for model %s; stopping it anyway",

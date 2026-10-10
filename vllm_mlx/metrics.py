@@ -503,7 +503,9 @@ class MetricsCollector:
                 cache_type = "prefix_trie_cache"
                 cache_stats = simple_stats
 
-        self._prom["cache_stats_reported"].set(1 if isinstance(cache_stats, dict) else 0)
+        self._prom["cache_stats_reported"].set(
+            1 if isinstance(cache_stats, dict) else 0
+        )
         self._prom["cache_discarded_hits"].set(
             _coerce_float(cache_stats.get("discarded_hits", 0))
             if isinstance(cache_stats, dict)
@@ -648,7 +650,9 @@ class MetricsCollector:
                 ).set(_coerce_float(limit["bytes"]))
 
         persistence = persistence or {}
-        dirs = [d for d in (persistence.get("dirs") or {}).values() if isinstance(d, dict)]
+        dirs = [
+            d for d in (persistence.get("dirs") or {}).values() if isinstance(d, dict)
+        ]
         self._prom["pc_persist_applies"].set(1 if persistence.get("applies") else 0)
         self._prom["pc_persist_loaded"].set(
             sum(_coerce_int(d.get("loaded")) for d in dirs)

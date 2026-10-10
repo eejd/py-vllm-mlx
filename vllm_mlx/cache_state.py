@@ -82,7 +82,9 @@ def apply_simple_prefix_cache_flags(args: Any) -> str | None:
         blockers = []
         if getattr(args, "enable_mtp", False):
             blockers.append("--enable-mtp")
-        if getattr(args, "specprefill", False) and getattr(args, "specprefill_draft_model", None):
+        if getattr(args, "specprefill", False) and getattr(
+            args, "specprefill_draft_model", None
+        ):
             blockers.append("--specprefill with a draft model")
         if (getattr(args, "max_kv_size", None) or 0) > 0:
             blockers.append("--max-kv-size")
@@ -118,7 +120,9 @@ def launch_options(args: Any) -> dict[str, Any]:
             getattr(args, "enable_prefix_cache", True)
             and not getattr(args, "disable_prefix_cache", False)
         ),
-        "memory_aware_cache_requested": not getattr(args, "no_memory_aware_cache", False),
+        "memory_aware_cache_requested": not getattr(
+            args, "no_memory_aware_cache", False
+        ),
         "cache_memory_mb": getattr(args, "cache_memory_mb", None),
         "cache_memory_percent": getattr(args, "cache_memory_percent", None),
         "use_paged_cache": bool(getattr(args, "use_paged_cache", False)),
@@ -201,7 +205,11 @@ def build(
         inert: Any = launch_block
     else:
         batching = bool(launch.get("continuous_batching")) if launch else UNREPORTED
-        launch_block = launch if launch is not None else _unreported("server not started via the CLI")
+        launch_block = (
+            launch
+            if launch is not None
+            else _unreported("server not started via the CLI")
+        )
         inert = (launch or {}).get("inert_options", UNREPORTED)
 
     # The batched MLLM engine nests its prefix-cache stats one level down.
@@ -212,7 +220,11 @@ def build(
 
     counters: dict[str, Any] | dict[str, str]
     memory_limit: Any
-    if isinstance(engine_cache, dict) and "error" not in engine_cache and "hits" in engine_cache:
+    if (
+        isinstance(engine_cache, dict)
+        and "error" not in engine_cache
+        and "hits" in engine_cache
+    ):
         counters = {k: engine_cache[k] for k in _COUNTER_KEYS if k in engine_cache}
         memory_limit = engine_cache.get("memory_limit") or _unreported(
             "the cache did not record how its memory limit was derived"

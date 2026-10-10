@@ -4052,7 +4052,8 @@ def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
 def _should_finalize_tool_stream(tool_parser, tool_result) -> bool:
     """Whether the end-of-stream hook runs: nothing was emitted on the last delta, the
     parser needs every delta, or the parser can still hold a call after emitting one
-    (FINALIZE_AFTER_RESULT: a closed call and an unterminated tail in the same delta)."""
+    (FINALIZE_AFTER_RESULT: a closed call and an unterminated tail in the same delta).
+    """
     return (
         tool_result is None
         or _requires_eager_tool_streaming(tool_parser)
@@ -4533,10 +4534,13 @@ async def metrics():
                     engine_cache = registry_states[name]["engine_cache"]
         elif _engine is not None:
             engine_cache = (
-                _engine.get_cache_stats() if hasattr(_engine, "get_cache_stats") else None
+                _engine.get_cache_stats()
+                if hasattr(_engine, "get_cache_stats")
+                else None
             )
             cache_states = {
-                _model_name or "default": _cache_state.build(
+                _model_name
+                or "default": _cache_state.build(
                     engine=_engine,
                     launch=_cache_launch_options,
                     engine_cache=engine_cache,
@@ -6506,9 +6510,11 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
                 _disconnect_guard(
                     _stream_responses_request(request, engine=engine),
                     raw_request,
-                    cleanup=_make_release_cleanup(raw_request)
-                    if engine is not None
-                    else None,
+                    cleanup=(
+                        _make_release_cleanup(raw_request)
+                        if engine is not None
+                        else None
+                    ),
                 ),
                 media_type="text/event-stream",
             )
