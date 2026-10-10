@@ -446,7 +446,10 @@ async def test_exact_repeat_reports_the_tokens_the_cache_supplied():
     fake = _growing_responses([ord("X")])
 
     with (
-        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            side_effect=lambda *_: [GrowingCache()],
+        ),
         patch("mlx_lm.stream_generate", side_effect=fake),
     ):
         first = await _collect(engine, MESSAGES)
@@ -456,8 +459,9 @@ async def test_exact_repeat_reports_the_tokens_the_cache_supplied():
     assert first[-1].cached_tokens == 0
     # all but the last prompt token come from the cache; only that one is fed
     assert second[-1].cached_tokens == prompt_tokens - 1
-    assert fake.seen_prompts[1] == [FakeTokenizer().encode(
-        FakeTokenizer().apply_chat_template(MESSAGES))[-1]]
+    assert fake.seen_prompts[1] == [
+        FakeTokenizer().encode(FakeTokenizer().apply_chat_template(MESSAGES))[-1]
+    ]
 
 
 async def test_non_streaming_chat_uses_the_cache_when_it_is_enabled():
@@ -466,7 +470,10 @@ async def test_non_streaming_chat_uses_the_cache_when_it_is_enabled():
     fake = _growing_responses([ord("X")])
 
     with (
-        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            side_effect=lambda *_: [GrowingCache()],
+        ),
         patch("mlx_lm.stream_generate", side_effect=fake),
     ):
         first = await engine.chat(MESSAGES, max_tokens=4, temperature=0.0, top_p=1.0)
@@ -501,7 +508,10 @@ async def test_cache_stats_expose_the_trie_counters_at_the_top_level():
     fake = _growing_responses([ord("X")])
 
     with (
-        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            side_effect=lambda *_: [GrowingCache()],
+        ),
         patch("mlx_lm.stream_generate", side_effect=fake),
     ):
         await _collect(engine, MESSAGES)
@@ -524,7 +534,10 @@ async def test_cache_state_counters_are_filled_for_the_simple_engine():
     engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
     fake = _growing_responses([ord("X")])
     with (
-        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            side_effect=lambda *_: [GrowingCache()],
+        ),
         patch("mlx_lm.stream_generate", side_effect=fake),
     ):
         await _collect(engine, MESSAGES)
@@ -554,7 +567,10 @@ async def test_trie_cache_works_with_an_unhashable_model_object():
     fake = _growing_responses([ord("X")])
 
     with (
-        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            side_effect=lambda *_: [GrowingCache()],
+        ),
         patch("mlx_lm.stream_generate", side_effect=fake),
     ):
         await _collect(engine, MESSAGES)
@@ -570,7 +586,10 @@ async def test_clearing_the_runtime_caches_drops_the_trie_and_its_counters():
     engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
     fake = _growing_responses([ord("X")])
     with (
-        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            side_effect=lambda *_: [GrowingCache()],
+        ),
         patch("mlx_lm.stream_generate", side_effect=fake),
     ):
         await _collect(engine, MESSAGES)
@@ -606,8 +625,13 @@ async def test_non_streaming_chat_keeps_the_specprefill_outcome():
     async def fake_stream_chat(*_a, **_k):
         from vllm_mlx.engine.base import GenerationOutput
 
-        yield GenerationOutput(text="ok", finished=True, finish_reason="stop",
-                               specprefill_outcome=outcome, cached_tokens=3)
+        yield GenerationOutput(
+            text="ok",
+            finished=True,
+            finish_reason="stop",
+            specprefill_outcome=outcome,
+            cached_tokens=3,
+        )
 
     engine.stream_chat = fake_stream_chat
     out = await engine.chat(MESSAGES, max_tokens=4)
@@ -624,7 +648,10 @@ async def test_the_system_snapshot_cache_can_be_switched_off(monkeypatch):
         {"role": "user", "content": "first"},
     ]
     with (
-        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            side_effect=lambda *_: [GrowingCache()],
+        ),
         patch("mlx_lm.stream_generate", side_effect=fake),
         patch.object(engine, "stream_generate") as uncached,
     ):
@@ -643,7 +670,10 @@ async def test_stats_never_wait_for_a_worker_holding_the_trie_lock():
     engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
     fake = _growing_responses([ord("X")])
     with (
-        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=lambda *_: [GrowingCache()]),
+        patch(
+            "mlx_lm.models.cache.make_prompt_cache",
+            side_effect=lambda *_: [GrowingCache()],
+        ),
         patch("mlx_lm.stream_generate", side_effect=fake),
     ):
         await _collect(engine, MESSAGES)
@@ -665,6 +695,7 @@ async def test_stats_never_wait_for_a_worker_holding_the_trie_lock():
 async def test_cache_level_memory_is_in_binary_megabytes_like_the_other_engines():
     engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
     fake = _growing_responses([ord("X")])
+
     def big_cache(*_):
         layer = GrowingCache()
         layer.nbytes = 3 * 1024 * 1024

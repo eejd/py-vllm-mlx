@@ -1439,7 +1439,6 @@ class StreamingXMLToolCallParser:
 # ---------------------------------------------------------------------------
 
 
-
 def repair_json_arguments(raw: str) -> str | None:
     """``raw`` if it is a JSON object, the object with missing closing braces added if that makes
     it one (the model stopped before ``</function>``), else ``None``.
@@ -1527,9 +1526,13 @@ class Qwen3XMLToolParser(ToolParser):
                 fixed = repair_json_arguments(arguments)
             else:
                 # Cut off mid-value, or no way to tell: keep the call only if already valid.
-                fixed = arguments if repair_json_arguments(arguments) == arguments else None
+                fixed = (
+                    arguments if repair_json_arguments(arguments) == arguments else None
+                )
             if fixed is None:
-                dropped.append("<function=" + segments[i] if aligned else tc.function.name)
+                dropped.append(
+                    "<function=" + segments[i] if aligned else tc.function.name
+                )
                 continue
             tool_calls.append(
                 {

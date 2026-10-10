@@ -1259,7 +1259,9 @@ models:
 # --- lifecycle hooks: persisted prefix caches in registry mode (#41) -------------------------
 
 
-def _hooked_manager(tmp_path, sizes, events, *, fail_load=False, fail_unload=False, budget_gb=8):
+def _hooked_manager(
+    tmp_path, sizes, events, *, fail_load=False, fail_unload=False, budget_gb=8
+):
     registry = _registry(tmp_path, sizes)
     created: dict[str, list[FakeEngine]] = {}
 
@@ -1325,7 +1327,9 @@ def test_eviction_saves_the_evicted_model_and_loads_the_new_one(tmp_path):
         second = await manager.acquire("beta")  # does not fit next to alpha
         await second.release()
         assert [e[:2] for e in events] == [
-            ("load", "alpha"), ("save", "alpha"), ("load", "beta"),
+            ("load", "alpha"),
+            ("save", "alpha"),
+            ("load", "beta"),
         ]
         assert created["alpha"][0].stopped == 1
         await manager.shutdown()
@@ -1344,7 +1348,9 @@ def test_a_reload_runs_the_load_hook_again(tmp_path):
             lease = await manager.acquire(name)
             await lease.release()
         assert [e[:2] for e in events if e[0] == "load"] == [
-            ("load", "alpha"), ("load", "beta"), ("load", "alpha"),
+            ("load", "alpha"),
+            ("load", "beta"),
+            ("load", "alpha"),
         ]
         await manager.shutdown()
 
@@ -1354,7 +1360,9 @@ def test_a_reload_runs_the_load_hook_again(tmp_path):
 def test_a_failing_load_hook_stops_the_engine_and_fails_the_acquire(tmp_path):
     async def _run():
         events: list = []
-        manager, created = _hooked_manager(tmp_path, {"alpha": 4}, events, fail_load=True)
+        manager, created = _hooked_manager(
+            tmp_path, {"alpha": 4}, events, fail_load=True
+        )
         with pytest.raises(RuntimeError, match="restore failed"):
             await manager.acquire("alpha")
         assert created["alpha"][0].started == 1 and created["alpha"][0].stopped == 1
@@ -1366,7 +1374,9 @@ def test_a_failing_load_hook_stops_the_engine_and_fails_the_acquire(tmp_path):
 def test_a_failing_unload_hook_still_stops_the_engine(tmp_path):
     async def _run():
         events: list = []
-        manager, created = _hooked_manager(tmp_path, {"alpha": 4}, events, fail_unload=True)
+        manager, created = _hooked_manager(
+            tmp_path, {"alpha": 4}, events, fail_unload=True
+        )
         lease = await manager.acquire("alpha")
         await lease.release()
         await manager.shutdown()
@@ -1379,7 +1389,9 @@ def test_a_manager_without_hooks_behaves_as_before(tmp_path):
     async def _run():
         registry = _registry(tmp_path, {"alpha": 4})
         manager = ModelManager(
-            _manager_config(budget_gb=8), registry, _defaults(),
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
             engine_factory=lambda config: FakeEngine(config),
         )
         lease = await manager.acquire("alpha")
@@ -1407,7 +1419,9 @@ def test_cancelling_a_load_during_the_hook_does_not_wedge_the_model(tmp_path):
                 stopped.append(self)
 
         manager = ModelManager(
-            _manager_config(budget_gb=8), registry, _defaults(),
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
             engine_factory=lambda config: Tracked(config),
             on_engine_loaded=on_loaded,
         )
@@ -1439,7 +1453,9 @@ def test_a_stop_failure_after_a_failed_load_hook_keeps_the_hooks_error(tmp_path)
                 raise OSError("stop failed")
 
         manager = ModelManager(
-            _manager_config(budget_gb=8), registry, _defaults(),
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
             engine_factory=lambda config: BadStop(config),
             on_engine_loaded=on_loaded,
         )

@@ -29,16 +29,28 @@ def test_usage_omits_details_when_unreported():
 
 
 def test_usage_reports_zero_cached_tokens_as_zero_not_omitted():
-    u = Usage(prompt_tokens=5, prompt_tokens_details=PromptTokensDetails(cached_tokens=0))
+    u = Usage(
+        prompt_tokens=5, prompt_tokens_details=PromptTokensDetails(cached_tokens=0)
+    )
     assert u.model_dump()["prompt_tokens_details"] == {"cached_tokens": 0}
 
 
 def test_get_usage_distinguishes_unreported_zero_and_positive():
     from vllm_mlx.server import get_usage
 
-    unreported = get_usage(GenerationOutput(text="x", prompt_tokens=9, completion_tokens=1))
-    zero = get_usage(GenerationOutput(text="x", prompt_tokens=9, completion_tokens=1, cached_tokens=0))
-    some = get_usage(GenerationOutput(text="x", prompt_tokens=9, completion_tokens=1, cached_tokens=6))
+    unreported = get_usage(
+        GenerationOutput(text="x", prompt_tokens=9, completion_tokens=1)
+    )
+    zero = get_usage(
+        GenerationOutput(
+            text="x", prompt_tokens=9, completion_tokens=1, cached_tokens=0
+        )
+    )
+    some = get_usage(
+        GenerationOutput(
+            text="x", prompt_tokens=9, completion_tokens=1, cached_tokens=6
+        )
+    )
     assert unreported.prompt_tokens_details is None
     assert zero.prompt_tokens_details.cached_tokens == 0
     assert some.prompt_tokens_details.cached_tokens == 6
@@ -58,7 +70,12 @@ def test_collector_merge_keeps_the_latest_reported_value():
     first = RequestOutput(request_id="r", new_text="a", cached_tokens=4)
     later = RequestOutput(request_id="r", new_text="b")  # producer ahead of consumer
     assert c._merge_outputs(first, later).cached_tokens == 4
-    assert c._merge_outputs(first, RequestOutput(request_id="r", cached_tokens=5)).cached_tokens == 5
+    assert (
+        c._merge_outputs(
+            first, RequestOutput(request_id="r", cached_tokens=5)
+        ).cached_tokens
+        == 5
+    )
 
 
 class _Resp:
@@ -79,7 +96,9 @@ def _scheduler():
 @pytest.mark.parametrize("cached", [0, 3])
 def test_scheduler_copies_the_requests_cached_tokens_onto_its_output(cached):
     s = _scheduler()
-    req = Request(request_id="a", prompt="one two three four", sampling_params=SamplingParams())
+    req = Request(
+        request_id="a", prompt="one two three four", sampling_params=SamplingParams()
+    )
     req.output_token_ids = [1]  # skip the prompt-only cache store
     req.cached_tokens = cached
     s.running = {"a": req}
@@ -125,8 +144,12 @@ class _Engine:
 
     def _out(self, **kw):
         return GenerationOutput(
-            text="ok", prompt_tokens=10, completion_tokens=2, finish_reason="stop",
-            cached_tokens=self.cached, **kw,
+            text="ok",
+            prompt_tokens=10,
+            completion_tokens=2,
+            finish_reason="stop",
+            cached_tokens=self.cached,
+            **kw,
         )
 
     async def chat(self, messages, **kwargs):
@@ -147,7 +170,9 @@ class _Engine:
 async def test_chat_completion_usage_reports_cached_tokens(monkeypatch, cached, expect):
     server = _patch_server(monkeypatch, _Engine(cached))
     req = server.ChatCompletionRequest(
-        model="served-model", messages=[server.Message(role="user", content="hi")], max_tokens=4
+        model="served-model",
+        messages=[server.Message(role="user", content="hi")],
+        max_tokens=4,
     )
     resp = await server.create_chat_completion(req, raw_request=None)
     usage = json.loads(resp.model_dump_json())["usage"]
@@ -160,7 +185,9 @@ async def test_chat_completion_usage_reports_cached_tokens(monkeypatch, cached, 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(("cached", "expect"), [(None, None), (0, 0), (7, 7)])
-async def test_streaming_chat_usage_chunk_reports_cached_tokens(monkeypatch, cached, expect):
+async def test_streaming_chat_usage_chunk_reports_cached_tokens(
+    monkeypatch, cached, expect
+):
     server = _patch_server(monkeypatch, _Engine(cached))
     req = server.ChatCompletionRequest(
         model="served-model",
@@ -168,9 +195,14 @@ async def test_streaming_chat_usage_chunk_reports_cached_tokens(monkeypatch, cac
         stream=True,
         stream_options={"include_usage": True},
     )
-    chunks = [c async for c in server.stream_chat_completion(_Engine(cached), req.messages, req)]
+    chunks = [
+        c
+        async for c in server.stream_chat_completion(_Engine(cached), req.messages, req)
+    ]
     payloads = [
-        json.loads(c.removeprefix("data: ").strip()) for c in chunks if c != "data: [DONE]\n\n"
+        json.loads(c.removeprefix("data: ").strip())
+        for c in chunks
+        if c != "data: [DONE]\n\n"
     ]
     usages = [p["usage"] for p in payloads if p.get("usage")]
     assert usages, "no usage chunk"
@@ -198,9 +230,12 @@ async def test_completions_usage_sums_cached_tokens_across_prompts_and_omits_if_
 
     async def run(values):
         eng = Mixed(values)
-        monkeypatch.setattr(server, "_acquire_default_engine_for_request",
-                            lambda raw, **kw: _coro(eng))
-        req = server.CompletionRequest(model="served-model", prompt=["a b", "c d"], max_tokens=2)
+        monkeypatch.setattr(
+            server, "_acquire_default_engine_for_request", lambda raw, **kw: _coro(eng)
+        )
+        req = server.CompletionRequest(
+            model="served-model", prompt=["a b", "c d"], max_tokens=2
+        )
         r = await server.create_completion(req, raw_request=None)
         return json.loads(r.model_dump_json())["usage"]
 
@@ -228,9 +263,13 @@ def test_table_defaults_match_the_real_parser():
 
 
 def test_simple_engine_reports_the_cache_options_it_ignores():
-    ns = _args("--kv-cache-quantization", "--cache-memory-mb", "512", "--use-paged-cache")
+    ns = _args(
+        "--kv-cache-quantization", "--cache-memory-mb", "512", "--use-paged-cache"
+    )
     assert cache_state.inert_options(ns) == [
-        "--cache-memory-mb", "--kv-cache-quantization", "--use-paged-cache",
+        "--cache-memory-mb",
+        "--kv-cache-quantization",
+        "--use-paged-cache",
     ]
     opts = cache_state.launch_options(ns)
     assert opts["continuous_batching"] is False
@@ -240,7 +279,9 @@ def test_simple_engine_reports_the_cache_options_it_ignores():
 
 def test_nothing_is_inert_with_defaults_or_with_continuous_batching():
     assert cache_state.inert_options(_args()) == []
-    cb = _args("--continuous-batching", "--kv-cache-quantization", "--cache-memory-mb", "512")
+    cb = _args(
+        "--continuous-batching", "--kv-cache-quantization", "--cache-memory-mb", "512"
+    )
     assert cache_state.inert_options(cb) == []
     assert cache_state.launch_options(cb)["kv_cache_quantization"]["effective"] is True
 
@@ -250,11 +291,17 @@ def test_nothing_is_inert_with_defaults_or_with_continuous_batching():
 
 def test_build_marks_what_the_engine_cannot_report_as_unreported_with_a_reason():
     state = cache_state.build(
-        engine=SimpleNamespace(), launch=None, engine_cache={"system_kv_cache": {}},
-        persistence={"policy": {}, "dirs": {}}, registry_mode=False,
+        engine=SimpleNamespace(),
+        launch=None,
+        engine_cache={"system_kv_cache": {}},
+        persistence={"policy": {}, "dirs": {}},
+        registry_mode=False,
     )
     assert state["schema_version"] == cache_state.SCHEMA_VERSION
-    assert state["counters"]["value"] == cache_state.UNREPORTED and state["counters"]["reason"]
+    assert (
+        state["counters"]["value"] == cache_state.UNREPORTED
+        and state["counters"]["reason"]
+    )
     assert state["memory_limit"]["value"] == cache_state.UNREPORTED
     assert state["launch_options"]["value"] == cache_state.UNREPORTED
     assert state["inert_options"] == cache_state.UNREPORTED
@@ -263,23 +310,39 @@ def test_build_marks_what_the_engine_cannot_report_as_unreported_with_a_reason()
 
 def test_build_reports_counters_and_the_memory_limit_derivation():
     stats = {
-        "hits": 3, "misses": 1, "evictions": 0, "tokens_saved": 120, "entry_count": 2,
-        "current_memory_mb": 1.5, "max_memory_mb": 64.0, "hit_rate": 0.75,
+        "hits": 3,
+        "misses": 1,
+        "evictions": 0,
+        "tokens_saved": 120,
+        "entry_count": 2,
+        "current_memory_mb": 1.5,
+        "max_memory_mb": 64.0,
+        "hit_rate": 0.75,
         "memory_limit": {"bytes": 64 << 20, "source": "explicit", "max_memory_mb": 64},
     }
     state = cache_state.build(
-        engine=SimpleNamespace(), launch=cache_state.launch_options(_args("--continuous-batching")),
-        engine_cache=stats, persistence={"policy": {}, "dirs": {}}, registry_mode=True,
+        engine=SimpleNamespace(),
+        launch=cache_state.launch_options(_args("--continuous-batching")),
+        engine_cache=stats,
+        persistence={"policy": {}, "dirs": {}},
+        registry_mode=True,
     )
     assert state["counters"] == {
-        "hits": 3, "misses": 1, "evictions": 0, "tokens_saved": 120, "entry_count": 2,
-        "current_memory_mb": 1.5, "max_memory_mb": 64.0,
+        "hits": 3,
+        "misses": 1,
+        "evictions": 0,
+        "tokens_saved": 120,
+        "entry_count": 2,
+        "current_memory_mb": 1.5,
+        "max_memory_mb": 64.0,
     }
     assert state["memory_limit"]["source"] == "explicit"
     # a registry model's engine mode comes from its class, not from the CLI flag
-    assert state["engine"] == {"class": "SimpleNamespace",
-                               "continuous_batching": cache_state.UNREPORTED,
-                               "registry_mode": True}
+    assert state["engine"] == {
+        "class": "SimpleNamespace",
+        "continuous_batching": cache_state.UNREPORTED,
+        "registry_mode": True,
+    }
     assert set(state["versions"]) == {"vllm_mlx", "mlx", "mlx_lm"}
 
 
@@ -299,7 +362,9 @@ def test_cache_stats_endpoint_carries_cache_state(monkeypatch, with_mlx_vlm):
     import vllm_mlx.server as server
     from fastapi.testclient import TestClient
 
-    if with_mlx_vlm:  # the endpoint has a separate return path when mlx_vlm is importable
+    if (
+        with_mlx_vlm
+    ):  # the endpoint has a separate return path when mlx_vlm is importable
         utils = types.ModuleType("mlx_vlm.utils")
         utils.get_multimodal_kv_cache_stats = lambda: {}
         utils.get_pil_cache_stats = lambda: {}
@@ -309,12 +374,20 @@ def test_cache_stats_endpoint_carries_cache_state(monkeypatch, with_mlx_vlm):
 
     class Eng:
         def get_cache_stats(self):
-            return {"hits": 1, "misses": 0, "evictions": 0, "tokens_saved": 5, "entry_count": 1,
-                    "memory_limit": {"bytes": 1, "source": "explicit"}}
+            return {
+                "hits": 1,
+                "misses": 0,
+                "evictions": 0,
+                "tokens_saved": 5,
+                "entry_count": 1,
+                "memory_limit": {"bytes": 1, "source": "explicit"},
+            }
 
     monkeypatch.setattr(server, "_engine", Eng())
     monkeypatch.setattr(server, "_api_key", None)
-    server.set_cache_launch_options(cache_state.launch_options(_args("--continuous-batching")))
+    server.set_cache_launch_options(
+        cache_state.launch_options(_args("--continuous-batching"))
+    )
     try:
         body = TestClient(server.app).get("/v1/cache/stats").json()
     finally:
@@ -332,12 +405,19 @@ def test_memory_limit_details_explicit_percent_and_fallback(monkeypatch):
     import vllm_mlx.memory_cache as mc
 
     explicit = mc.MemoryCacheConfig(max_memory_mb=100).memory_limit_details()
-    assert explicit["source"] == "explicit" and explicit["bytes"] == 100 * mc._BYTES_PER_MB
+    assert (
+        explicit["source"] == "explicit" and explicit["bytes"] == 100 * mc._BYTES_PER_MB
+    )
 
-    monkeypatch.setattr(mc, "_get_available_memory", lambda: 10 * 1024 * mc._BYTES_PER_MB)
+    monkeypatch.setattr(
+        mc, "_get_available_memory", lambda: 10 * 1024 * mc._BYTES_PER_MB
+    )
     pct = mc.MemoryCacheConfig(max_memory_percent=0.25).memory_limit_details()
     assert pct["source"] == "percent_of_available"
-    assert pct["available_bytes"] == 10 * 1024 * mc._BYTES_PER_MB and pct["percent"] == 0.25
+    assert (
+        pct["available_bytes"] == 10 * 1024 * mc._BYTES_PER_MB
+        and pct["percent"] == 0.25
+    )
     assert pct["bytes"] == int(10 * 1024 * mc._BYTES_PER_MB * 0.25)
 
     monkeypatch.setattr(mc, "_get_available_memory", lambda: 0)
@@ -424,8 +504,12 @@ def test_a_persisted_cache_is_refused_by_a_differently_quantized_model(tmp_path)
     assert src.store(list(range(8)), _kv_entry())
     assert src.save_to_disk(str(tmp_path))
 
-    assert _cache_for(_quant_model(4, 64)).load_from_disk(str(tmp_path)) == 1  # same checkpoint
-    assert _cache_for(_quant_model(6, 64)).load_from_disk(str(tmp_path)) == 0  # other bits
+    assert (
+        _cache_for(_quant_model(4, 64)).load_from_disk(str(tmp_path)) == 1
+    )  # same checkpoint
+    assert (
+        _cache_for(_quant_model(6, 64)).load_from_disk(str(tmp_path)) == 0
+    )  # other bits
     assert _cache_for(_quant_model(quantized=False)).load_from_disk(str(tmp_path)) == 0
 
 
@@ -449,9 +533,16 @@ class _FakeCore:
 
     def _out(self, **kw):
         return RequestOutput(
-            request_id="r", output_text="hi", new_text="hi", output_token_ids=[1],
-            finished=True, finish_reason="stop", prompt_tokens=12, completion_tokens=1,
-            cached_tokens=self.cached, **kw,
+            request_id="r",
+            output_text="hi",
+            new_text="hi",
+            output_token_ids=[1],
+            finished=True,
+            finish_reason="stop",
+            prompt_tokens=12,
+            completion_tokens=1,
+            cached_tokens=self.cached,
+            **kw,
         )
 
     async def generate(self, prompt, sampling_params):
@@ -479,8 +570,14 @@ class _FakeMLLMScheduler:
 
     def _out(self):
         return RequestOutput(
-            request_id="r", output_text="hi", new_text="hi", output_token_ids=[1],
-            finished=True, finish_reason="stop", prompt_tokens=12, completion_tokens=1,
+            request_id="r",
+            output_text="hi",
+            new_text="hi",
+            output_token_ids=[1],
+            finished=True,
+            finish_reason="stop",
+            prompt_tokens=12,
+            completion_tokens=1,
             cached_tokens=self.cached,
         )
 
@@ -526,8 +623,14 @@ def test_registry_mode_reports_each_loaded_model_and_whether_persistence_applies
                 self.load_cache_from_disk = lambda d: 0
 
         def get_cache_stats(self):
-            return {"hits": self.hits, "misses": 0, "evictions": 0, "tokens_saved": 0,
-                    "entry_count": 0, "memory_limit": {"bytes": 1, "source": "explicit"}}
+            return {
+                "hits": self.hits,
+                "misses": 0,
+                "evictions": 0,
+                "tokens_saved": 0,
+                "entry_count": 0,
+                "memory_limit": {"bytes": 1, "source": "explicit"},
+            }
 
     class Manager:
         def loaded_engines(self):
@@ -550,7 +653,10 @@ def test_registry_mode_reports_each_loaded_model_and_whether_persistence_applies
     assert body["persistence"]["applies"] is True
     assert body["models"]["a"]["cache_state"]["persistence"]["applies"] is True
     simple = body["models"]["b"]["cache_state"]["persistence"]
-    assert simple["applies"] is False and "no persisted prefix-cache hooks" in simple["not_applied_reason"]
+    assert (
+        simple["applies"] is False
+        and "no persisted prefix-cache hooks" in simple["not_applied_reason"]
+    )
 
 
 def test_persistence_applies_outside_registry_mode(monkeypatch):
@@ -594,11 +700,17 @@ def _moe_model(expert_bits, order=("a", "b")):
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            self.args = SimpleNamespace(num_hidden_layers=2, hidden_size=64, vocab_size=100,
-                                        model_type="moe")
+            self.args = SimpleNamespace(
+                num_hidden_layers=2, hidden_size=64, vocab_size=100, model_type="moe"
+            )
             for name, bits in zip(order, expert_bits):
-                setattr(self, name, SwitchLinear(64, 64, 4, bias=False)
-                        .to_quantized(group_size=64, bits=bits))
+                setattr(
+                    self,
+                    name,
+                    SwitchLinear(64, 64, 4, bias=False).to_quantized(
+                        group_size=64, bits=bits
+                    ),
+                )
 
     return M()
 
@@ -608,7 +720,9 @@ def test_moe_expert_quantization_is_part_of_the_fingerprint():
     from vllm_mlx.memory_cache import _quantization_signature as sig
 
     assert "QuantizedSwitchLinear:4:64" in sig(_moe_model((4, 4)))
-    assert fp(_moe_model((4, 4))) != fp(_moe_model((4, 8)))  # mixed precision experts differ
+    assert fp(_moe_model((4, 4))) != fp(
+        _moe_model((4, 8))
+    )  # mixed precision experts differ
 
 
 def test_signature_does_not_depend_on_module_registration_order():
@@ -627,14 +741,22 @@ def test_negative_cached_token_counts_are_clamped():
 
 def test_batched_mllm_nested_prefix_cache_stats_are_surfaced_not_called_unreportable():
     nested = {
-        "prefix_cache": {"hits": 2, "misses": 1, "evictions": 0, "tokens_saved": 64,
-                         "entry_count": 1,
-                         "memory_limit": {"bytes": 5, "source": "explicit"}},
+        "prefix_cache": {
+            "hits": 2,
+            "misses": 1,
+            "evictions": 0,
+            "tokens_saved": 64,
+            "entry_count": 1,
+            "memory_limit": {"bytes": 5, "source": "explicit"},
+        },
         "vision_embedding_cache": {"hits": 0},
     }
     state = cache_state.build(
-        engine=SimpleNamespace(), launch=None, engine_cache=nested,
-        persistence={}, registry_mode=False,
+        engine=SimpleNamespace(),
+        launch=None,
+        engine_cache=nested,
+        persistence={},
+        registry_mode=False,
     )
     assert state["counters"]["hits"] == 2 and state["counters"]["tokens_saved"] == 64
     assert state["memory_limit"]["source"] == "explicit"
@@ -649,25 +771,47 @@ class SimpleEngine:
 
 
 def test_registry_models_report_their_own_engine_not_the_cli_flags():
-    launch = cache_state.launch_options(_args("--kv-cache-quantization"))  # CLI: simple + inert
+    launch = cache_state.launch_options(
+        _args("--kv-cache-quantization")
+    )  # CLI: simple + inert
     assert launch["continuous_batching"] is False and launch["inert_options"]
     for eng, expect in ((BatchedEngine(), True), (SimpleEngine(), False)):
-        state = cache_state.build(engine=eng, launch=launch, engine_cache=None,
-                                  persistence={}, registry_mode=True)
+        state = cache_state.build(
+            engine=eng,
+            launch=launch,
+            engine_cache=None,
+            persistence={},
+            registry_mode=True,
+        )
         assert state["engine"]["continuous_batching"] is expect
         assert state["launch_options"]["value"] == cache_state.UNREPORTED
         assert "registry mode" in state["launch_options"]["reason"]
         assert state["inert_options"]["value"] == cache_state.UNREPORTED
-    odd = cache_state.build(engine=SimpleNamespace(), launch=launch, engine_cache=None,
-                            persistence={}, registry_mode=True)
+    odd = cache_state.build(
+        engine=SimpleNamespace(),
+        launch=launch,
+        engine_cache=None,
+        persistence={},
+        registry_mode=True,
+    )
     assert odd["engine"]["continuous_batching"] == cache_state.UNREPORTED
 
 
 def test_the_other_scheduler_only_flags_are_listed_as_inert_in_simple_mode():
-    ns = _args("--prefix-cache-size", "5", "--paged-cache-block-size", "32",
-               "--max-cache-blocks", "7", "--chunked-prefill-tokens", "128")
+    ns = _args(
+        "--prefix-cache-size",
+        "5",
+        "--paged-cache-block-size",
+        "32",
+        "--max-cache-blocks",
+        "7",
+        "--chunked-prefill-tokens",
+        "128",
+    )
     assert cache_state.inert_options(ns) == [
-        "--prefix-cache-size", "--paged-cache-block-size", "--max-cache-blocks",
+        "--prefix-cache-size",
+        "--paged-cache-block-size",
+        "--max-cache-blocks",
         "--chunked-prefill-tokens",
     ]
 
@@ -686,25 +830,38 @@ def test_persistence_does_not_apply_to_an_engine_without_the_hooks(monkeypatch):
 
     monkeypatch.setattr(server, "_engine", WithHooks())
     assert server._persistence_snapshot()["applies"] is True
-    monkeypatch.setattr(server, "_engine", None)  # not loaded yet: cannot tell, assume it applies
+    monkeypatch.setattr(
+        server, "_engine", None
+    )  # not loaded yet: cannot tell, assume it applies
     assert server._persistence_snapshot()["applies"] is True
 
 
 @pytest.mark.anyio
 async def test_streaming_completions_usage_reports_cached_tokens(monkeypatch):
     server = _patch_server(monkeypatch, _Engine(5))
-    req = server.CompletionRequest(model="served-model", prompt="a b", max_tokens=2, stream=True)
+    req = server.CompletionRequest(
+        model="served-model", prompt="a b", max_tokens=2, stream=True
+    )
     chunks = [c async for c in server.stream_completion(_Engine(5), "a b", req, 2)]
-    payloads = [json.loads(c.removeprefix("data: ").strip()) for c in chunks
-                if c.startswith("data: ") and "[DONE]" not in c]
+    payloads = [
+        json.loads(c.removeprefix("data: ").strip())
+        for c in chunks
+        if c.startswith("data: ") and "[DONE]" not in c
+    ]
     usage = [p["usage"] for p in payloads if p.get("usage")]
     assert usage and usage[-1]["prompt_tokens_details"] == {"cached_tokens": 5}
 
 
 def test_registry_top_level_with_no_default_engine_does_not_report_the_cli_flags():
     launch = cache_state.launch_options(_args("--kv-cache-quantization"))
-    state = cache_state.build(engine=None, launch=launch, engine_cache=None, persistence={},
-                              registry_mode=True, none_reason="registry mode keeps no default")
+    state = cache_state.build(
+        engine=None,
+        launch=launch,
+        engine_cache=None,
+        persistence={},
+        registry_mode=True,
+        none_reason="registry mode keeps no default",
+    )
     assert state["engine"]["continuous_batching"] == cache_state.UNREPORTED
     assert state["launch_options"]["value"] == cache_state.UNREPORTED
     assert state["inert_options"]["value"] == cache_state.UNREPORTED
@@ -766,7 +923,9 @@ def test_simple_engine_stays_as_it_was_without_an_explicit_flag():
     assert "VLLM_MLX_SYSTEM_KV_CACHE" not in os.environ
 
 
-def test_disable_prefix_cache_turns_off_the_trie_and_the_system_snapshot_cache(monkeypatch):
+def test_disable_prefix_cache_turns_off_the_trie_and_the_system_snapshot_cache(
+    monkeypatch,
+):
     import os
 
     os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
@@ -790,7 +949,9 @@ def test_continuous_batching_leaves_the_prefix_cache_flags_alone(monkeypatch):
     import os
 
     os.environ.pop("VLLM_MLX_SYSTEM_KV_CACHE", None)
-    ns = _args("--continuous-batching", "--enable-prefix-cache", "--disable-prefix-cache")
+    ns = _args(
+        "--continuous-batching", "--enable-prefix-cache", "--disable-prefix-cache"
+    )
     assert cache_state.apply_simple_prefix_cache_flags(ns) is None
     assert ns.prefix_trie_cache is False
     assert "VLLM_MLX_SYSTEM_KV_CACHE" not in os.environ
@@ -805,26 +966,43 @@ def test_continuous_batching_leaves_the_prefix_cache_flags_alone(monkeypatch):
         (["--specprefill", "--specprefill-draft-model", "d"], "--specprefill"),
     ],
 )
-def test_the_trie_cache_warns_when_the_engine_setup_keeps_it_from_engaging(extra, named):
-    note = cache_state.apply_simple_prefix_cache_flags(_args("--enable-prefix-cache", *extra))
+def test_the_trie_cache_warns_when_the_engine_setup_keeps_it_from_engaging(
+    extra, named
+):
+    note = cache_state.apply_simple_prefix_cache_flags(
+        _args("--enable-prefix-cache", *extra)
+    )
     assert "cannot engage" in note and named in note
 
 
 def test_the_persistence_options_are_reported_as_ignored_by_the_simple_engine():
     ns = _args(
-        "--prefix-cache-dir", "/x", "--prefix-cache-persist", "none",
-        "--prefix-cache-reset", "start",
+        "--prefix-cache-dir",
+        "/x",
+        "--prefix-cache-persist",
+        "none",
+        "--prefix-cache-reset",
+        "start",
     )
     assert cache_state.inert_options(ns) == [
-        "--prefix-cache-dir", "--prefix-cache-persist", "--prefix-cache-reset",
+        "--prefix-cache-dir",
+        "--prefix-cache-persist",
+        "--prefix-cache-reset",
     ]
-    assert cache_state.inert_options(
-        _args("--continuous-batching", "--prefix-cache-dir", "/x")
-    ) == []
+    assert (
+        cache_state.inert_options(
+            _args("--continuous-batching", "--prefix-cache-dir", "/x")
+        )
+        == []
+    )
 
 
 def test_flags_the_simple_engine_honors_are_not_reported_as_ignored():
-    for flag in ("--enable-prefix-cache", "--disable-prefix-cache", "--prefix-trie-cache"):
+    for flag in (
+        "--enable-prefix-cache",
+        "--disable-prefix-cache",
+        "--prefix-trie-cache",
+    ):
         assert cache_state.inert_options(_args(flag)) == [], flag
 
 
