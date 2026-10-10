@@ -64,16 +64,47 @@ def test_gemma4_unified_text_config_actually_constructs():
     assert getattr(args, "num_hidden_layers", None) == 2
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_6_text", "", "unknown"])
-def test_unmatched_types_keep_the_generic_fallback(model_type):
-    """Unknown families must not start raising — that would be a regression.
-
-    qwen3_5.TextModel handles dense and MoE natively, so it stays the default.
-    """
+@pytest.mark.parametrize(
+    "model_type",
+    ["qwen3_5", "qwen3_5_text", "qwen3_5_moe_text", "qwen3_6_text"],
+)
+def test_qwen3_5_family_keeps_the_qwen3_5_text_model(model_type):
+    """qwen3_5.TextModel handles dense and MoE natively; it is chosen by name."""
     Model, ModelArgs = _import_text_model_classes(model_type)
     assert Model.__module__ == "mlx_lm.models.qwen3_5"
     assert Model.__qualname__ == "TextModel"
     assert ModelArgs.__qualname__ == "TextModelArgs"
+
+
+@pytest.mark.parametrize("model_type", ["", "unknown", "mistral", "llama", "qwen3_vl"])
+def test_unregistered_type_raises_instead_of_guessing_a_family(model_type):
+    """There is no generic fallback.
+
+    Ministral-3 used to reach the Qwen3.5 skeleton, which constructs and loads
+    without complaint and then fails every request. An unregistered family must
+    stop at the dispatch and say which model_type it was.
+    """
+    with pytest.raises(ValueError) as exc:
+        _import_text_model_classes(model_type)
+    assert repr(model_type) in str(exc.value)
+    assert "_TEXT_MODEL_FAMILIES" in str(exc.value)
+
+
+def test_unregistered_type_keeps_the_route_on_the_vlm_path(tmp_path, caplog):
+    """build_text_model reports it (model_type named) and returns no TextModel."""
+    (tmp_path / "config.json").write_text(
+        '{"text_config": {"model_type": "some_new_family"}}'
+    )
+
+    class _Vlm:
+        language_model = object()
+
+    with caplog.at_level(logging.ERROR, logger="vllm_mlx.text_model_from_vlm"):
+        assert build_text_model(_Vlm(), tmp_path) is None
+
+    message = caplog.records[-1].getMessage()
+    assert "some_new_family" in message, message
+    assert "not selected" in message, message
 
 
 def test_failure_names_the_model_type_and_the_chosen_class(tmp_path, caplog):
