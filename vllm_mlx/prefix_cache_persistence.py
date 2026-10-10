@@ -144,7 +144,9 @@ class PersistencePolicy:
         return self.reset in ("stop", "both")
 
     def resolve_dir(self, model_name: object) -> str:
-        return os.path.join(self.base_dir or default_base_dir(), safe_model_name(model_name))
+        return os.path.join(
+            self.base_dir or default_base_dir(), safe_model_name(model_name)
+        )
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -189,11 +191,16 @@ def reset_cache_dir(path: str | os.PathLike[str]) -> ResetResult:
     """
     p = Path(os.path.expanduser(os.fspath(path)))
     if not p.is_absolute():
-        raise PersistenceError(f"refusing to reset a relative path: {os.fspath(path)!r}")
+        raise PersistenceError(
+            f"refusing to reset a relative path: {os.fspath(path)!r}"
+        )
     home = Path(os.path.expanduser("~"))
     # Compare both the spelled path and the one with intermediate symlinks
     # resolved, so a link to the home directory or to ``/`` is also refused.
-    for cand, ref in ((p, home), (Path(os.path.realpath(p)), Path(os.path.realpath(home)))):
+    for cand, ref in (
+        (p, home),
+        (Path(os.path.realpath(p)), Path(os.path.realpath(home))),
+    ):
         if cand == Path(cand.anchor) or cand == ref or cand in ref.parents:
             raise PersistenceError(f"refusing to reset {p}: not a cache directory")
     try:

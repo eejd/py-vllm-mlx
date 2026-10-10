@@ -87,7 +87,9 @@ def test_the_persist_mode_is_honored_per_model(tmp_path):
 def test_reset_at_start_applies_on_every_cold_load(tmp_path):
     async def _run():
         server.set_prefix_cache_policy(
-            PersistencePolicy(base_dir=str(tmp_path / "cache"), persist="save-only", reset="start")
+            PersistencePolicy(
+                base_dir=str(tmp_path / "cache"), persist="save-only", reset="start"
+            )
         )
         engine, cfg = CachingEngine(), _config(tmp_path, "alpha")
         cache_dir = Path(server._get_cache_dir(cfg.entry.source))

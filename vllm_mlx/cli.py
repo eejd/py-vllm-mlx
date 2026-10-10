@@ -22,8 +22,8 @@ from .cli_arg_types import (
     make_positive_int_arg_parser,
     memory_budget_gb_arg,
 )
+from .precision import FP32_MATMUL_PRECISIONS, set_fp32_matmul_precision
 from .tool_parsers import ToolParserManager
-
 
 
 class _ExplicitStoreTrue(argparse.Action):
@@ -63,6 +63,25 @@ def _add_tool_calling_args(serve_parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_precision_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--fp32-matmul-precision",
+        choices=FP32_MATMUL_PRECISIONS,
+        default=None,
+        help="Precision of float32 matmul, attention and convolution on GPUs "
+        "with matrix units (Apple M5 and later). 'highest' keeps full float32; "
+        "'high' allows reduced TF32-class precision, which is MLX's default. "
+        "Unset leaves MLX's default and the MLX_ENABLE_TF32 environment "
+        "variable in effect. Half-precision models are unaffected.",
+    )
+
+
+def _apply_fp32_matmul_precision(args) -> None:
+    precision = getattr(args, "fp32_matmul_precision", None)
+    if precision is not None:
+        set_fp32_matmul_precision(precision)
+
+
 def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
@@ -94,6 +113,9 @@ def serve_command(args):
         print("Error: --memory-budget-gb requires --models-config")
         sys.exit(1)
 
+    # Before any model loads: older MLX reads the setting once, at first use.
+    _apply_fp32_matmul_precision(args)
+
     # Persisted prefix cache: where it lives, whether it is read or written, and
     # when it is deleted. Invalid combinations are refused before any model loads.
     from .prefix_cache_persistence import PersistenceError, PersistencePolicy
@@ -123,7 +145,9 @@ def serve_command(args):
 
     server.set_cache_launch_options(cache_state.launch_options(args))
     # Registry entries choose their own engine, so the global flags cannot be called inert there.
-    inert = [] if getattr(args, "models_config", None) else cache_state.inert_options(args)
+    inert = (
+        [] if getattr(args, "models_config", None) else cache_state.inert_options(args)
+    )
     if inert:
         print(
             "Warning: these options only take effect with --continuous-batching and are "
@@ -628,6 +652,8 @@ def bench_command(args):
     from .engine_core import AsyncEngineCore, EngineConfig
     from .request import SamplingParams
     from .scheduler import SchedulerConfig
+
+    _apply_fp32_matmul_precision(args)
 
     # Handle prefix cache flags
     enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
@@ -1527,6 +1553,7 @@ Examples:
     )
     # Tool calling options
     _add_tool_calling_args(serve_parser)
+    _add_precision_args(serve_parser)
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers
 
@@ -1687,6 +1714,7 @@ Examples:
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
     bench_parser.add_argument("model", type=str, help="Model to benchmark")
+    _add_precision_args(bench_parser)
     bench_parser.add_argument(
         "--num-prompts", type=int, default=10, help="Number of prompts"
     )

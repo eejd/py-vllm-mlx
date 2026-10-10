@@ -341,19 +341,27 @@ def test_serve_records_cache_launch_options_and_warns_about_simple_engine_inert_
     assert opts["continuous_batching"] is False
     assert opts["inert_options"] == ["--cache-memory-mb", "--kv-cache-quantization"]
     assert opts["kv_cache_quantization"] == {
-        "requested": True, "bits": 8, "group_size": 64, "min_quantize_tokens": 256,
+        "requested": True,
+        "bits": 8,
+        "group_size": 64,
+        "min_quantize_tokens": 256,
         "effective": False,
     }
 
 
-def test_serve_with_continuous_batching_records_options_and_does_not_warn(monkeypatch, capsys):
+def test_serve_with_continuous_batching_records_options_and_does_not_warn(
+    monkeypatch, capsys
+):
     from vllm_mlx import cli
 
     server = _patched_serve(monkeypatch)
     cli.serve_command(
         _serve_args(
-            continuous_batching=True, kv_cache_quantization=True, cache_memory_mb=512,
-            mllm_prefill_step_size=0, specprefill_backbone_pct=0.0,
+            continuous_batching=True,
+            kv_cache_quantization=True,
+            cache_memory_mb=512,
+            mllm_prefill_step_size=0,
+            specprefill_backbone_pct=0.0,
         )
     )
     assert "only take effect with --continuous-batching" not in capsys.readouterr().out
@@ -374,8 +382,12 @@ def test_registry_mode_does_not_call_global_cache_flags_inert(monkeypatch, capsy
 
 @pytest.mark.parametrize(
     "extra",
-    [{}, {"prefix_cache_dir": "/x"}, {"prefix_cache_persist": "none"},
-     {"prefix_cache_reset": "start"}],
+    [
+        {},
+        {"prefix_cache_dir": "/x"},
+        {"prefix_cache_persist": "none"},
+        {"prefix_cache_reset": "start"},
+    ],
 )
 def test_registry_mode_no_longer_says_that_prefix_cache_options_do_nothing(
     monkeypatch, capsys, extra
