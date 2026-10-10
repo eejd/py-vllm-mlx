@@ -91,7 +91,12 @@ def test_unregistered_type_raises_instead_of_guessing_a_family(model_type):
 
 
 def test_unregistered_type_keeps_the_route_on_the_vlm_path(tmp_path, caplog):
-    """build_text_model reports it (model_type named) and returns no TextModel."""
+    """An expected registry miss is one WARNING line (no traceback, no ERROR).
+
+    The route falls back to mlx-vlm for text; that is the intended outcome for
+    any family without an extracted TextModel, not a crash. Genuine
+    construction errors keep the ERROR with a traceback (test below).
+    """
     (tmp_path / "config.json").write_text(
         '{"text_config": {"model_type": "some_new_family"}}'
     )
@@ -99,12 +104,15 @@ def test_unregistered_type_keeps_the_route_on_the_vlm_path(tmp_path, caplog):
     class _Vlm:
         language_model = object()
 
-    with caplog.at_level(logging.ERROR, logger="vllm_mlx.text_model_from_vlm"):
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.text_model_from_vlm"):
         assert build_text_model(_Vlm(), tmp_path) is None
 
-    message = caplog.records[-1].getMessage()
-    assert "some_new_family" in message, message
-    assert "not selected" in message, message
+    records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is None
+    assert "some_new_family" in records[0].getMessage()
+    assert "mlx-vlm text path" in records[0].getMessage()
 
 
 def test_failure_names_the_model_type_and_the_chosen_class(tmp_path, caplog):

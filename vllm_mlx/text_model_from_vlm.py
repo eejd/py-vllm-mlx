@@ -43,14 +43,23 @@ _TEXT_MODEL_FAMILIES: tuple[tuple[str, str, tuple[str, str]], ...] = (
 _VLM_ONLY_TEXT_MODEL_PREFIXES = ("qwen4_exp",)
 
 
+class UnregisteredTextModelFamily(ValueError):
+    """No mlx-lm text-model family is registered for a config's ``model_type``.
+
+    An expected, non-fatal outcome (the route stays on the mlx-vlm path), so
+    ``build_text_model`` reports it as one warning line, without a traceback.
+    """
+
+
 def _import_text_model_classes(model_type: str):
     """Return ``(Model, ModelArgs)`` for a text config's ``model_type``.
 
-    Raises ``ValueError`` for a type no family is registered for. There is no
-    generic fallback: guessing the Qwen3.5 skeleton for an unknown family either
-    dies in someone else's constructor with an error naming neither the model nor
-    the class, or (Ministral-3) builds a wrong-architecture model that loads
-    under ``strict=False`` and fails on the first request.
+    Raises ``UnregisteredTextModelFamily`` (a ``ValueError``) for a type no
+    family is registered for. There is no generic fallback: guessing the
+    Qwen3.5 skeleton for an unknown family either dies in someone else's
+    constructor with an error naming neither the model nor the class, or
+    (Ministral-3) builds a wrong-architecture model that loads under
+    ``strict=False`` and fails on the first request.
     """
     import importlib
 
@@ -61,7 +70,7 @@ def _import_text_model_classes(model_type: str):
             module = importlib.import_module(module_name)
             return getattr(module, model_attr), getattr(module, args_attr)
 
-    raise ValueError(
+    raise UnregisteredTextModelFamily(
         f"No mlx-lm text-model family is registered for model_type={model_type!r} "
         f"(known prefixes: {sorted(f[0] for f in _TEXT_MODEL_FAMILIES)}); add one "
         "to _TEXT_MODEL_FAMILIES, or to _VLM_ONLY_TEXT_MODEL_PREFIXES to keep "
@@ -87,7 +96,7 @@ def _align_tied_embeddings(
         return
     has_lm_head = any(name.startswith("lm_head.") for name, _ in vlm_weights)
     if bool(args.tie_word_embeddings) == has_lm_head:
-        logger.warning(
+        logger.info(
             "model_type=%r: TextModel args say tie_word_embeddings=%s but the vlm "
             "weights %s an lm_head; following the weights",
             model_type,
@@ -251,6 +260,14 @@ def build_text_model(
 
         return text_model
 
+    except UnregisteredTextModelFamily as e:
+        logger.warning(
+            "Keeping model_type=%r on the mlx-vlm text path; no extracted "
+            "TextModel was built (class=<not selected>): %s",
+            model_type,
+            e,
+        )
+        return None
     except ImportError as e:
         logger.error("Cannot import mlx_lm TextModel (need PR #990): %s", e)
         return None

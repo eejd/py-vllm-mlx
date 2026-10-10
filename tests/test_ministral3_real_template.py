@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Round-trip the ``mistral`` tool parser against Ministral-3's own chat template.
 
+Scope: a template/parser round-trip *regression* test only. It is **not** proof of
+the Ministral-3 serving fix: it builds ``MistralToolParser()`` without a tokenizer
+and never loads a model, so it passes on the commit before the dispatch and
+vocabulary fixes. Those are guarded by ``test_text_model_dispatch.py`` and
+``test_tool_parsers.py``.
+
 The template renders an assistant tool call as
 ``[TOOL_CALLS]name[ARGS]{json}`` (the format the model is trained to emit). These
 tests render two calls through the real template and require the parser to
-recover the exact arguments, whole and streamed. They need the model's tokenizer
-files in the local Hugging Face cache and skip when they are absent (CI has no
-model cache).
+recover the exact arguments, whole and token-streamed. They need the model's
+tokenizer files in the local Hugging Face cache (``HF_HOME``) and skip, with the
+reason stated, when they are absent: CI has no model cache, so a green skip there
+says nothing about the template.
 """
 
 import glob
@@ -59,7 +66,11 @@ def _snapshot() -> str:
     )
     paths = [p for p in paths if os.path.exists(os.path.join(p, "chat_template.jinja"))]
     if not paths:
-        pytest.skip(f"{_REPO} is not in the local Hugging Face cache")
+        pytest.skip(
+            f"{_REPO} chat_template.jinja not found under {_HUB}: the Ministral-3 "
+            "template round-trip was NOT exercised (set HF_HOME to a cache that "
+            "has the model)"
+        )
     return paths[-1]
 
 
