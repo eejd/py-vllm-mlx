@@ -29,23 +29,29 @@ from .abstract_tool_parser import (
 )
 from .hermes_tool_parser import _parse_param_value, generate_tool_id
 
-# A CDATA section is matched atomically and any other text must not start a tag we are
+# A CDATA section is matched whole and any other text must not start a tag we are
 # looking for the end of, so a value such as ``<![CDATA[x = "</function>"]]>`` cannot end
 # its element early and an unterminated block fails fast instead of backtracking.
-_CDATA = r"(?><!\[CDATA\[.*?\]\]>)"
-_FUNCTION_RE = re.compile(
-    r'<function\s+name="([^"]+)"\s*>((?:'
-    + _CDATA
-    + r"|(?!</function>|<!\[CDATA\[).)*+)</function>",
-    re.DOTALL,
-)
+#
+# The element body is matched possessively without Python 3.11's ``(?>...)``/``*+``
+# (``requires-python >=3.10``): a lookahead captures the greedy body as group 2 and the
+# backreference ``\2`` consumes it. Python never backtracks into a lookahead once it has
+# matched, so the body is neither shortened nor re-split after the fact, and nothing
+# follows the repetition inside the lookahead, so a CDATA section always ends at its first
+# ``]]>``.
+_CDATA = r"<!\[CDATA\[.*?\]\]>"
+
+
+def _element_re(tag: str) -> re.Pattern[str]:
+    return re.compile(
+        rf'<{tag}\s+name="([^"]+)"\s*>(?=((?:{_CDATA}|(?!</{tag}>|<!\[CDATA\[).)*))\2</{tag}>',
+        re.DOTALL,
+    )
+
+
+_FUNCTION_RE = _element_re("function")
 _OPEN_TAIL_RE = re.compile(r'<function\s+name="([^"]+)"\s*>(.*)\Z', re.DOTALL)
-_PARAM_RE = re.compile(
-    r'<param\s+name="([^"]+)"\s*>((?:'
-    + _CDATA
-    + r"|(?!</param>|<!\[CDATA\[).)*+)</param>",
-    re.DOTALL,
-)
+_PARAM_RE = _element_re("param")
 _CDATA_RE = re.compile(r"\A\s*<!\[CDATA\[(.*)\]\]>\s*\Z", re.DOTALL)
 _CDATA_SECTION_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 # Legacy MiniCPM tokens some checkpoints still emit around a call, and a closing tag with

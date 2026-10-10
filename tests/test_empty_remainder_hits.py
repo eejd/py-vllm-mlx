@@ -20,7 +20,6 @@ from tests.test_exact_hit_reuse import (  # noqa: E402
     PROMPT,
     _kv,
     _rotating,
-    _Recorder,
     _run,
     _setup,
 )
