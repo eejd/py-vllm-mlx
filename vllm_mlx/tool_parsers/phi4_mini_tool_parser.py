@@ -16,8 +16,9 @@ differs from it in four ways:
   regex ``functools\\[(.*?)\\]``, which cuts the list at the first ``]`` and so loses
   any call whose arguments contain a list or a ``]`` inside a string;
 * a block is accepted whole or not at all. Invalid JSON, a call that is not an
-  object, a name that is not an identifier or ``arguments`` that are not an object
-  leave the block in the content, so ``arguments`` is always valid JSON;
+  object, a name that is not an identifier, ``arguments`` that are not an object or a
+  non-finite number (``NaN``, ``Infinity``) leave the block in the content, so
+  ``arguments`` is always valid JSON;
 * prose around a block stays content (vLLM returns ``None`` whenever a call was found);
 * it streams, with the fork's emit-once discipline.
 """
@@ -70,6 +71,11 @@ def _array_end(text: str, start: int) -> int | None:
     return None
 
 
+def _reject_constant(name: str) -> None:
+    """``NaN``/``Infinity`` are not JSON; ``json.dumps`` would write them back out."""
+    raise ValueError(f"non-finite number {name}")
+
+
 def _parse_calls(array_text: str) -> list[tuple[str, dict[str, Any]]] | None:
     """``[{"name": ..., "arguments": {...}}, ...]`` -> ``[(name, arguments), ...]``.
 
@@ -78,7 +84,7 @@ def _parse_calls(array_text: str) -> list[tuple[str, dict[str, Any]]] | None:
     call this parser can stand behind.
     """
     try:
-        raw = json.loads(array_text)
+        raw = json.loads(array_text, parse_constant=_reject_constant)
     except (ValueError, RecursionError):
         return None
     if not isinstance(raw, list) or not raw:
@@ -94,7 +100,7 @@ def _parse_calls(array_text: str) -> list[tuple[str, dict[str, Any]]] | None:
         if isinstance(args, str):
             # A model that double-encodes its arguments is still unambiguous.
             try:
-                args = json.loads(args)
+                args = json.loads(args, parse_constant=_reject_constant)
             except (ValueError, RecursionError):
                 return None
         if not isinstance(args, dict):

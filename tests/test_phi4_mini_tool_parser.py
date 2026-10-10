@@ -220,6 +220,30 @@ class TestExtract:
         # Nothing is dropped silently: the model's text stays visible.
         assert result.content == payload
 
+    @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+    def test_non_finite_numbers_never_reach_arguments(self, constant):
+        # json.loads accepts them and json.dumps writes them back: not valid JSON.
+        text = 'functools[{"name": "f", "arguments": {"x": %s}}]' % constant
+        result = self.parser.extract_tool_calls(text)
+        assert result.tools_called is False
+        assert result.content == text
+
+    def test_non_finite_number_in_double_encoded_arguments(self):
+        text = 'functools[{"name": "f", "arguments": "{\\"x\\": NaN}"}]'
+        result = self.parser.extract_tool_calls(text)
+        assert result.tools_called is False
+        assert result.content == text
+
+    def test_every_returned_arguments_string_is_strict_json(self):
+        def reject(constant):
+            raise AssertionError(constant)
+
+        result = self.parser.extract_tool_calls(
+            _text(_call("a", {"x": 1.5, "y": [None, True], "s": "NaN"}))
+        )
+        for call in result.tool_calls:
+            json.loads(call["arguments"], parse_constant=reject)
+
     def test_one_bad_call_rejects_the_whole_list(self):
         text = _text(_call("good", {"a": 1}), {"name": "bad name", "arguments": {}})
         result = self.parser.extract_tool_calls(text)
@@ -263,6 +287,7 @@ STREAM_CASES = {
     "plain": "Just an answer with no tools, mentioning functools in passing.",
     "functools_prose": "Use functools[0] carefully, and functools.partial.",
     "malformed": "functools[nope] then " + _text(_call("ok", {"a": 1})),
+    "non_finite": 'functools[{"name": "f", "arguments": {"x": NaN}}] ok',
     "partial_marker_tail": "ends like a marker functools",
     "partial_marker_tail_2": "ends like a marker functo",
 }
