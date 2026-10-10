@@ -218,8 +218,12 @@ vllm-mlx serve mlx-community/Phi-4-mini-instruct-4bit \
   --chat-template "$TEMPLATE"
 ```
 
-`--chat-template` takes a file path or a one-line inline template, applies to every
-engine (Simple, Batched, text and multimodal), and is refused with `--models-config`.
+`--chat-template` takes a file path or a one-line inline template (`\n`, `\t`, `\r`
+are decoded, everything else is kept as typed), applies to every engine (Simple,
+Batched, text and multimodal), and is refused with `--models-config`. It is
+server-wide, so the shipped template renders requests **without tools** byte-for-byte
+like the model's own template (tests pin this); only requests with tools get the
+function-calling system prompt.
 The model answers a call with `functools[{"name": ..., "arguments": {...}}]`; the
 parser finds the end of the list with a bracket scan, so arguments containing `]`
 are safe, and a list it cannot fully parse stays in `content`. It streams: each call
