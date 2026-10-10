@@ -54,6 +54,25 @@ class TestResolve:
     def test_inline_single_line_decodes_escapes(self):
         assert resolve_chat_template("a{{ x }}\\nb") == "a{{ x }}\nb"
 
+    def test_inline_non_ascii_text_is_kept(self):
+        template = resolve_chat_template('{{ "é" }} {{ "日本" }} {{ "😀" }}')
+        assert template == '{{ "é" }} {{ "日本" }} {{ "😀" }}'
+
+    def test_inline_escaped_newline_and_tab_next_to_non_ascii(self):
+        assert resolve_chat_template("é{{ x }}\\n日本\\t\\r.") == (
+            "é{{ x }}\n日本\t\r."
+        )
+
+    def test_inline_escaped_quote_is_left_for_jinja(self):
+        template = resolve_chat_template('{{ "a\\"b" }}')
+        assert template == '{{ "a\\"b" }}'
+        from jinja2 import Environment
+
+        assert Environment().from_string(template).render() == 'a"b'
+
+    def test_inline_double_backslash_then_n_is_not_a_newline(self):
+        assert resolve_chat_template("{{ x }}\\\\n") == "{{ x }}\\\\n"
+
     def test_missing_path_is_an_error_not_an_inline_template(self, tmp_path):
         with pytest.raises(ValueError, match="not an existing file"):
             resolve_chat_template(str(tmp_path / "missing.jinja"))
@@ -209,3 +228,197 @@ class TestEnginesRenderTheOverride:
         lm.load()
         assert lm.processor.chat_template == OVERRIDE
         assert _render(lm.get_tokenizer()) == "OVERRIDE user=hi;tools=1"
+
+
+# --- the template reaches every engine constructor --------------------------------
+#
+# Each hand-off below is a place where dropping ``chat_template`` would silently
+# ignore the option while everything else keeps working.
+
+
+@pytest.fixture
+def clean_server_state(monkeypatch):
+    """load_model/serve/main rewrite server globals; restore them afterwards."""
+    from vllm_mlx import server
+
+    for name in (
+        "_engine",
+        "_residency_manager",
+        "_default_model_key",
+        "_model_name",
+        "_model_path",
+        "_model_manager",
+        "_lazy_load_model",
+        "_auto_unload_idle_seconds",
+        "_force_mllm_model",
+        "_default_max_tokens",
+        "_max_request_tokens",
+        "_api_key",
+        "_default_timeout",
+        "_metrics_enabled",
+        "_rate_limiter",
+        "_enable_auto_tool_choice",
+        "_tool_call_parser",
+        "_default_temperature",
+        "_default_top_p",
+        "_default_top_k",
+        "_default_min_p",
+        "_default_presence_penalty",
+        "_default_repetition_penalty",
+        "_default_chat_template_kwargs",
+        "_max_audio_upload_bytes",
+        "_max_tts_input_chars",
+        "_embedding_max_length",
+        "_embedding_overflow_policy",
+        "_reasoning_parser",
+        "_reasoning_parser_name",
+    ):
+        if hasattr(server, name):
+            monkeypatch.setattr(server, name, getattr(server, name))
+    monkeypatch.setattr(server, "_lifespan_active", False)
+    monkeypatch.setattr(server, "_engine", None)
+    monkeypatch.setattr(server, "_residency_manager", None)
+    return server
+
+
+class TestLoadModelPassesTheTemplate:
+    def test_simple_engine(self, clean_server_state):
+        from unittest.mock import MagicMock, patch
+
+        server = clean_server_state
+        with (
+            patch.object(
+                server, "SimpleEngine", return_value=MagicMock()
+            ) as engine_cls,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+            patch("vllm_mlx.server.asyncio.new_event_loop", return_value=MagicMock()),
+            patch("vllm_mlx.server.asyncio.set_event_loop"),
+        ):
+            server.load_model("m", use_batching=False, chat_template=OVERRIDE)
+            assert engine_cls.call_args.kwargs["chat_template"] == OVERRIDE
+            server.load_model("m", use_batching=False)
+            assert engine_cls.call_args.kwargs["chat_template"] is None
+
+    def test_batched_engine(self, clean_server_state):
+        from unittest.mock import MagicMock, patch
+
+        server = clean_server_state
+        with (
+            patch.object(
+                server, "BatchedEngine", return_value=MagicMock()
+            ) as engine_cls,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+        ):
+            server.load_model("m", use_batching=True, chat_template=OVERRIDE)
+            assert engine_cls.call_args.kwargs["chat_template"] == OVERRIDE
+            server.load_model("m", use_batching=True)
+            assert engine_cls.call_args.kwargs["chat_template"] is None
+
+    def test_lifecycle_residency_spec(self, clean_server_state, monkeypatch):
+        server = clean_server_state
+        specs = []
+
+        class FakeResidencyManager:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def register_model(self, spec):
+                specs.append(spec)
+
+        monkeypatch.setattr(server, "ResidencyManager", FakeResidencyManager)
+        server.load_model(
+            "m",
+            auto_unload_idle_seconds=60.0,
+            lazy_load_model=True,
+            chat_template=OVERRIDE,
+        )
+        assert [s.chat_template for s in specs] == [OVERRIDE]
+
+
+class TestEntryPointsPassTheTemplate:
+    def test_serve_command(self, clean_server_state, monkeypatch, tmp_path):
+        from vllm_mlx import cli
+        from vllm_mlx.utils import download
+
+        path = tmp_path / "t.jinja"
+        path.write_text(OVERRIDE, encoding="utf-8")
+        loaded = {}
+        monkeypatch.setattr(
+            download, "ensure_model_downloaded", lambda *a, **k: "local-test-model"
+        )
+        monkeypatch.setattr(
+            clean_server_state,
+            "load_model",
+            lambda *args, **kwargs: loaded.update(kwargs),
+        )
+        monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+        args = cli.create_parser().parse_args(
+            ["serve", "local-test-model", "--chat-template", str(path)]
+        )
+        cli.serve_command(args)
+        assert loaded["chat_template"] == OVERRIDE
+
+        loaded.clear()
+        cli.serve_command(
+            cli.create_parser().parse_args(["serve", "local-test-model"])
+        )
+        assert loaded["chat_template"] is None
+
+    def test_server_main(self, clean_server_state, monkeypatch, tmp_path):
+        import sys
+
+        server = clean_server_state
+        path = tmp_path / "t.jinja"
+        path.write_text(OVERRIDE, encoding="utf-8")
+        loaded = {}
+        monkeypatch.setattr(
+            server, "load_model", lambda *args, **kwargs: loaded.update(kwargs)
+        )
+        monkeypatch.setattr(server, "load_embedding_model", lambda *a, **k: None)
+        monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["vllm_mlx.server", "--model", "m", "--chat-template", str(path)],
+        )
+        server.main()
+        assert loaded["chat_template"] == OVERRIDE
+
+
+class TestMultimodalEnginesPassTheTemplate:
+    @pytest.fixture
+    def recorded_mllm(self, monkeypatch):
+        import vllm_mlx.models.mllm as mllm_mod
+
+        constructed = []
+
+        class FakeMLXMultimodalLM:
+            def __init__(self, model_name, **kwargs):
+                constructed.append(kwargs)
+                self.model = object()
+                self.processor = object()
+
+            def load(self):
+                return None
+
+        monkeypatch.setattr(mllm_mod, "MLXMultimodalLM", FakeMLXMultimodalLM)
+        return constructed
+
+    def test_simple_engine(self, recorded_mllm):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine("org/vlm", force_mllm=True, chat_template=OVERRIDE)
+        engine.prepare_for_start()
+        assert recorded_mllm[-1]["chat_template"] == OVERRIDE
+
+    def test_batched_engine(self, recorded_mllm, monkeypatch):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        import mlx.core as mx
+
+        # The MLLM branch sets process-wide Metal limits when a GPU is present.
+        monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+        engine = BatchedEngine("org/vlm", force_mllm=True, chat_template=OVERRIDE)
+        engine.prepare_for_start()
+        assert recorded_mllm[-1]["chat_template"] == OVERRIDE

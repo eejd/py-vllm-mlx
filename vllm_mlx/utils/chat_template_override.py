@@ -13,12 +13,18 @@ server keys its caches on.
 """
 
 import argparse
-import codecs
 import logging
 import os
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Escapes decoded in an inline template. Anything else after a backslash (a quote, a
+# second backslash, \uXXXX...) is left for Jinja, which has its own string escapes, and
+# non-ASCII text is never reinterpreted.
+_INLINE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r"}
+_BACKSLASH_PAIR = re.compile(r"\\(.)", re.DOTALL)
 
 # A value containing none of these cannot be a Jinja template, so a value that is not
 # an existing file is a mistyped path, not an inline template.
@@ -27,9 +33,9 @@ _JINJA_CHARS = ("{", "}", "\n")
 
 CHAT_TEMPLATE_HELP = (
     "Replace the chat template the model ships with: a path to a Jinja template "
-    "file, or the template itself on one line (\\n escapes are decoded). Applies to "
-    "text and multimodal models. Needed for Phi-4-mini tool calling, whose own "
-    "template ignores tools: use the template shipped in the package, "
+    "file, or the template itself on one line (\\n, \\t and \\r are decoded). "
+    "Applies to text and multimodal models. Needed for Phi-4-mini tool calling, "
+    "whose own template ignores tools: use the template shipped in the package, "
     "vllm_mlx/templates/tool_chat_template_phi4_mini.jinja. Not supported with "
     "--models-config."
 )
@@ -39,7 +45,8 @@ def resolve_chat_template(value: str) -> str:
     """Return the template text for a ``--chat-template`` value.
 
     ``value`` is a path to a template file, or the template itself in single-line
-    form (``\\n`` escapes are decoded, as in vLLM). Raises ``ValueError`` when it is
+    form (``\\n``, ``\\t`` and ``\\r`` are decoded; other text is kept as typed, so
+    non-ASCII characters and ``\\"`` survive). Raises ``ValueError`` when it is
     neither or the text is not valid Jinja.
     """
     if not value or not value.strip():
@@ -55,7 +62,11 @@ def resolve_chat_template(value: str) -> str:
             "like an inline Jinja template (no '{', '}' or newline)"
         )
     else:
-        template = codecs.decode(value, "unicode_escape")
+        # Pairs are consumed whole, so a typed double backslash followed by n stays
+        # as typed instead of becoming a backslash and a newline.
+        template = _BACKSLASH_PAIR.sub(
+            lambda m: _INLINE_ESCAPES.get(m.group(1), m.group(0)), value
+        )
 
     from jinja2 import Environment, TemplateSyntaxError
 
