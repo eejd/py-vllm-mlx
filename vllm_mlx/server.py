@@ -172,6 +172,7 @@ from .cli_arg_types import (
     make_positive_int_arg_parser,
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .utils.chat_template_override import CHAT_TEMPLATE_HELP, chat_template_arg
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
     resolve_stt_model_name,
@@ -1731,6 +1732,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             specprefill_keep_pct=spec.specprefill_keep_pct,
             specprefill_backbone_pct=spec.specprefill_backbone_pct,
             specprefill_draft_model=spec.specprefill_draft_model,
+            chat_template=spec.chat_template,
         )
 
     from .engine.simple import SimpleEngine
@@ -1753,6 +1755,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         prefix_trie_cache=spec.prefix_trie_cache,
         prefix_trie_cache_size=spec.prefix_trie_cache_size,
         prefix_trie_cache_memory_mb=spec.prefix_trie_cache_memory_mb,
+        chat_template=spec.chat_template,
     )
 
 
@@ -4192,6 +4195,7 @@ def load_model(
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
     default_mllm_draft: bool = False,
+    chat_template: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -4226,6 +4230,8 @@ def load_model(
             startup.
         default_mllm_draft: Enable a configured assistant drafter unless a
             request explicitly opts out.
+        chat_template: Template text (already resolved, see
+            ``utils.chat_template_override``) that replaces the model's own.
     """
     global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
     global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
@@ -4321,6 +4327,7 @@ def load_model(
             prefix_trie_cache=prefix_trie_cache,
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
+            chat_template=chat_template,
         )
         _residency_manager = ResidencyManager(
             _engine_factory,
@@ -4358,6 +4365,7 @@ def load_model(
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
+            chat_template=chat_template,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -4390,6 +4398,7 @@ def load_model(
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
             default_mllm_draft=default_mllm_draft,
+            chat_template=chat_template,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -8305,6 +8314,7 @@ def main():
         default_mllm_draft=args.default_mllm_draft,
         auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         lazy_load_model=args.lazy_load_model,
+        chat_template=args.chat_template,
     )
 
     # Start server with TCP keepalive for fast dead-client detection.
@@ -8515,6 +8525,12 @@ Examples:
         type=float,
         default=None,
         help="Default top_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--chat-template",
+        type=chat_template_arg,
+        default=None,
+        help=CHAT_TEMPLATE_HELP,
     )
     parser.add_argument(
         "--default-chat-template-kwargs",

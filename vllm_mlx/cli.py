@@ -23,6 +23,7 @@ from .cli_arg_types import (
     memory_budget_gb_arg,
 )
 from .tool_parsers import ToolParserManager
+from .utils.chat_template_override import CHAT_TEMPLATE_HELP, chat_template_arg
 
 
 
@@ -92,6 +93,9 @@ def serve_command(args):
         sys.exit(1)
     if memory_budget_gb is not None and not models_config:
         print("Error: --memory-budget-gb requires --models-config")
+        sys.exit(1)
+    if models_config and getattr(args, "chat_template", None) is not None:
+        print("Error: --chat-template cannot be used with --models-config")
         sys.exit(1)
 
     # Persisted prefix cache: where it lives, whether it is read or written, and
@@ -498,6 +502,7 @@ def serve_command(args):
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
             default_mllm_draft=default_mllm_draft,
+            chat_template=getattr(args, "chat_template", None),
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
@@ -1575,6 +1580,12 @@ Examples:
             "tokens by forcing the end-think sequence when the budget is exhausted. "
             "Per-request thinking_token_budget overrides this. (default: None = unlimited)"
         ),
+    )
+    serve_parser.add_argument(
+        "--chat-template",
+        type=chat_template_arg,
+        default=None,
+        help=CHAT_TEMPLATE_HELP,
     )
     serve_parser.add_argument(
         "--default-chat-template-kwargs",

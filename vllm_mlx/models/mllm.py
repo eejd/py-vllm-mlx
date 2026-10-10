@@ -35,6 +35,7 @@ import requests
 from vllm_mlx.engine.chat_template_safety import normalize_messages_for_chat_template
 from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
 from vllm_mlx.mlx_cache_compat import clone_layer
+from vllm_mlx.utils.chat_template_override import apply_chat_template_override
 
 logger = logging.getLogger(__name__)
 
@@ -1638,6 +1639,7 @@ class MLXMultimodalLM:
         draft_kind: str | None = None,
         draft_block_size: int | None = None,
         default_draft_enabled: bool = False,
+        chat_template: str | None = None,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -1651,6 +1653,7 @@ class MLXMultimodalLM:
             draft_model: Optional MLLM speculative draft/assistant model path.
             draft_kind: Optional mlx-vlm draft kind, for example "mtp".
             draft_block_size: Optional speculative block size passed to mlx-vlm.
+            chat_template: Template text replacing the model's own (``--chat-template``).
         """
         self.model_name = model_name
         self.trust_remote_code = trust_remote_code
@@ -1660,6 +1663,7 @@ class MLXMultimodalLM:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.default_draft_enabled = default_draft_enabled
+        self._chat_template = chat_template
 
         self.model = None
         self.processor = None
@@ -1686,6 +1690,7 @@ class MLXMultimodalLM:
             logger.info(f"Loading MLLM: {self.model_name}")
 
             self.model, self.processor = load(self.model_name)
+            apply_chat_template_override(self.processor, self._chat_template)
             self.config = load_config(self.model_name)
             if self.draft_model_path:
                 self._draft_model = self._load_draft_model()

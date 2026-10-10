@@ -91,6 +91,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `glm47` | `glm4` | GLM-4.7, GLM-4.7-Flash | `<tool_call>` with `<arg_key>`/`<arg_value>` XML |
 | `lfm2` | `lfm2.5` | Liquid LFM2, LFM2.5 | `<\|tool_call_start\|>[fn(arg=value)]<\|tool_call_end\|>` Python-call list |
 | `minicpm` | `minicpm5` | MiniCPM5 | `<function name=".."><param name="..">..</param></function>` XML |
+| `phi4_mini_json` | `phi4_mini`, `phi4` | Microsoft Phi-4-mini | `functools[{"name": .., "arguments": {..}}]` JSON list; needs `--chat-template` |
 
 ## Model Examples
 
@@ -203,6 +204,26 @@ vllm-mlx serve lmstudio-community/GLM-4.7-Flash-MLX-8bit \
 vllm-mlx serve mlx-community/Kimi-K2-Instruct-4bit \
   --enable-auto-tool-choice --tool-call-parser kimi
 ```
+
+### Microsoft Phi-4-mini
+
+Phi-4-mini's own chat template ignores the OpenAI `tools=` argument: the model is
+never told which tools exist and answers in prose. The package ships vLLM's tool
+template (adapted, see the header of the file) and `--chat-template` installs it:
+
+```bash
+TEMPLATE=$(python -c 'import vllm_mlx.templates as t; print(t.PHI4_MINI_TOOL_TEMPLATE)')
+vllm-mlx serve mlx-community/Phi-4-mini-instruct-4bit \
+  --enable-auto-tool-choice --tool-call-parser phi4_mini_json \
+  --chat-template "$TEMPLATE"
+```
+
+`--chat-template` takes a file path or a one-line inline template, applies to every
+engine (Simple, Batched, text and multimodal), and is refused with `--models-config`.
+The model answers a call with `functools[{"name": ..., "arguments": {...}}]`; the
+parser finds the end of the list with a bracket scan, so arguments containing `]`
+are safe, and a list it cannot fully parse stays in `content`. It streams: each call
+is emitted once, when its list closes.
 
 ### Salesforce xLAM
 
