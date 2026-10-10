@@ -49,6 +49,9 @@ def _tojson(value, ensure_ascii=False, indent=None, **kwargs):
     return json.dumps(value, ensure_ascii=ensure_ascii, indent=indent, **kwargs)
 
 
+EOS = "<|endoftext|>"
+
+
 def render(messages, tools=None, add_generation_prompt=True, **extra):
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
     env.filters["tojson"] = _tojson
@@ -57,6 +60,7 @@ def render(messages, tools=None, add_generation_prompt=True, **extra):
         messages=messages,
         tools=tools,
         add_generation_prompt=add_generation_prompt,
+        eos_token=EOS,
         **extra,
     )
 
@@ -101,16 +105,90 @@ class TestRenderTools:
     def test_without_tools_there_is_no_function_calling_prompt(self):
         prompt = render([{"role": "user", "content": "hi"}])
         assert "functools" not in prompt
-        assert prompt == (
-            "<|system|>\nYou are a helpful assistant.<|end|><|user|>hi<|end|>"
-            "<|assistant|>"
+        assert "helpful assistant" not in prompt
+
+
+# The model's own template, copied from mlx-community/Phi-4-mini-instruct-4bit
+# tokenizer_config.json. Without tools the shipped template must render exactly this.
+STOCK_TEMPLATE = (
+    "{% for message in messages %}{% if message['role'] == 'system' and 'tools' in "
+    "message and message['tools'] is not none %}{{ '<|' + message['role'] + '|>' + "
+    "message['content'] + '<|tool|>' + message['tools'] + '<|/tool|>' + '<|end|>' }}"
+    "{% else %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}"
+    "{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}"
+    "{% else %}{{ eos_token }}{% endif %}"
+)
+
+_SYSTEM = {"role": "system", "content": "Be brief."}
+_USER = {"role": "user", "content": "Hi there"}
+_ASSISTANT = {"role": "assistant", "content": "Hello!"}
+_USER_2 = {"role": "user", "content": "And now?"}
+
+# name -> (messages, add_generation_prompt, literal prompt)
+TOOL_LESS_CASES = {
+    "no_system": ([_USER], True, "<|user|>Hi there<|end|><|assistant|>"),
+    "no_system_no_generation_prompt": ([_USER], False, f"<|user|>Hi there<|end|>{EOS}"),
+    "system": (
+        [_SYSTEM, _USER],
+        True,
+        "<|system|>Be brief.<|end|><|user|>Hi there<|end|><|assistant|>",
+    ),
+    "system_no_generation_prompt": (
+        [_SYSTEM, _USER],
+        False,
+        f"<|system|>Be brief.<|end|><|user|>Hi there<|end|>{EOS}",
+    ),
+    "multi_turn": (
+        [_SYSTEM, _USER, _ASSISTANT, _USER_2],
+        True,
+        "<|system|>Be brief.<|end|><|user|>Hi there<|end|><|assistant|>Hello!<|end|>"
+        "<|user|>And now?<|end|><|assistant|>",
+    ),
+    "multi_turn_no_generation_prompt": (
+        [_USER, _ASSISTANT, _USER_2],
+        False,
+        "<|user|>Hi there<|end|><|assistant|>Hello!<|end|><|user|>And now?<|end|>"
+        + EOS,
+    ),
+    "legacy_system_tools_field": (
+        [
+            {
+                "role": "system",
+                "content": "Be brief.",
+                "tools": '[{"name": "f"}]',
+            },
+            _USER,
+        ],
+        True,
+        '<|system|>Be brief.<|tool|>[{"name": "f"}]<|/tool|><|end|>'
+        "<|user|>Hi there<|end|><|assistant|>",
+    ),
+}
+
+
+class TestToolLessRequestsKeepTheStockLayout:
+    """A server-wide --chat-template must not change prompts that carry no tools."""
+
+    @pytest.mark.parametrize("case", sorted(TOOL_LESS_CASES))
+    @pytest.mark.parametrize("tools", [None, []])
+    def test_literal_layout(self, case, tools):
+        messages, add_generation_prompt, expected = TOOL_LESS_CASES[case]
+        assert (
+            render(messages, tools=tools, add_generation_prompt=add_generation_prompt)
+            == expected
         )
 
-    def test_generation_prompt_is_not_added_when_not_requested(self):
-        prompt = render(
-            [{"role": "user", "content": "hi"}], add_generation_prompt=False
+    @pytest.mark.parametrize("case", sorted(TOOL_LESS_CASES))
+    def test_stock_template_renders_the_same_literal(self, case):
+        # Keeps the literals honest: they are what the model's own template renders.
+        messages, add_generation_prompt, expected = TOOL_LESS_CASES[case]
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+        stock = env.from_string(STOCK_TEMPLATE).render(
+            messages=messages,
+            add_generation_prompt=add_generation_prompt,
+            eos_token=EOS,
         )
-        assert prompt.endswith("<|user|>hi<|end|>")
+        assert stock == expected
 
 
 class TestRenderToolHistory:
@@ -252,6 +330,18 @@ class TestRealTokenizer:
             add_generation_prompt=True,
         )
         assert "get_weather" not in prompt
+
+    @pytest.mark.parametrize("case", sorted(TOOL_LESS_CASES))
+    def test_without_tools_the_prompt_is_the_models_own(
+        self, tokenizer, template, case
+    ):
+        messages, add_generation_prompt, expected = TOOL_LESS_CASES[case]
+        kwargs = dict(tokenize=False, add_generation_prompt=add_generation_prompt)
+        stock = tokenizer.apply_chat_template(messages, **kwargs)
+        shipped = tokenizer.apply_chat_template(
+            messages, chat_template=template, **kwargs
+        )
+        assert shipped == stock == expected
 
     def test_shipped_template_shows_the_tools(self, tokenizer, template):
         prompt = tokenizer.apply_chat_template(

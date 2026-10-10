@@ -6,7 +6,11 @@
 
   Derived from vLLM's examples/tool_chat_template_phi4_mini.jinja
   (https://github.com/vllm-project/vllm, Apache-2.0, Copyright contributors to the vLLM
-  project). Same prompt text and layout. Changes made in this fork (vllm-mlx):
+  project). Changes made in this fork (vllm-mlx):
+    * WITHOUT tools the output is byte-identical to Phi-4-mini's own template (the
+      branch below is that template, verbatim), so a server started with this template
+      renders requests that carry no tools exactly as it would without it. Only the
+      tools branch differs from the stock template, and it is vLLM's prompt text;
     * assistant `tool_calls` are rendered in the format the system prompt asks the
       model to produce, `functools[{...}, {...}]`; upstream renders a bare
       `{...}, {...}` that the model was never told to emit, and drops the calls when
@@ -15,10 +19,14 @@
       JSON string) are rendered as JSON, not as a Python dict repr;
     * the OpenAI `tool` role is handled like upstream's `tools` role; a result that is
       not already a JSON object/array is rendered as a JSON string so
-      `{"result": ...}` stays valid JSON.
+      `{"result": ...}` stays valid JSON. A result that merely starts with `{` or `[`
+      is assumed to be JSON and is not validated (known limitation);
     * the trailing `<|assistant|>` follows `add_generation_prompt` (default: added).
   Use with `--tool-call-parser phi4_mini_json`.
 -#}
+{%- if not tools -%}
+{% for message in messages %}{% if message['role'] == 'system' and 'tools' in message and message['tools'] is not none %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|tool|>' + message['tools'] + '<|/tool|>' + '<|end|>' }}{% else %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% else %}{{ eos_token }}{% endif %}
+{%- else -%}
 {%- if messages and messages[0]['role'] == 'system' %}
     {%- set system_message = messages[0]['content']|trim %}
     {%- set messages = messages[1:] %}
@@ -89,3 +97,4 @@ If you decide to call functions:
 {%- endif %}
 {{ response }}
 {%- if response %}<|user|>{% endif %}
+{%- endif %}
