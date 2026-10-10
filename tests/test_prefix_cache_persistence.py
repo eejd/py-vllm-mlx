@@ -33,10 +33,15 @@ from vllm_mlx.prefix_cache_persistence import (
 # --- the valid persist x reset matrix (documented in the module docstring) ---------------
 
 VALID = {
-    ("auto", "never"), ("auto", "start"),
-    ("none", "never"), ("none", "start"), ("none", "stop"), ("none", "both"),
+    ("auto", "never"),
+    ("auto", "start"),
+    ("none", "never"),
+    ("none", "start"),
+    ("none", "stop"),
+    ("none", "both"),
     ("load-only", "never"),
-    ("save-only", "never"), ("save-only", "start"),
+    ("save-only", "never"),
+    ("save-only", "start"),
 }
 
 
@@ -62,7 +67,9 @@ def test_defaults_are_the_historical_behavior(monkeypatch):
 
 def test_directory_option_beats_env_and_env_beats_default(tmp_path):
     env = {ENV_DIR: str(tmp_path / "from-env")}
-    assert PersistencePolicy.from_options(environ=env).base_dir == str(tmp_path / "from-env")
+    assert PersistencePolicy.from_options(environ=env).base_dir == str(
+        tmp_path / "from-env"
+    )
     opt = PersistencePolicy.from_options(str(tmp_path / "opt"), environ=env)
     assert opt.base_dir == str(tmp_path / "opt")
     assert opt.resolve_dir("a\\b") == str(tmp_path / "opt" / "a--b")
@@ -87,7 +94,9 @@ def test_unknown_modes_are_refused():
 
 def _populate(d: Path, entries: int = 2) -> None:
     d.mkdir(parents=True, exist_ok=True)
-    (d / "index.json").write_text(json.dumps({"entries": [{"index": i} for i in range(entries)]}))
+    (d / "index.json").write_text(
+        json.dumps({"entries": [{"index": i} for i in range(entries)]})
+    )
     for i in range(entries):
         (d / f"entry_{i}.safetensors").write_bytes(b"k" * 100)
         (d / f"entry_{i}_tokens.bin").write_bytes(b"t" * 8)
@@ -204,7 +213,9 @@ def policy_for(tmp_path):
 
     def make(persist="auto", reset="never"):
         server.set_prefix_cache_policy(
-            PersistencePolicy(base_dir=str(tmp_path / "base"), persist=persist, reset=reset)
+            PersistencePolicy(
+                base_dir=str(tmp_path / "base"), persist=persist, reset=reset
+            )
         )
         server._model_path = "org/model"
         return tmp_path / "base" / "org--model"
@@ -215,7 +226,9 @@ def policy_for(tmp_path):
 
 
 def _digest(d: Path) -> dict[str, str]:
-    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(d.iterdir())}
+    return {
+        p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(d.iterdir())
+    }
 
 
 def _run(coro):
@@ -297,7 +310,9 @@ def test_registry_models_get_their_own_directories(policy_for):
     _run(server._save_prefix_cache_to_disk(a, model_key="org/a"))
     _run(server._save_prefix_cache_to_disk(b, model_key="org/b"))
     base = d.parent
-    assert describe_dir(base / "org--a")[0] == 1 and describe_dir(base / "org--b")[0] == 2
+    assert (
+        describe_dir(base / "org--a")[0] == 1 and describe_dir(base / "org--b")[0] == 2
+    )
     assert not (base / "default").exists()
 
 
@@ -313,7 +328,9 @@ def test_registry_hooks_pass_the_models_name(policy_for):
     assert eng2.loads == [str(d.parent / "org--regmodel")]
 
 
-def test_an_unsafe_reset_at_start_fails_instead_of_silently_loading(policy_for, tmp_path):
+def test_an_unsafe_reset_at_start_fails_instead_of_silently_loading(
+    policy_for, tmp_path
+):
     d = policy_for("auto", "start")
     real = tmp_path / "elsewhere"
     _populate(real, 2)
@@ -361,12 +378,22 @@ def test_serve_accepts_the_options_and_defaults_are_historical():
     parser = create_parser()
     a = parser.parse_args(["serve", "m"])
     assert (a.prefix_cache_dir, a.prefix_cache_persist, a.prefix_cache_reset) == (
-        None, "auto", "never",
+        None,
+        "auto",
+        "never",
     )
-    b = parser.parse_args([
-        "serve", "m", "--prefix-cache-dir", "/x", "--prefix-cache-persist", "load-only",
-        "--prefix-cache-reset", "never",
-    ])
+    b = parser.parse_args(
+        [
+            "serve",
+            "m",
+            "--prefix-cache-dir",
+            "/x",
+            "--prefix-cache-persist",
+            "load-only",
+            "--prefix-cache-reset",
+            "never",
+        ]
+    )
     assert (b.prefix_cache_dir, b.prefix_cache_persist) == ("/x", "load-only")
     with pytest.raises(SystemExit):
         parser.parse_args(["serve", "m", "--prefix-cache-persist", "sometimes"])
@@ -416,7 +443,9 @@ def test_an_oserror_in_reset_at_start_fails_startup_and_blocks_the_shutdown_save
 ):
     d = policy_for("auto", "start")
     monkeypatch.setattr(
-        server, "reset_cache_dir", lambda path: (_ for _ in ()).throw(PermissionError("x"))
+        server,
+        "reset_cache_dir",
+        lambda path: (_ for _ in ()).throw(PermissionError("x")),
     )
     eng = StubEngine()
     with pytest.raises(PersistenceError, match="reset at start failed"):

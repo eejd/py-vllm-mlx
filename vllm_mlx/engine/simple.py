@@ -590,7 +590,9 @@ class SimpleEngine(BaseEngine):
                     ):
                         self._prefix_trie_cache_stats["skips"] += 1
                         return None, None, 0
-                trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(trie_key, tokens)
+                trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(
+                    trie_key, tokens
+                )
             if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
                 self._prefix_trie_cache_stats["misses"] += 1
                 return None, None, 0

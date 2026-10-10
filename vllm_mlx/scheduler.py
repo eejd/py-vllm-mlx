@@ -1790,16 +1790,13 @@ class Scheduler:
                 # paged and legacy prefix-cache hits): each of them hands back
                 # a state that covers the whole key.
                 reusable = request.prompt_cache is not None and all(
-                    _is_exactly_rewindable(layer)
-                    for layer in request.prompt_cache
+                    _is_exactly_rewindable(layer) for layer in request.prompt_cache
                 )
                 if reusable:
                     # Rewind one position on a copy (the stored entry is
                     # untouched) and feed just the last token: the model
                     # then sees each position exactly once.
-                    request.prompt_cache = _trim_cache_offset(
-                        request.prompt_cache, 1
-                    )
+                    request.prompt_cache = _trim_cache_offset(request.prompt_cache, 1)
                     request.cached_tokens = len(request.prompt_token_ids) - 1
                     request.remaining_tokens = request.prompt_token_ids[-1:]
                     tokens_to_process = request.remaining_tokens

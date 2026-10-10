@@ -25,7 +25,6 @@ from .cli_arg_types import (
 from .tool_parsers import ToolParserManager
 
 
-
 class _ExplicitStoreTrue(argparse.Action):
     """``store_true`` that also records that the flag was given on the command line.
 
@@ -123,7 +122,9 @@ def serve_command(args):
 
     server.set_cache_launch_options(cache_state.launch_options(args))
     # Registry entries choose their own engine, so the global flags cannot be called inert there.
-    inert = [] if getattr(args, "models_config", None) else cache_state.inert_options(args)
+    inert = (
+        [] if getattr(args, "models_config", None) else cache_state.inert_options(args)
+    )
     if inert:
         print(
             "Warning: these options only take effect with --continuous-batching and are "

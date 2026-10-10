@@ -17,7 +17,10 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 cache_mod = pytest.importorskip("mlx_lm.models.cache")
 
-from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig  # noqa: E402
+from vllm_mlx.memory_cache import (
+    MemoryAwarePrefixCache,
+    MemoryCacheConfig,
+)  # noqa: E402
 from vllm_mlx.mllm_batch_generator import (  # noqa: E402
     MLLMBatchGenerator,
     MLLMBatchRequest,

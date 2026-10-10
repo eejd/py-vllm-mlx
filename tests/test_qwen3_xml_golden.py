@@ -27,14 +27,20 @@ def test_corpus_is_the_pinned_one():
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["id"])
 def test_non_streaming_extraction(case):
-    result = Qwen3XMLToolParser(None).extract_tool_calls(case["text"], {"tools": case["tools"]})
-    calls = [{"name": c["name"], "arguments": c["arguments"]} for c in result.tool_calls]
+    result = Qwen3XMLToolParser(None).extract_tool_calls(
+        case["text"], {"tools": case["tools"]}
+    )
+    calls = [
+        {"name": c["name"], "arguments": c["arguments"]} for c in result.tool_calls
+    ]
     assert check_case(case, calls, result.content) == []
 
 
 def test_truncated_call_becomes_content_not_a_call():
     case = next(c for c in CASES if c["id"] == "truncated_mid_value")
-    result = Qwen3XMLToolParser(None).extract_tool_calls(case["text"], {"tools": case["tools"]})
+    result = Qwen3XMLToolParser(None).extract_tool_calls(
+        case["text"], {"tools": case["tools"]}
+    )
     assert not result.tools_called and "Tok" in result.content
 
 
@@ -70,11 +76,14 @@ def test_repair_json_arguments(raw, expected):
 def test_server_coerce_closes_missing_braces_and_never_completes_values():
     from vllm_mlx.server import _coerce_tool_arguments
 
-    assert json.loads(_coerce_tool_arguments('{"city": "Tokyo"', "get_weather", None)) == {
-        "city": "Tokyo"
-    }
+    assert json.loads(
+        _coerce_tool_arguments('{"city": "Tokyo"', "get_weather", None)
+    ) == {"city": "Tokyo"}
     assert _coerce_tool_arguments('{"city": "To', "get_weather", None) == '{"city": "To'
-    assert _coerce_tool_arguments('{"city": "Tokyo"}', "get_weather", None) == '{"city": "Tokyo"}'
+    assert (
+        _coerce_tool_arguments('{"city": "Tokyo"}', "get_weather", None)
+        == '{"city": "Tokyo"}'
+    )
 
 
 def _extract(text):
@@ -108,4 +117,6 @@ def test_prose_mentioning_function_tag_falls_back_to_valid_only():
         "<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>"
     )
     result = _extract(text)
-    assert [json.loads(c["arguments"]) for c in result.tool_calls] == [{"city": "Tokyo"}]
+    assert [json.loads(c["arguments"]) for c in result.tool_calls] == [
+        {"city": "Tokyo"}
+    ]

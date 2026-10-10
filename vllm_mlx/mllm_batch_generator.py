@@ -2153,9 +2153,7 @@ class MLLMBatchGenerator:
                         len(input_ids_list),
                         len(input_ids_list),
                     )
-                    self._record_cache_use(
-                        req, cache_credited, len(input_ids_list)
-                    )
+                    self._record_cache_use(req, cache_credited, len(input_ids_list))
                 elif cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
                     # The prepared cache is an isolated recursive copy.

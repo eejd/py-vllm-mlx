@@ -35,7 +35,9 @@ def _ssd_scheduler(layer_factory=_kv, prompt_len=8, stored_len=8):
     sched._ssd_tier = SimpleNamespace(
         _stats=stats,
         _index=SimpleNamespace(touch=touched.append),
-        _read_entry=lambda tokens, path: [layer_factory(stored_len) for _ in range(LAYERS)],
+        _read_entry=lambda tokens, path: [
+            layer_factory(stored_len) for _ in range(LAYERS)
+        ],
     )
     sched._reconstruct_ssd_layers = lambda layers: layers
     request = Request(

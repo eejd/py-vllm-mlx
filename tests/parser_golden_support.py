@@ -2,6 +2,7 @@
 
 The corpus is tests/data/parser_golden.jsonl, sha256 cdeb531c941bd95caf2d64f995dc35c6a26e2a58041c17d601487ea79b099735.
 """
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,9 @@ def load_cases(path: Path = DATA) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def iter_parser_cases(policies: Sequence[str] | None = None) -> Iterator[dict[str, Any]]:
+def iter_parser_cases(
+    policies: Sequence[str] | None = None,
+) -> Iterator[dict[str, Any]]:
     for case in load_cases():
         if policies is None or case["policy"] in policies:
             yield case
@@ -71,10 +74,14 @@ def check_case(
             problems.append(f"expected {case['expected_calls']!r}, got {decoded!r}")
     elif policy == "reject":
         if calls:
-            problems.append(f"emitted {len(calls)} call(s) for output that must not become one")
+            problems.append(
+                f"emitted {len(calls)} call(s) for output that must not become one"
+            )
     elif policy == "content":
         if calls:
-            problems.append(f"emitted {len(calls)} call(s) for output that is not a call")
+            problems.append(
+                f"emitted {len(calls)} call(s) for output that is not a call"
+            )
         if not (content or "").strip() or case["text"].strip() not in (content or ""):
             problems.append("text did not come back as content")
     return problems

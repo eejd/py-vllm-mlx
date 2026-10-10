@@ -72,7 +72,9 @@ def _setup(entry_tokens, layer_factory=_kv, max_kv_size=0):
     sched.memory_aware_cache = cache
     if entry_tokens:
         n = len(entry_tokens)
-        assert cache.store(list(entry_tokens), [layer_factory(n) for _ in range(LAYERS)])
+        assert cache.store(
+            list(entry_tokens), [layer_factory(n) for _ in range(LAYERS)]
+        )
     rec = _Recorder()
     sched.batch_generator = rec
     params = SamplingParams()
@@ -219,7 +221,8 @@ def test_exact_reuse_with_kv_quantization_on():
     assert request.cached_tokens == 7
     assert rec.calls[0]["prompts"] == [[8]]
     assert all(
-        not isinstance(layer, _QuantizedCacheWrapper) for layer in rec.calls[0]["caches"][0]
+        not isinstance(layer, _QuantizedCacheWrapper)
+        for layer in rec.calls[0]["caches"][0]
     )
     assert [layer.offset for layer in rec.calls[0]["caches"][0]] == [7] * LAYERS
     assert _stats(cache) == (1, 0, 7, 0)
@@ -229,7 +232,9 @@ def test_reschedule_after_an_error_takes_the_whole_hit_back_once():
     sched, cache, _ = _setup(PROMPT[:5])
     request = _run(sched, PROMPT)
     assert _stats(cache) == (1, 0, 5, 0)
-    request.status = __import__("vllm_mlx.request", fromlist=["RequestStatus"]).RequestStatus.RUNNING
+    request.status = __import__(
+        "vllm_mlx.request", fromlist=["RequestStatus"]
+    ).RequestStatus.RUNNING
     sched.running[request.request_id] = request
     sched._reschedule_running_requests()
     assert _stats(cache) == (0, 1, 0, 1)
@@ -272,7 +277,9 @@ def test_loaded_entries_are_quantized_when_kv_quantization_is_on(tmp_path):
     _save(tmp_path)
     plain = _loader()
     assert plain.load_from_disk(str(tmp_path)) == 1
-    quant = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4)
+    quant = _loader(
+        kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4
+    )
     assert quant.load_from_disk(str(tmp_path)) == 1
 
     layers = next(iter(quant._entries.values())).cache
@@ -284,7 +291,9 @@ def test_loaded_entries_are_quantized_when_kv_quantization_is_on(tmp_path):
 
 def test_a_loaded_quantized_entry_still_serves_an_exact_fetch(tmp_path):
     _save(tmp_path)
-    quant = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4)
+    quant = _loader(
+        kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4
+    )
     quant.load_from_disk(str(tmp_path))
     cache, rest = quant.fetch(list(range(8)))
     assert cache is not None and rest == []
@@ -293,7 +302,9 @@ def test_a_loaded_quantized_entry_still_serves_an_exact_fetch(tmp_path):
 
 def test_short_entries_stay_unquantized_on_load(tmp_path):
     _save(tmp_path)
-    quant = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=64)
+    quant = _loader(
+        kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=64
+    )
     assert quant.load_from_disk(str(tmp_path)) == 1
     layers = next(iter(quant._entries.values())).cache
     assert not any(isinstance(layer, _QuantizedCacheWrapper) for layer in layers)
@@ -332,17 +343,23 @@ def test_an_entry_that_cannot_be_quantized_is_kept_unquantized(tmp_path):
     )
     assert src.store(list(range(8)), [_kv(8, dim=48) for _ in range(LAYERS)])
     assert src.save_to_disk(str(tmp_path))
-    quant = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4)
+    quant = _loader(
+        kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4
+    )
     assert quant.load_from_disk(str(tmp_path)) == 1  # dim 48 % 64 != 0
     layers = next(iter(quant._entries.values())).cache
     assert not any(isinstance(layer, _QuantizedCacheWrapper) for layer in layers)
 
 
 def test_quantized_store_save_load_round_trip_stays_quantized(tmp_path):
-    src = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4)
+    src = _loader(
+        kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4
+    )
     assert src.store(list(range(8)), [_kv(8, dim=64) for _ in range(LAYERS)])
     assert src.save_to_disk(str(tmp_path))
-    dst = _loader(kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4)
+    dst = _loader(
+        kv_quantize=True, kv_bits=8, kv_group_size=64, kv_min_quantize_tokens=4
+    )
     assert dst.load_from_disk(str(tmp_path)) == 1
     layers = next(iter(dst._entries.values())).cache
     assert all(isinstance(layer, _QuantizedCacheWrapper) for layer in layers)

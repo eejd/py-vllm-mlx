@@ -1113,12 +1113,16 @@ class TestResponsesRegistryRouting:
         assert registry.engines["alpha"].chat.await_count == 1
         assert registry.engines["beta"].chat.await_count == 1
 
-    def test_cached_tokens_come_from_the_requested_models_engine(self, client, registry):
+    def test_cached_tokens_come_from_the_requested_models_engine(
+        self, client, registry
+    ):
         body = client.post(
             "/v1/responses", json={"model": "alpha", "input": "hi"}
         ).json()
         assert body["usage"]["input_tokens_details"] == {"cached_tokens": 11}
-        body = client.post("/v1/responses", json={"model": "beta", "input": "hi"}).json()
+        body = client.post(
+            "/v1/responses", json={"model": "beta", "input": "hi"}
+        ).json()
         assert "input_tokens_details" not in body["usage"]
 
     def test_lease_is_released_after_a_response(self, client, registry):
