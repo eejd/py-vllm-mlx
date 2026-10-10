@@ -25,6 +25,7 @@ Available parsers:
 - lfm2/lfm2.5: Liquid LFM2/LFM2.5 models (<|tool_call_start|>[fn(k=v)]<|tool_call_end|>)
 - minicpm/minicpm5: MiniCPM5 models (<function name=".."><param name="..">..</param></function>)
 - step3p5/step: Step3p5/Step 3.7 Flash XML function calls
+- phi4_mini_json/phi4_mini/phi4: Microsoft Phi-4-mini (functools[{...}] JSON list; needs --chat-template)
 
 Usage:
     from vllm_mlx.tool_parsers import ToolParserManager
@@ -70,6 +71,7 @@ from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
 from .minimax_tool_parser import MiniMaxToolParser
 from .qwen3_xml_tool_parser import Qwen3XMLToolParser
+from .phi4_mini_tool_parser import Phi4MiniToolParser
 from .step3p5_tool_parser import Step3p5ToolParser
 
 
@@ -125,4 +127,5 @@ __all__ = [
     "HarmonyToolParser",
     "MiniMaxToolParser",
     "Step3p5ToolParser",
+    "Phi4MiniToolParser",
 ]
