@@ -173,6 +173,7 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
         default_mllm_draft: bool = False,
+        chat_template: str | None = None,
     ):
         """
         Initialize the simple engine.
@@ -200,6 +201,8 @@ class SimpleEngine(BaseEngine):
             prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
             default_mllm_draft: Enable the configured assistant drafter unless a
                 request explicitly sets ``mllm_draft`` to false.
+            chat_template: Template text that replaces the model's own
+                (``--chat-template``), for text and multimodal models alike
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -246,6 +249,7 @@ class SimpleEngine(BaseEngine):
             "tokens_saved": 0,
         }
         self._default_mllm_draft = default_mllm_draft
+        self._chat_template = chat_template
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -804,6 +808,7 @@ class SimpleEngine(BaseEngine):
                 draft_kind=self._mllm_draft_kind,
                 draft_block_size=self._mllm_draft_block_size,
                 default_draft_enabled=self._default_mllm_draft,
+                chat_template=self._chat_template,
             )
         else:
             from ..models.llm import MLXLanguageModel
@@ -813,6 +818,7 @@ class SimpleEngine(BaseEngine):
                 trust_remote_code=self._trust_remote_code,
                 mtp=self._mtp,
                 mtp_num_draft_tokens=self._mtp_num_draft_tokens,
+                chat_template=self._chat_template,
             )
 
         self._model.load()

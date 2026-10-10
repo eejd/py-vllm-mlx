@@ -45,6 +45,7 @@ class ModelSpec:
     prefix_trie_cache: bool = False
     prefix_trie_cache_size: int = 32
     prefix_trie_cache_memory_mb: int | None = None
+    chat_template: str | None = None
 
 
 @dataclass

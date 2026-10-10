@@ -11,6 +11,7 @@ import json
 import logging
 from pathlib import Path
 
+from .chat_template_override import apply_chat_template_override
 from .chat_templates import DEFAULT_CHATML_TEMPLATE, NEMOTRON_CHAT_TEMPLATE
 
 logger = logging.getLogger(__name__)
@@ -129,19 +130,27 @@ def _install_custom_chat_template(model_name: str, tokenizer):
     return install_deepseek_v4(tokenizer, model_name=model_name)
 
 
-def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
+def load_model_with_fallback(
+    model_name: str,
+    tokenizer_config: dict = None,
+    chat_template: str | None = None,
+):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
 
     Args:
         model_name: HuggingFace model name or local path
         tokenizer_config: Optional tokenizer configuration
+        chat_template: Optional template text (see ``--chat-template``) that replaces
+            the one the model ships with
 
     Returns:
         Tuple of (model, tokenizer)
     """
     model, tokenizer = _load_model_with_fallback(model_name, tokenizer_config)
-    return model, _install_custom_chat_template(model_name, tokenizer)
+    tokenizer = _install_custom_chat_template(model_name, tokenizer)
+    apply_chat_template_override(tokenizer, chat_template)
+    return model, tokenizer
 
 
 def _load_model_with_fallback(model_name: str, tokenizer_config: dict = None):

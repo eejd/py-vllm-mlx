@@ -133,6 +133,7 @@ class BatchedEngine(BaseEngine):
         specprefill_keep_pct: float = 0.3,
         specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
+        chat_template: str | None = None,
     ):
         """
         Initialize the batched engine.
@@ -152,6 +153,8 @@ class BatchedEngine(BaseEngine):
             specprefill_keep_pct: Fraction of prompt chunks to retain
             specprefill_backbone_pct: Fraction reserved for uniform coverage
             specprefill_draft_model: Small text model used to score prompt tokens
+            chat_template: Template text that replaces the model's own
+                (``--chat-template``), for text and multimodal models alike
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -169,6 +172,7 @@ class BatchedEngine(BaseEngine):
         self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
         self._specprefill_draft_model = None
+        self._chat_template = chat_template
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -322,6 +326,7 @@ class BatchedEngine(BaseEngine):
                 draft_model=self._mllm_draft_model,
                 draft_kind=self._mllm_draft_kind,
                 draft_block_size=self._mllm_draft_block_size,
+                chat_template=self._chat_template,
             )
             self._mllm_instance.load()
             self._model = self._mllm_instance.model
@@ -568,6 +573,7 @@ class BatchedEngine(BaseEngine):
         self._model, self._tokenizer = load_model_with_fallback(
             self._model_name,
             tokenizer_config=tokenizer_config,
+            chat_template=self._chat_template,
         )
 
         # Validate MTP support if enabled
