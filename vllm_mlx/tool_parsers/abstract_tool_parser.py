@@ -114,10 +114,21 @@ class ToolParser(ABC):
 
     @cached_property
     def vocab(self) -> dict[str, int]:
-        """Get the tokenizer vocabulary."""
-        if self.model_tokenizer is None:
+        """Get the tokenizer vocabulary.
+
+        On a multimodal (MLLM) engine the tokenizer-like object the server hands
+        a parser is the HF *processor*, which has no ``get_vocab`` but wraps the
+        text tokenizer that does. Without this unwrap a parser that reads the
+        vocabulary at construction (``mistral``) raised
+        ``'Mistral3Processor' object has no attribute 'get_vocab'`` and the
+        server fell back to a generic parser that cannot read its markup.
+        """
+        tokenizer = self.model_tokenizer
+        if tokenizer is not None and not hasattr(tokenizer, "get_vocab"):
+            tokenizer = getattr(tokenizer, "tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "get_vocab"):
             return {}
-        return self.model_tokenizer.get_vocab()
+        return tokenizer.get_vocab()
 
     @abstractmethod
     def extract_tool_calls(

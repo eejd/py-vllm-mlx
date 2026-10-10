@@ -109,6 +109,29 @@ class TestMistralToolParser:
     def parser(self):
         return MistralToolParser()
 
+    def test_constructs_from_a_multimodal_processor(self):
+        """An MLLM engine hands the parser the HF processor, not the tokenizer.
+
+        The processor has no ``get_vocab``; the parser must reach the wrapped
+        tokenizer's vocabulary rather than fail construction (the server then
+        silently fell back to a generic parser that cannot read ``[TOOL_CALLS]``).
+        """
+
+        class _Tokenizer:
+            def get_vocab(self):
+                return {"[TOOL_CALLS]": 9, "[ARGS]": 32}
+
+        class _Processor:
+            tokenizer = _Tokenizer()
+
+        parser = MistralToolParser(_Processor())
+
+        assert parser.bot_token_id == 9
+
+    def test_constructs_without_any_vocabulary(self):
+        """A tokenizer-like object with no vocabulary leaves the token id unset."""
+        assert MistralToolParser(object()).bot_token_id is None
+
     def test_old_format_single(self, parser):
         """Test parsing old Mistral format with single tool call."""
         text = '[TOOL_CALLS] [{"name": "get_weather", "arguments": {"city": "Paris"}}]'

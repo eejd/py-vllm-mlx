@@ -25,17 +25,16 @@ logger = logging.getLogger(__name__)
 # Text-model classes keyed by config ``model_type`` *prefix*, longest first.
 # A family has to cover its variants: Gemma 4 reports ``gemma4_text`` on some
 # checkpoints and ``gemma4_unified_text`` on others, and an exact match on the
-# former silently sent the latter to the generic fallback below.
+# former used to send the latter to the wrong family.
+#
+# qwen3_5.TextModel and TextModelArgs handle both dense and MoE natively
+# (MTPDecoderLayer auto-selects SparseMoeBlock when args.num_experts > 0).
 _TEXT_MODEL_FAMILIES: tuple[tuple[str, str, tuple[str, str]], ...] = (
     ("gemma4", "mlx_lm.models.gemma4_text", ("Model", "ModelArgs")),
+    ("ministral3", "mlx_lm.models.ministral3", ("Model", "ModelArgs")),
+    ("qwen3_5", "mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs")),
+    ("qwen3_6", "mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs")),
 )
-
-# Fallback. qwen3_5.TextModel and TextModelArgs handle both dense and MoE
-# natively (MTPDecoderLayer auto-selects SparseMoeBlock when
-# args.num_experts > 0), which makes them a reasonable generic choice — but it
-# is a guess, and a wrong guess dies deep inside the constructor with an error
-# that names neither the model nor the class. Hence the logging either side.
-_DEFAULT_TEXT_MODEL = ("mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs"))
 
 # These architectures are not compatible with the generic Qwen3.5 text
 # skeleton. Returning no extracted TextModel keeps SimpleEngine on the loaded
@@ -44,32 +43,67 @@ _DEFAULT_TEXT_MODEL = ("mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs"))
 _VLM_ONLY_TEXT_MODEL_PREFIXES = ("qwen4_exp",)
 
 
+class UnregisteredTextModelFamily(ValueError):
+    """No mlx-lm text-model family is registered for a config's ``model_type``.
+
+    An expected, non-fatal outcome (the route stays on the mlx-vlm path), so
+    ``build_text_model`` reports it as one warning line, without a traceback.
+    """
+
+
 def _import_text_model_classes(model_type: str):
-    """Return ``(Model, ModelArgs)`` for a text config's ``model_type``."""
+    """Return ``(Model, ModelArgs)`` for a text config's ``model_type``.
+
+    Raises ``UnregisteredTextModelFamily`` (a ``ValueError``) for a type no
+    family is registered for. There is no generic fallback: guessing the
+    Qwen3.5 skeleton for an unknown family either dies in someone else's
+    constructor with an error naming neither the model nor the class, or
+    (Ministral-3) builds a wrong-architecture model that loads under
+    ``strict=False`` and fails on the first request.
+    """
     import importlib
 
-    module_name, (model_attr, args_attr) = _DEFAULT_TEXT_MODEL
-    matched = False
-    for prefix, family_module, (family_model, family_args) in sorted(
+    for prefix, module_name, (model_attr, args_attr) in sorted(
         _TEXT_MODEL_FAMILIES, key=lambda f: len(f[0]), reverse=True
     ):
         if model_type.startswith(prefix):
-            module_name, model_attr, args_attr = (
-                family_module,
-                family_model,
-                family_args,
-            )
-            matched = True
-            break
+            module = importlib.import_module(module_name)
+            return getattr(module, model_attr), getattr(module, args_attr)
 
-    if not matched:
-        logger.debug(
-            "No text-model family matches model_type=%r; falling back to %s",
+    raise UnregisteredTextModelFamily(
+        f"No mlx-lm text-model family is registered for model_type={model_type!r} "
+        f"(known prefixes: {sorted(f[0] for f in _TEXT_MODEL_FAMILIES)}); add one "
+        "to _TEXT_MODEL_FAMILIES, or to _VLM_ONLY_TEXT_MODEL_PREFIXES to keep "
+        "text on the mlx-vlm path"
+    )
+
+
+def _align_tied_embeddings(
+    args: Any, vlm_weights: list[tuple[str, mx.array]], model_type: str
+) -> None:
+    """Make ``args.tie_word_embeddings`` agree with the loaded vlm weights.
+
+    The vlm loader is the source of truth for the checkpoint: its language
+    model either owns an ``lm_head`` or reads logits through the embedding
+    table. The extracted TextModel's own argument default may differ (mlx-lm's
+    ``ministral3.ModelArgs`` defaults to tied, while Ministral-3 checkpoints
+    keep ``tie_word_embeddings: false`` at the top level, outside the
+    ``text_config`` it is built from). A skeleton without the ``lm_head`` the
+    weights carry silently drops it under ``strict=False`` and decodes through
+    the embeddings: garbage logits, no error.
+    """
+    if not hasattr(args, "tie_word_embeddings"):
+        return
+    has_lm_head = any(name.startswith("lm_head.") for name, _ in vlm_weights)
+    if bool(args.tie_word_embeddings) == has_lm_head:
+        logger.info(
+            "model_type=%r: TextModel args say tie_word_embeddings=%s but the vlm "
+            "weights %s an lm_head; following the weights",
             model_type,
-            module_name,
+            args.tie_word_embeddings,
+            "carry" if has_lm_head else "have no",
         )
-    module = importlib.import_module(module_name)
-    return getattr(module, model_attr), getattr(module, args_attr)
+        args.tie_word_embeddings = not has_lm_head
 
 
 def build_text_model(
@@ -114,12 +148,14 @@ def build_text_model(
         # Build args with proper __post_init__ (handles partial_rotary_factor,
         # rope_scaling, head_dim derivation)
         args = TextModelArgs.from_dict(text_config)
+
+        vlm_lm = vlm_model.language_model
+        vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
+        _align_tied_embeddings(args, vlm_weights, model_type)
         text_model = TextModel(args)
 
         # Keep the ordinary text route independent from draft tensors unless
         # the serving engine explicitly enabled speculative MTP decoding.
-        vlm_lm = vlm_model.language_model
-        vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
         mtp_weights = _load_mtp_weights(model_path) if enable_mtp else []
 
         all_weight_names = set(name for name, _ in vlm_weights)
@@ -224,6 +260,14 @@ def build_text_model(
 
         return text_model
 
+    except UnregisteredTextModelFamily as e:
+        logger.warning(
+            "Keeping model_type=%r on the mlx-vlm text path; no extracted "
+            "TextModel was built (class=<not selected>): %s",
+            model_type,
+            e,
+        )
+        return None
     except ImportError as e:
         logger.error("Cannot import mlx_lm TextModel (need PR #990): %s", e)
         return None
