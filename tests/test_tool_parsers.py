@@ -702,6 +702,12 @@ class TestLlamaToolParser:
         ('<|python_tag|>brave_search.call(query="x")', 'brave_search.call(query="x")'),
         ("Sure.<|python_tag|>x = 1", "Sure.x = 1"),
         ("<|python_tag|>", ""),
+        # JSON-looking text that can never be a call envelope is content, released at
+        # once instead of buffered to EOF (Python dict literals, unquoted keys, a cut-off
+        # non-call object)
+        ("<|python_tag|>{x: 1}", "{x: 1}"),
+        ("<|python_tag|>{'temp': 18}", "{'temp': 18}"),
+        ('<|python_tag|>{"a": 1', '{"a": 1'),
     ]
 
     @pytest.mark.parametrize(("text", "content"), NOT_A_CALL)
@@ -730,14 +736,34 @@ class TestLlamaToolParser:
         assert streamed == content
         assert not any("tool_calls" in e for e in events)
 
-    def test_python_tag_before_a_truncated_call_does_not_leak_the_tag(self, parser):
-        # same as vLLM: the unfinished JSON stays content, the control token does not
-        text = '<|python_tag|>{"name": "read_file", "para'
+    INCOMPLETE_CALLS = [
+        '<|python_tag|>{"name": "read_file", "para',
+        '<|python_tag|>{"name": "read_file"',
+        '<|python_tag|>{"na',
+        "<|python_tag|>{",
+    ]
 
+    @pytest.mark.parametrize("text", INCOMPLETE_CALLS)
+    def test_an_incomplete_tagged_call_is_hidden_without_leaking_the_tag(
+        self, parser, text
+    ):
+        # protocol markup cut off at EOF is not content (the existing streaming contract,
+        # test_streaming_finalizer_hides_incomplete_tagged_call); non-streaming agrees
         result = parser.extract_tool_calls(text)
 
         assert not result.tools_called
-        assert result.content == '{"name": "read_file", "para'
+        assert result.content == ""
+
+    @pytest.mark.parametrize("text", INCOMPLETE_CALLS)
+    def test_streaming_an_incomplete_tagged_call_is_hidden_at_eof(self, parser, text):
+        chunks = ["<|python_tag|>", text[len("<|python_tag|>") :]]
+        events = self._stream(parser, chunks)
+        final = parser.finalize_streaming("".join(chunks))
+        if final:
+            events.append(final)
+
+        assert "".join(e.get("content", "") for e in events) == ""
+        assert not any("tool_calls" in e for e in events)
 
     def test_python_tag_call_next_to_code_keeps_the_call(self, parser):
         text = '<|python_tag|>x = 1\n<|python_tag|>{"name": "read", "parameters": {}} After'

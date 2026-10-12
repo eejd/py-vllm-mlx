@@ -132,8 +132,13 @@ class LlamaToolParser(ToolParser):
                 obj, length = decoder.raw_decode(text[scan:])
             except json.JSONDecodeError:
                 spans.append((marker_start, marker_end))
-                pending_start = marker_start
-                break
+                if cls._bare_json_prefix_is_viable(text[scan:]):
+                    # may still become a call envelope: wait for more text
+                    pending_start = marker_start
+                    break
+                # cannot be one (``{x: 1}``, ``{'temp': 18}``, ``{"a": 1``): content
+                cursor = marker_end
+                continue
 
             call = cls._tool_call_from_object(obj)
             if call is None:
@@ -351,7 +356,9 @@ class LlamaToolParser(ToolParser):
 
         All three can in principle coexist in the same response.
         """
-        python_records, python_spans, _ = self._extract_python_tag_data(model_output)
+        python_records, python_spans, python_pending = self._extract_python_tag_data(
+            model_output
+        )
         xml_records, xml_spans, _ = self._extract_xml_data(model_output)
         records = sorted(python_records + xml_records, key=lambda item: item[0])
         spans = python_spans + xml_spans
@@ -371,10 +378,18 @@ class LlamaToolParser(ToolParser):
                 content=cleaned_text if cleaned_text else None,
             )
         else:
+            content = model_output
+            if python_pending is not None:
+                # An incomplete tagged call at EOF is protocol markup: hidden, as in
+                # finalize_streaming (a lone tag is just the control token).
+                content = content[:python_pending]
+                spans = [
+                    (s, min(e, python_pending)) for s, e in spans if s < python_pending
+                ]
             return ExtractedToolCallInformation(
                 tools_called=False,
                 tool_calls=[],
-                content=self._remove_spans(model_output, spans),
+                content=self._remove_spans(content, spans),
             )
 
     def extract_tool_calls_streaming(
