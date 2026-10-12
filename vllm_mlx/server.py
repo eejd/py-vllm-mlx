@@ -43,6 +43,7 @@ import copy
 import functools
 import hashlib
 from dataclasses import dataclass
+import importlib
 import inspect
 import json
 import logging
@@ -4753,6 +4754,25 @@ def _registry_cache_states(persistence: dict | None = None) -> dict:
     return out
 
 
+# The multimodal caches are optional: stock mlx-vlm (through 0.7.6) has none of these helpers, so
+# a missing one is left out of the response and named in ``multimodal_cache_missing``, never
+# reported as an ``error`` that hides the engine's own cache statistics.
+_MLX_VLM_STATS_HOOKS = {
+    "multimodal_kv_cache": "get_multimodal_kv_cache_stats",
+    "pixel_values_cache": "get_pixel_values_cache_stats",
+    "pil_image_cache": "get_pil_cache_stats",
+}
+
+
+def _mlx_vlm_cache_hooks(*names: str) -> dict:
+    """The named callables ``mlx_vlm.utils`` provides, by name; absent ones are left out."""
+    try:
+        utils = importlib.import_module("mlx_vlm.utils")
+    except ImportError:
+        return {}
+    return {n: fn for n in names if callable(fn := getattr(utils, n, None))}
+
+
 @app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
 async def cache_stats():
     """Get cache statistics for debugging and monitoring."""
@@ -4778,30 +4798,20 @@ async def cache_stats():
         ),
     )
     models = _registry_cache_states() if registry_mode else None
-    try:
-        from mlx_vlm.utils import (
-            get_multimodal_kv_cache_stats,
-            get_pil_cache_stats,
-            get_pixel_values_cache_stats,
-        )
-
-        return {
-            "engine_cache": engine_cache,
-            "persistence": persistence,
-            "cache_state": state,
-            **({"models": models} if models is not None else {}),
-            "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
-            "pixel_values_cache": get_pixel_values_cache_stats(),
-            "pil_image_cache": get_pil_cache_stats(),
-        }
-    except ImportError:
-        return {
-            "engine_cache": engine_cache,
-            "persistence": persistence,
-            "cache_state": state,
-            **({"models": models} if models is not None else {}),
-            "error": "Cache stats not available (mlx_vlm not loaded)",
-        }
+    hooks = _mlx_vlm_cache_hooks(*_MLX_VLM_STATS_HOOKS.values())
+    missing = sorted(set(_MLX_VLM_STATS_HOOKS.values()) - set(hooks))
+    return {
+        "engine_cache": engine_cache,
+        "persistence": persistence,
+        "cache_state": state,
+        **({"models": models} if models is not None else {}),
+        **{
+            key: hooks[name]()
+            for key, name in _MLX_VLM_STATS_HOOKS.items()
+            if name in hooks
+        },
+        **({"multimodal_cache_missing": missing} if missing else {}),
+    }
 
 
 @app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
@@ -4821,25 +4831,26 @@ async def clear_cache():
             logger.warning("Failed to clear engine caches: %s", exc, exc_info=True)
             cleared_engine = {"error": str(exc)}
 
-    try:
-        from mlx_vlm.utils import (
-            clear_multimodal_kv_cache,
-            clear_pixel_values_cache,
-        )
-
-        clear_multimodal_kv_cache()
-        clear_pixel_values_cache()
-        return {
-            "status": "cleared",
-            "engine_cache": cleared_engine,
-            "caches": ["multimodal_kv", "pixel_values", "pil_image"],
-        }
-    except ImportError:
-        return {
-            "status": "cleared",
-            "engine_cache": cleared_engine,
-            "error": "Cache clear not available (mlx_vlm not loaded)",
-        }
+    hooks = _mlx_vlm_cache_hooks(
+        "clear_multimodal_kv_cache", "clear_pixel_values_cache"
+    )
+    caches = []
+    if "clear_multimodal_kv_cache" in hooks:
+        hooks["clear_multimodal_kv_cache"]()
+        caches.append("multimodal_kv")
+    if "clear_pixel_values_cache" in hooks:
+        hooks["clear_pixel_values_cache"]()
+        # the pixel-value helper has always been reported together with the PIL image cache
+        caches += ["pixel_values", "pil_image"]
+    missing = sorted(
+        {"clear_multimodal_kv_cache", "clear_pixel_values_cache"} - set(hooks)
+    )
+    return {
+        "status": "cleared",
+        "engine_cache": cleared_engine,
+        "caches": caches,
+        **({"multimodal_cache_missing": missing} if missing else {}),
+    }
 
 
 @app.delete("/v1/cache/prefix", dependencies=[Depends(verify_api_key)])

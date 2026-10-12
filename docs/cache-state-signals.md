@@ -89,6 +89,11 @@ on for pure-LLM streaming chat) and, when asked for, the prefix-trie cache (mlx-
 
 ## The `cache_state` block
 
+The multimodal cache entries of `GET /v1/cache/stats` (`multimodal_kv_cache`, `pixel_values_cache`,
+`pil_image_cache`) exist only when `mlx_vlm.utils` provides the matching helper (stock mlx-vlm provides none);
+absent ones are omitted and listed in `multimodal_cache_missing`. The text-engine statistics above never
+depend on them.
+
 `GET /v1/cache/stats` gains `cache_state` (and, in registry mode, `models.<name>.cache_state`).
 `schema_version` is 1. A value the engine cannot report is `"unreported"` (or `{"value": "unreported",
 "reason": ...}`), never a default that looks like data.
