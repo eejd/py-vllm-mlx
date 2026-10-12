@@ -687,6 +687,85 @@ class TestLlamaToolParser:
         assert all("content" in e for e in events)
         assert [e["content"] for e in events] == chunks
 
+    # --- <|python_tag|> is a control token, never content -----------------------------
+    #
+    # Llama 3.1+ puts its code-interpreter and built-in-tool output behind
+    # ``<|python_tag|>``. vLLM's llama3_json parser never sees the tag (its detokenizer
+    # skips special tokens) and llama.cpp renders it empty unless built-in tools are
+    # declared; this engine decodes special tokens, so the parser must drop the tag
+    # itself. A tag followed by a JSON call envelope stays a tool call.
+
+    NOT_A_CALL = [
+        ("<|python_tag|>import os\nprint(1)", "import os\nprint(1)"),
+        ("<|python_tag|>   import os", "   import os"),
+        ('<|python_tag|>{"a": 1}', '{"a": 1}'),
+        ('<|python_tag|>brave_search.call(query="x")', 'brave_search.call(query="x")'),
+        ("Sure.<|python_tag|>x = 1", "Sure.x = 1"),
+        ("<|python_tag|>", ""),
+    ]
+
+    @pytest.mark.parametrize(("text", "content"), NOT_A_CALL)
+    def test_python_tag_without_a_call_is_removed_from_content(
+        self, parser, text, content
+    ):
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called and result.tool_calls == []
+        assert result.content == content
+        assert "<|python_tag|>" not in result.content
+
+    @pytest.mark.parametrize(("text", "content"), NOT_A_CALL)
+    def test_streaming_python_tag_without_a_call_matches_non_streaming(
+        self, parser, text, content
+    ):
+        # the tag arrives as one atomic delta, as the tokenizer emits it
+        head, _, tail = text.partition("<|python_tag|>")
+        chunks = [c for c in (head, "<|python_tag|>", tail[:4], tail[4:]) if c]
+        events = self._stream(parser, chunks)
+        final = parser.finalize_streaming("".join(chunks))
+        if final:
+            events.append(final)
+
+        streamed = "".join(e.get("content", "") for e in events)
+        assert streamed == content
+        assert not any("tool_calls" in e for e in events)
+
+    def test_python_tag_before_a_truncated_call_does_not_leak_the_tag(self, parser):
+        # same as vLLM: the unfinished JSON stays content, the control token does not
+        text = '<|python_tag|>{"name": "read_file", "para'
+
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+        assert result.content == '{"name": "read_file", "para'
+
+    def test_python_tag_call_next_to_code_keeps_the_call(self, parser):
+        text = '<|python_tag|>x = 1\n<|python_tag|>{"name": "read", "parameters": {}} After'
+
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called and result.tool_calls[0]["name"] == "read"
+        assert "<|python_tag|>" not in (result.content or "")
+        assert "x = 1" in result.content and "After" in result.content
+
+    def test_recorded_llama32_1b_roundtrip_reply_has_no_tag_through_the_server_cleaner(
+        self, parser
+    ):
+        # tool_roundtrip, Llama-3.2-1B-Instruct-4bit, 2026-10-12 (quantbench evidence
+        # servers-2026-10-12/vllm-mlx-llama1b/conformance.jsonl)
+        from vllm_mlx.api.utils import clean_output_text
+
+        text = (
+            "<|python_tag|>import json\n\ndef get_weather(city):\n"
+            '    return {"temp_c": 18}\n\nprint(json.dumps(get_weather("Paris")))'
+        )
+
+        result = parser.extract_tool_calls(text)
+        shown = clean_output_text(result.content)
+
+        assert not result.tools_called
+        assert "<|python_tag|>" not in shown and shown.startswith("import json")
+
 
 class TestHermesToolParser:
     """Test the Hermes tool parser."""

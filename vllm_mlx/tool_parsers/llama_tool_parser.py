@@ -109,19 +109,36 @@ class LlamaToolParser(ToolParser):
             marker_start = text.find(cls.PYTHON_TAG, cursor)
             if marker_start < 0:
                 break
-            scan = marker_start + len(cls.PYTHON_TAG)
+            marker_end = marker_start + len(cls.PYTHON_TAG)
+            scan = marker_end
             while scan < len(text) and text[scan].isspace():
                 scan += 1
+
+            if scan >= len(text):
+                # Nothing after the tag yet: JSON call or plain text, undecidable.
+                spans.append((marker_start, marker_end))
+                pending_start = marker_start
+                break
+
+            if text[scan] != "{":
+                # Llama's code-interpreter / built-in-tool lead-in
+                # (``<|python_tag|>import os`` ...), not a JSON call for a
+                # declared function. The tag is a control token, never content.
+                spans.append((marker_start, marker_end))
+                cursor = marker_end
+                continue
 
             try:
                 obj, length = decoder.raw_decode(text[scan:])
             except json.JSONDecodeError:
+                spans.append((marker_start, marker_end))
                 pending_start = marker_start
                 break
 
             call = cls._tool_call_from_object(obj)
             if call is None:
-                cursor = marker_start + len(cls.PYTHON_TAG)
+                spans.append((marker_start, marker_end))
+                cursor = marker_end
                 continue
 
             records.append((scan, call))
@@ -342,7 +359,7 @@ class LlamaToolParser(ToolParser):
         if not records:
             bare_records, bare_spans, _ = self._extract_bare_json_data(model_output)
             records = bare_records
-            spans = bare_spans
+            spans = spans + bare_spans
 
         tool_calls = [call for _, call in records]
         cleaned_text = self._remove_spans(model_output, spans).strip()
@@ -355,7 +372,9 @@ class LlamaToolParser(ToolParser):
             )
         else:
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False,
+                tool_calls=[],
+                content=self._remove_spans(model_output, spans),
             )
 
     def extract_tool_calls_streaming(
