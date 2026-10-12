@@ -703,11 +703,9 @@ class TestLlamaToolParser:
         ("Sure.<|python_tag|>x = 1", "Sure.x = 1"),
         ("<|python_tag|>", ""),
         # JSON-looking text that can never be a call envelope is content, released at
-        # once instead of buffered to EOF (Python dict literals, unquoted keys, a cut-off
-        # non-call object)
+        # once instead of buffered to EOF (Python dict literals, unquoted keys)
         ("<|python_tag|>{x: 1}", "{x: 1}"),
         ("<|python_tag|>{'temp': 18}", "{'temp': 18}"),
-        ('<|python_tag|>{"a": 1', '{"a": 1'),
     ]
 
     @pytest.mark.parametrize(("text", "content"), NOT_A_CALL)
@@ -741,6 +739,10 @@ class TestLlamaToolParser:
         '<|python_tag|>{"name": "read_file"',
         '<|python_tag|>{"na',
         "<|python_tag|>{",
+        # a cut-off object of any shape may still become a call
+        '<|python_tag|>{"a": 1',
+        '<|python_tag|>{"parameters": {"x": 1}, "na',
+        '<|python_tag|>{"a": tru',
     ]
 
     @pytest.mark.parametrize("text", INCOMPLETE_CALLS)
@@ -764,6 +766,40 @@ class TestLlamaToolParser:
 
         assert "".join(e.get("content", "") for e in events) == ""
         assert not any("tool_calls" in e for e in events)
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            ["<|python_tag|>", '{"parameters": {"x": 1}, ', '"name": "f"}'],
+            ["<|python_tag|>", '{"par', 'ameters": {"x": 1}, "na', 'me": "f"}'],
+            ["<|python_tag|>", '{"arguments": {}, ', '"name": "f"}'],
+            [
+                "<|python_tag|>",
+                '{"type": "function", "name": "f", "parameters": {',
+                "}}",
+            ],
+        ],
+    )
+    def test_a_tagged_call_with_any_key_order_is_never_shown_as_content(
+        self, parser, chunks
+    ):
+        events = self._stream(parser, chunks)
+
+        assert "".join(e.get("content", "") for e in events) == ""
+        calls = [c for e in events for c in e.get("tool_calls", [])]
+        assert [c["function"]["name"] for c in calls] == ["f"]
+        assert parser.extract_tool_calls("".join(chunks)).tools_called
+
+    def test_malformed_call_looking_json_after_the_tag_is_content_in_both_modes(
+        self, parser
+    ):
+        # not a valid JSON prefix (single-quoted arguments), so it is not "still arriving"
+        text = '<|python_tag|>{"name": "f", "parameters": {\'a\': 1}}'
+        body = text[len("<|python_tag|>") :]
+
+        assert parser.extract_tool_calls(text).content == body
+        events = self._stream(parser, ["<|python_tag|>", body])
+        assert "".join(e.get("content", "") for e in events) == body
 
     def test_python_tag_call_next_to_code_keeps_the_call(self, parser):
         text = '<|python_tag|>x = 1\n<|python_tag|>{"name": "read", "parameters": {}} After'

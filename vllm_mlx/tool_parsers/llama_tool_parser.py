@@ -130,13 +130,13 @@ class LlamaToolParser(ToolParser):
 
             try:
                 obj, length = decoder.raw_decode(text[scan:])
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
                 spans.append((marker_start, marker_end))
-                if cls._bare_json_prefix_is_viable(text[scan:]):
-                    # may still become a call envelope: wait for more text
+                if cls._json_ran_out(text[scan:], exc):
+                    # a cut-off object may still become a call envelope (any key order)
                     pending_start = marker_start
                     break
-                # cannot be one (``{x: 1}``, ``{'temp': 18}``, ``{"a": 1``): content
+                # malformed or not JSON (``{x: 1}``, single-quoted arguments): content
                 cursor = marker_end
                 continue
 
@@ -233,6 +233,18 @@ class LlamaToolParser(ToolParser):
         return bool(
             cls.BARE_JSON_MARKER.search(text) or cls.BARE_JSON_PARTIAL.search(text)
         )
+
+    # Tail of a cut-off JSON value at the decoder's error position: an unterminated string,
+    # a partial number or a partial literal (an error at the very end has an empty tail).
+    _JSON_CUT_OFF_TAIL = re.compile(
+        r'"(?:[^"\\]|\\.)*\\?|-?\d*\.?\d*(?:[eE][+-]?\d*)?|t(?:ru?)?|f(?:a(?:ls?)?)?|n(?:ul?)?'
+    )
+
+    @classmethod
+    def _json_ran_out(cls, text: str, exc: json.JSONDecodeError) -> bool:
+        """Whether ``text`` failed to decode only because it ends early (a valid JSON prefix)
+        rather than because it is malformed (``{x: 1}``, ``{'a': 1}``)."""
+        return cls._JSON_CUT_OFF_TAIL.fullmatch(text[exc.pos :]) is not None
 
     @classmethod
     def _starts_with_complete_non_tool_json(cls, text: str) -> bool:
