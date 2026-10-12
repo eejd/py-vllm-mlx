@@ -196,3 +196,12 @@ def test_clear_cache_calls_only_the_helpers_that_exist(monkeypatch):
     assert calls == ["pixel"]
     assert body["caches"] == ["pixel_values", "pil_image"]
     assert body["multimodal_cache_missing"] == ["clear_multimodal_kv_cache"]
+
+
+def test_a_raising_clear_helper_is_not_swallowed(monkeypatch):
+    def boom():
+        raise RuntimeError("clear broke")
+
+    client, _ = _client(monkeypatch, _utils(clear_multimodal_kv_cache=boom))
+    with pytest.raises(RuntimeError, match="clear broke"):
+        client.delete("/v1/cache")
