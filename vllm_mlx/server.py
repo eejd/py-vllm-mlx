@@ -180,7 +180,8 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import EngineBusy, UnsupportedRequestOption, suspend_cancellation
+from .engine.base import EngineBusy, suspend_cancellation
+from .request import UnsupportedRequestOption
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -915,8 +916,6 @@ def _prepare_chat_completion_invocation(
     messages, images, videos, audios, has_media = _prepare_chat_messages(
         engine, request.messages
     )
-    if getattr(request, "ignore_eos", False):
-        engine.validate_request_options(ignore_eos=True, has_media=has_media)
     response_format = request.response_format
     messages, json_logits_processor = _prepare_json_logits_processor(
         engine,
@@ -3136,10 +3135,6 @@ def _prepare_responses_request(
         preserve_native_format=engine.preserve_native_tool_format,
     )
     messages = canonicalize_system_messages(messages)
-    if chat_request.ignore_eos:
-        engine.validate_request_options(
-            ignore_eos=True, has_media=bool(images or videos or audios)
-        )
 
     chat_kwargs = {
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
@@ -3182,6 +3177,10 @@ async def _run_responses_request(
     engine, chat_request, messages, chat_kwargs = _prepare_responses_request(
         request, engine=engine
     )
+    if request.ignore_eos:
+        await engine.validate_request_options(
+            ignore_eos=True, has_media=has_media_content(chat_request.messages)
+        )
 
     timeout = _default_timeout
     output = await _wait_with_disconnect(
@@ -6108,7 +6107,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     try:
         if getattr(request, "ignore_eos", False):
             try:
-                engine.validate_request_options(ignore_eos=True, completion=True)
+                await engine.validate_request_options(ignore_eos=True, completion=True)
             except UnsupportedRequestOption as exc:
                 tracker.finish(result="client_error")
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -6336,6 +6335,16 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     release_on_exit = True
     try:
+        if getattr(request, "ignore_eos", False):
+            try:
+                await engine.validate_request_options(
+                    ignore_eos=True,
+                    has_media=has_media_content(request.messages),
+                    mllm_draft=getattr(request, "mllm_draft", None),
+                )
+            except UnsupportedRequestOption as exc:
+                tracker.finish(result="client_error")
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             prepared = _prepare_chat_completion_invocation(
                 engine,
@@ -6569,7 +6578,7 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             if request.ignore_eos:
                 # Streams cannot report an error after their first chunk.
                 try:
-                    (engine or get_engine()).validate_request_options(
+                    await (engine or get_engine()).validate_request_options(
                         ignore_eos=True,
                         has_media=has_media_content(chat_request.messages),
                     )

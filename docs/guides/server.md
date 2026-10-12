@@ -165,10 +165,19 @@ assert response.choices[0].finish_reason == "length"
 
 EOS tokens that are generated after the first one are counted in `usage.completion_tokens` but are
 never rendered into the text (vLLM hides special tokens by default, and a natural stop does not show
-them either). Both the simple and the continuous-batching engine honour the flag. On the simple
-engine, requests that decode through mlx-vlm (image/video/audio inputs, or completions on a
-multimodal model) cannot, and are answered with HTTP 400 instead of ignoring it; text-only chat on a
-multimodal model and every text-only model are unaffected.
+them either). Both the simple and the continuous-batching engine honour the flag.
+
+On the simple engine, requests that decode through mlx-vlm cannot honour it and are answered with
+HTTP 400 before any response starts (streaming included) instead of ignoring it: image/video/audio
+inputs, completions on a multimodal model, and text-only chat on a multimodal model when it does not
+take the mlx-lm text route (a drafter requested per request or by default, or no text route could be
+built). Text-only models, and text-only chat on a multimodal model that takes the text route, are
+unaffected.
+
+`ignore_eos` has no context-window bound: only the cap ends generation (vLLM additionally stops at
+`max_model_len`), so keep the cap within the model's context. On the continuous-batching engine a
+request is also refused (HTTP 400) if the installed mlx-lm has no per-sequence stop override; mlx-lm
+0.31.3 and 0.32 both do.
 
 ### Models
 

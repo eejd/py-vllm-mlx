@@ -33,13 +33,13 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
+from ..request import UnsupportedRequestOption
 from ..utils.tokenizer import collect_eos_token_ids, eos_ignoring_tokenizer
 from .base import (
     BaseEngine,
     EngineBusy,
     EngineStopped,
     GenerationOutput,
-    UnsupportedRequestOption,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
     shield_task,
@@ -1021,21 +1021,44 @@ class SimpleEngine(BaseEngine):
         mx.clear_cache()
         logger.info("SimpleEngine stopped")
 
-    def validate_request_options(
+    async def validate_request_options(
         self,
         *,
         ignore_eos: bool = False,
         has_media: bool = False,
         completion: bool = False,
+        mllm_draft: bool | None = None,
     ) -> None:
-        """Refuse ``ignore_eos`` where the request is certain to reach mlx-vlm.
+        """Refuse ``ignore_eos`` for a request that would decode through mlx-vlm.
 
-        Media requests and completions on a multimodal model always do. Whether
-        a text-only chat request takes the mlx-lm text route depends on lazily
-        loaded state, so that case is left to the check on the route itself.
+        On a multimodal model only text-only chat can take the mlx-lm text
+        route (``_uses_text_model_route``, the predicate ``stream_chat`` itself
+        routes on); media requests, completions, and chat while the drafter or
+        a missing text model forces mlx-vlm cannot honour the flag.
         """
-        if ignore_eos and self._is_mllm and (has_media or completion):
-            _reject_ignore_eos_on_mlx_vlm({"ignore_eos": True})
+        if not ignore_eos or not self._is_mllm:
+            return
+        if not completion:
+            draft = self._default_mllm_draft if mllm_draft is None else bool(mllm_draft)
+            await self._ensure_text_model_for_request(mllm_draft_requested=draft)
+            if self._uses_text_model_route(
+                has_media=has_media, mllm_draft_requested=draft
+            ):
+                return
+        _reject_ignore_eos_on_mlx_vlm({"ignore_eos": True})
+
+    def _uses_text_model_route(
+        self, *, has_media: bool, mllm_draft_requested: bool
+    ) -> bool:
+        """Does a chat request on this engine decode through the mlx-lm TextModel?"""
+        return (
+            self._is_mllm
+            and self._text_model is not None
+            and self._should_route_text_through_text_model(
+                mllm_draft_requested=mllm_draft_requested
+            )
+            and not has_media
+        )
 
     def _should_route_text_through_text_model(
         self, *, mllm_draft_requested: bool = False
@@ -1921,13 +1944,8 @@ class SimpleEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         # Per-request routing: text-only through mlx_lm TextModel
-        if (
-            self._is_mllm
-            and self._text_model is not None
-            and self._should_route_text_through_text_model(
-                mllm_draft_requested=mllm_draft_requested
-            )
-            and not has_media
+        if self._uses_text_model_route(
+            has_media=has_media, mllm_draft_requested=mllm_draft_requested
         ):
             has_mtp = (
                 hasattr(self._text_model, "mtp") and self._text_model.mtp is not None

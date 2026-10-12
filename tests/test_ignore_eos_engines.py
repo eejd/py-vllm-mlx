@@ -26,8 +26,11 @@ tokenizers = pytest.importorskip("tokenizers")
 
 from transformers import PreTrainedTokenizerFast  # noqa: E402
 
-from vllm_mlx.engine.base import UnsupportedRequestOption  # noqa: E402
-from vllm_mlx.request import Request, SamplingParams  # noqa: E402
+from vllm_mlx.request import (  # noqa: E402
+    Request,
+    SamplingParams,
+    UnsupportedRequestOption,
+)
 from vllm_mlx.scheduler import (  # noqa: E402
     Scheduler,
     SchedulerConfig,
@@ -289,8 +292,70 @@ class TestStopOverrideKwargs:
         assert all(empty.match(state, t)[1] is None for t in range(VOCAB))
 
     def test_unknown_batch_generator_fails_loudly(self):
-        with pytest.raises(RuntimeError, match="ignore_eos"):
+        with pytest.raises(RuntimeError, match="per-sequence stop"):
             _stop_override_insert_kwargs(_Gen.neither(), [])
+
+
+class TestAdmission:
+    """A mlx-lm without the per-sequence stop API refuses ignore_eos up front.
+
+    Finding out while scheduling would abort the whole running batch and leave
+    the triggering request without an owner.
+    """
+
+    def _scheduler(self, model, monkeypatch, generator):
+        monkeypatch.setattr("vllm_mlx.scheduler.BatchGenerator", generator)
+        return _scheduler(model, eos_id=None)
+
+    def test_ignore_eos_is_refused_before_anything_is_queued(self, model, monkeypatch):
+        sched = self._scheduler(model, monkeypatch, type(_Gen.neither()))
+        request = _request("a", ignore_eos=True)
+
+        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+            sched.add_request(request)
+
+        assert "a" not in sched.requests
+        assert not sched.has_requests()
+
+    def test_other_requests_are_unaffected(self, model, monkeypatch):
+        sched = self._scheduler(model, monkeypatch, type(_Gen.neither()))
+
+        sched.add_request(_request("a"))
+
+        assert sched.has_requests()
+
+    def test_a_supporting_release_admits_ignore_eos(self, model, monkeypatch):
+        for generator in (type(_Gen.new_api()), type(_Gen.old_api())):
+            sched = self._scheduler(model, monkeypatch, generator)
+            sched.add_request(_request("a", ignore_eos=True))
+            assert sched.has_requests()
+
+    @pytest.mark.anyio
+    async def test_the_batched_engine_refuses_at_the_door(self, monkeypatch):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=False):
+            engine = BatchedEngine("test-model")
+        monkeypatch.setattr("vllm_mlx.scheduler.BatchGenerator", type(_Gen.neither()))
+
+        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+            await engine.validate_request_options(ignore_eos=True)
+        await engine.validate_request_options()  # no flag, nothing to refuse
+
+    def test_the_llm_mtp_draft_hook_never_meets_an_ignore_eos_request(self):
+        """``_mtp_next`` ends a request on any EOS draft, ignoring ignore_eos.
+
+        It is only installed on a BatchGenerator with a ``_step`` hook, and the
+        installed release's has none, so the hook is dormant. Should a release
+        bring ``_step`` back it must not also advertise a per-sequence stop
+        override, or ``ignore_eos`` would reach that unaware code.
+        """
+        from vllm_mlx import scheduler
+
+        generator = scheduler.BatchGenerator
+        has_step_hook = hasattr(generator, "_step")
+        has_stop_override = scheduler._stop_override_param(generator) is not None
+        assert not (has_step_hook and has_stop_override)
 
 
 class TestTokenizerView:
@@ -521,7 +586,7 @@ class TestBatchedEngineForwarding:
         assert engine._mllm_scheduler.generate.call_args.kwargs["ignore_eos"] is True
 
 
-class TestSimpleEngine:
+class TestSimpleEngineValidation:
     def _engine(self, is_mllm=False):
         from vllm_mlx.engine.simple import SimpleEngine
 
@@ -532,53 +597,47 @@ class TestSimpleEngine:
         return engine
 
     @pytest.mark.anyio
-    async def test_non_stream_chat_takes_the_exact_counting_path(self):
-        """``model.chat()`` re-tokenizes text to count; ignore_eos needs exact N."""
-        engine = self._engine()
-        engine._model = MagicMock()
-        seen = {}
+    async def test_text_models_and_flagless_requests_are_accepted(self):
+        text = self._engine(is_mllm=False)
+        await text.validate_request_options(ignore_eos=True, has_media=True)
+        await text.validate_request_options(ignore_eos=True, completion=True)
 
-        async def fake_stream_chat(messages, **kwargs):
-            seen.update(kwargs)
-            from vllm_mlx.engine.base import GenerationOutput
-
-            yield GenerationOutput(
-                text="a b",
-                new_text="b",
-                completion_tokens=4,
-                finished=True,
-                finish_reason="length",
-            )
-
-        engine.stream_chat = fake_stream_chat
-        result = await engine.chat(
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=4,
-            ignore_eos=True,
-        )
-
-        engine._model.chat.assert_not_called()
-        assert seen["ignore_eos"] is True
-        assert result.completion_tokens == 4
-        assert result.finish_reason == "length"
-
-    def test_preflight_refuses_only_where_mlx_vlm_is_certain(self):
-        text_engine = self._engine(is_mllm=False)
-        mllm_engine = self._engine(is_mllm=True)
-
-        # Text models and text-only chat on a multimodal model are fine.
-        text_engine.validate_request_options(ignore_eos=True, has_media=True)
-        text_engine.validate_request_options(ignore_eos=True, completion=True)
-        mllm_engine.validate_request_options(ignore_eos=True)
-        mllm_engine.validate_request_options(has_media=True, completion=True)
-        # Media, or completions, on a multimodal model reach mlx-vlm.
-        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
-            mllm_engine.validate_request_options(ignore_eos=True, has_media=True)
-        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
-            mllm_engine.validate_request_options(ignore_eos=True, completion=True)
+        mllm = self._engine(is_mllm=True)
+        await mllm.validate_request_options(has_media=True, completion=True)
 
     @pytest.mark.anyio
-    async def test_mlx_vlm_route_refuses_instead_of_ignoring(self):
+    async def test_mllm_refuses_exactly_what_stream_chat_routes_to_mlx_vlm(self):
+        engine = self._engine(is_mllm=True)
+        engine._text_model = object()
+        engine._text_model_initialization_attempted = True
+
+        # Text-only chat with the text route available: accepted.
+        await engine.validate_request_options(ignore_eos=True)
+        for kwargs in (
+            {"has_media": True},  # media decodes through mlx-vlm
+            {"completion": True},  # completions always do
+        ):
+            with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+                await engine.validate_request_options(ignore_eos=True, **kwargs)
+
+        # No text model: text-only chat falls back to mlx-vlm too.
+        engine._text_model = None
+        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+            await engine.validate_request_options(ignore_eos=True)
+
+        # A drafter requested per request, or by default, takes the mlx-vlm route.
+        engine._text_model = object()
+        engine._mllm_draft_model_path = "drafter"
+        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+            await engine.validate_request_options(ignore_eos=True, mllm_draft=True)
+        await engine.validate_request_options(ignore_eos=True, mllm_draft=False)
+        engine._default_mllm_draft = True
+        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+            await engine.validate_request_options(ignore_eos=True)
+        await engine.validate_request_options(ignore_eos=True, mllm_draft=False)
+
+    @pytest.mark.anyio
+    async def test_the_route_itself_still_refuses_as_a_backstop(self):
         engine = self._engine(is_mllm=True)
         engine._model = MagicMock()
         engine._text_model = None
@@ -607,3 +666,145 @@ class TestSimpleEngine:
                 ignore_eos=True,
             )
         engine._model.chat.assert_not_called()
+
+
+CHAT_TEMPLATE = "{% for m in messages %}{{ m['content'] }} {% endfor %}"
+CHAT = [
+    {"role": "system", "content": "w1 w2"},
+    {"role": "user", "content": "w5 w6 w7 w8"},
+]
+
+
+class _RealEngines:
+    """SimpleEngine routes driven end to end by the real tiny model.
+
+    The chat template renders the message contents, so ``w<id>`` words in the
+    prompt are token ids and the output text ``w<id> ...`` reads back as ids.
+    """
+
+    def __init__(self, model):
+        self.model = model
+
+    def _tokenizer(self, eos_id=None):
+        wrapper = _wrapped(eos_id)
+        wrapper._tokenizer.chat_template = CHAT_TEMPLATE
+        return wrapper
+
+    def llm_engine(self, eos_id=None, trie=False):
+        from vllm_mlx.engine.simple import SimpleEngine
+        from vllm_mlx.models.llm import MLXLanguageModel
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("tiny")
+        wrapper = MLXLanguageModel.__new__(MLXLanguageModel)
+        wrapper.model_name = "tiny"
+        wrapper.model = self.model
+        wrapper.tokenizer = self._tokenizer(eos_id)
+        wrapper._loaded = True
+        wrapper._mtp = False
+        engine._model = wrapper
+        engine._loaded = True
+        engine._is_mllm = False
+        engine._prefix_trie_cache_enabled = trie
+        engine._supports_system_kv_cache = trie
+        return engine
+
+    def mllm_text_route_engine(self, eos_id=None):
+        """A multimodal engine whose text-only chat takes the mlx-lm text route."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=True):
+            engine = SimpleEngine("tiny-mllm")
+        engine._loaded = True
+        engine._is_mllm = True
+        engine._model = MagicMock()
+        engine._text_model = self.model
+        engine._text_tokenizer = self._tokenizer(eos_id)
+        engine._text_model_initialization_attempted = True
+        engine._supports_system_kv_cache = False
+        return engine
+
+
+@pytest.fixture(scope="module")
+def engines(model):
+    return _RealEngines(model)
+
+
+def _flag(ignore_eos):
+    return {"ignore_eos": True} if ignore_eos else {}
+
+
+async def _stream_chat(engine, ignore_eos=False):
+    last = None
+    async for out in engine.stream_chat(
+        messages=CHAT, max_tokens=CAP, temperature=0.0, **_flag(ignore_eos)
+    ):
+        last = out
+    return last
+
+
+async def _chat(engine, ignore_eos=False):
+    return await engine.chat(
+        messages=CHAT, max_tokens=CAP, temperature=0.0, **_flag(ignore_eos)
+    )
+
+
+async def _complete(engine, ignore_eos=False):
+    return await engine.generate(
+        prompt="w1 w2 w5 w6 w7 w8", max_tokens=CAP, temperature=0.0, **_flag(ignore_eos)
+    )
+
+
+def _ids(text):
+    return [int(word[1:]) for word in text.split()]
+
+
+class TestSimpleEngineRoutes:
+    """What a client sees from the Simple engine, on real decode paths."""
+
+    async def _check(self, make_engine, run):
+        """EOS cuts the default request short and is ignored under ignore_eos."""
+        greedy = _ids((await run(make_engine(None))).text)
+        assert len(greedy) == CAP
+        _, eos = _eos_for(greedy)
+
+        stopped = await run(make_engine(eos))
+        assert stopped.finish_reason == "stop"
+        assert stopped.completion_tokens < CAP
+
+        ran = await run(make_engine(eos), ignore_eos=True)
+        assert ran.finish_reason == "length"
+        # Exactly the cap, EOS tokens included, so a benchmark can verify N.
+        assert ran.completion_tokens == CAP
+        assert "<eos>" not in ran.text
+        assert _ids(ran.text) == [t for t in greedy if t != eos]
+
+    @pytest.mark.anyio
+    async def test_llm_stream_chat(self, engines):
+        await self._check(engines.llm_engine, _stream_chat)
+
+    @pytest.mark.anyio
+    async def test_llm_non_stream_chat(self, engines):
+        await self._check(engines.llm_engine, _chat)
+
+    @pytest.mark.anyio
+    async def test_llm_completions(self, engines):
+        await self._check(engines.llm_engine, _complete)
+
+    @pytest.mark.anyio
+    async def test_llm_prefix_trie_cache_path(self, engines):
+        """The cache-aware stream path builds its own mlx-lm call."""
+        view = importlib.import_module(
+            "vllm_mlx.utils.tokenizer"
+        ).eos_ignoring_tokenizer
+        with patch("vllm_mlx.engine.simple.eos_ignoring_tokenizer", wraps=view) as spy:
+            await self._check(
+                lambda eos: engines.llm_engine(eos, trie=True), _stream_chat
+            )
+        # Only that path asks the engine module for the view directly.
+        assert spy.called
+
+    @pytest.mark.anyio
+    async def test_multimodal_engine_text_route(self, engines):
+        await self._check(engines.mllm_text_route_engine, _stream_chat)
+        await self._check(engines.mllm_text_route_engine, _chat)

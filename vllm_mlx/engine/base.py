@@ -45,14 +45,6 @@ class GenerationOutput:
     specprefill_outcome: "SpecPrefillOutcome | None" = None
 
 
-class UnsupportedRequestOption(ValueError):
-    """Raised when the engine route chosen for a request cannot honour an option.
-
-    The server maps it to HTTP 400. Silently dropping an option such as
-    ``ignore_eos`` would make a client believe it got semantics it did not.
-    """
-
-
 class EngineBusy(RuntimeError):
     """Raised when a serialized engine route is already serving a request."""
 
@@ -273,20 +265,22 @@ class BaseEngine(ABC):
         """Get the tokenizer."""
         pass
 
-    def validate_request_options(
+    async def validate_request_options(
         self,
         *,
         ignore_eos: bool = False,
         has_media: bool = False,
         completion: bool = False,
+        mllm_draft: bool | None = None,
     ) -> None:
         """Raise ``UnsupportedRequestOption`` if this engine cannot honour them.
 
         Called by the server before it starts a response, so an unsupported
         option is an HTTP 400 for streaming and non-streaming requests alike
         instead of a stream that dies after the first chunk. The default
-        accepts everything. ``completion`` marks /v1/completions, which
-        some engines route differently from chat.
+        accepts everything. ``completion`` marks /v1/completions, which some
+        engines route differently from chat; ``mllm_draft`` is the request's
+        per-request drafter override (``None``: the engine default).
         """
 
     @property

@@ -49,6 +49,14 @@ class RequestStatus(enum.IntEnum):
         return None
 
 
+class UnsupportedRequestOption(ValueError):
+    """Raised when the route chosen for a request cannot honour one of its options.
+
+    The server maps it to HTTP 400. Silently dropping an option such as
+    ``ignore_eos`` would make a client believe it got semantics it did not.
+    """
+
+
 @dataclass
 class SamplingParams:
     """Sampling parameters for text generation."""

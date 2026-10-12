@@ -823,6 +823,26 @@ class BatchedEngine(BaseEngine):
                 prepared.append(msg)
         return prepared
 
+    async def validate_request_options(
+        self,
+        *,
+        ignore_eos: bool = False,
+        has_media: bool = False,
+        completion: bool = False,
+        mllm_draft: bool | None = None,
+    ) -> None:
+        """Refuse ``ignore_eos`` when the LLM scheduler cannot honour it.
+
+        The MLLM scheduler has its own stop test and always can. The LLM
+        scheduler needs mlx-lm's per-sequence stop override on
+        ``BatchGenerator.insert``; without it the request is refused here, at
+        admission, instead of failing while it is being scheduled.
+        """
+        if ignore_eos and not self._is_mllm:
+            from ..scheduler import require_per_sequence_stop
+
+            require_per_sequence_stop()
+
     async def generate(
         self,
         prompt: str,

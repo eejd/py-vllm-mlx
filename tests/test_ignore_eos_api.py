@@ -15,7 +15,8 @@ from pydantic import ValidationError
 import vllm_mlx.server as server
 from vllm_mlx.api.models import ChatCompletionRequest, CompletionRequest, Message
 from vllm_mlx.api.responses_models import ResponsesRequest
-from vllm_mlx.engine.base import GenerationOutput, UnsupportedRequestOption
+from vllm_mlx.engine.base import GenerationOutput
+from vllm_mlx.request import UnsupportedRequestOption
 
 
 @pytest.fixture
@@ -92,9 +93,10 @@ class _Engine:
 
     def __init__(self):
         self.calls = []
+        self.validated = []
 
-    def validate_request_options(self, **kwargs):
-        return None
+    async def validate_request_options(self, **kwargs):
+        self.validated.append(kwargs)
 
     async def chat(self, messages, **kwargs):
         self.calls.append(("chat", kwargs))
@@ -184,7 +186,7 @@ class TestEndpointsForwardTheCapAndIgnoreEos:
     async def test_unsupported_option_is_a_400_before_any_response_starts(self, engine):
         """Streaming cannot report an error after its first chunk."""
 
-        def refuse(**kwargs):
+        async def refuse(**kwargs):
             raise UnsupportedRequestOption("ignore_eos is not supported here")
 
         engine.validate_request_options = refuse
@@ -206,6 +208,35 @@ class TestEndpointsForwardTheCapAndIgnoreEos:
                 await call
             assert exc_info.value.status_code == 400
         assert engine.calls == []
+
+    async def test_chat_preflight_sees_media_and_the_drafter_override(self, engine):
+        request = ChatCompletionRequest(
+            model="served",
+            messages=[
+                Message(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "what is this"},
+                        {"type": "image_url", "image_url": {"url": "file:///x.png"}},
+                    ],
+                )
+            ],
+            ignore_eos=True,
+            mllm_draft=True,
+        )
+        await server.create_chat_completion(request, raw_request=None)
+
+        assert engine.validated == [
+            {"ignore_eos": True, "has_media": True, "mllm_draft": True}
+        ]
+
+    async def test_no_preflight_without_ignore_eos(self, engine):
+        request = ChatCompletionRequest(
+            model="served", messages=[Message(role="user", content="hi")]
+        )
+        await server.create_chat_completion(request, raw_request=None)
+
+        assert engine.validated == []
 
     async def test_completions(self, engine):
         request = CompletionRequest(
@@ -236,6 +267,38 @@ class TestEndpointsForwardTheCapAndIgnoreEos:
         await server.create_completion(request, raw_request=None)
 
         assert "ignore_eos" not in engine.calls[0][1]
+
+
+@pytest.mark.anyio
+class TestResponsesPreflight:
+    @pytest.fixture
+    def refusing_engine(self, monkeypatch, limits):
+        fake = _Engine()
+
+        async def refuse(**kwargs):
+            raise UnsupportedRequestOption("ignore_eos is not supported here")
+
+        fake.validate_request_options = refuse
+        monkeypatch.setattr(server, "get_engine", lambda: fake)
+        monkeypatch.setattr(server, "_validate_model_name", lambda _m: None)
+        monkeypatch.setattr(server, "_model_manager", None)
+
+        async def no_preflight(raw_request):
+            return None
+
+        monkeypatch.setattr(server, "_preflight_response_format_backend", no_preflight)
+        return fake
+
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_unsupported_option_is_a_400(self, refusing_engine, stream):
+        request = ResponsesRequest(
+            model="served", input="hi", ignore_eos=True, stream=stream
+        )
+        with pytest.raises(server.HTTPException) as exc_info:
+            await server.create_response(request, raw_request=None)
+
+        assert exc_info.value.status_code == 400
+        assert refusing_engine.calls == []
 
 
 class TestResponsesApi:

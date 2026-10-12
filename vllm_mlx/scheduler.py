@@ -39,7 +39,13 @@ from .mlx_cache_compat import (
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .request import (
+    Request,
+    RequestOutput,
+    RequestStatus,
+    SamplingParams,
+    UnsupportedRequestOption,
+)
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
@@ -55,6 +61,38 @@ CACHE_CORRUPTION_PATTERNS = [
 ]
 
 
+def _stop_override_param(batch_generator: Any) -> Optional[str]:
+    """Name of the per-sequence stop parameter of ``batch_generator.insert``.
+
+    mlx-lm renamed it between releases: 0.31.x takes ``state_machines``, 0.32
+    takes ``stop_sequences``. ``None`` when the installed release has neither.
+    """
+    try:
+        params = inspect.signature(batch_generator.insert).parameters
+    except (TypeError, ValueError):
+        return None
+    for name in ("stop_sequences", "state_machines"):
+        if name in params:
+            return name
+    return None
+
+
+def require_per_sequence_stop() -> None:
+    """Raise ``UnsupportedRequestOption`` unless ``ignore_eos`` can be honoured.
+
+    ``ignore_eos`` needs a per-sequence stop override on
+    ``BatchGenerator.insert``. A release that lacks it must refuse the request
+    at admission: discovering it while scheduling would abort the whole
+    running batch and leave the triggering request without an owner.
+    """
+    if _stop_override_param(BatchGenerator) is None:
+        raise UnsupportedRequestOption(
+            "ignore_eos needs a per-sequence stop override on "
+            "BatchGenerator.insert (stop_sequences or state_machines), and the "
+            "installed mlx-lm provides neither"
+        )
+
+
 def _stop_override_insert_kwargs(
     batch_generator: Any, stop_token_ids: List[int]
 ) -> Dict[str, Any]:
@@ -63,20 +101,17 @@ def _stop_override_insert_kwargs(
     ``BatchGenerator`` is built with one stop-token set (the model's EOS ids)
     shared by every sequence. A request that sets ``ignore_eos`` must not stop
     on those ids, so it is inserted with its own stop set holding only the
-    ids the client asked for (``stop_token_ids``; usually none).
-
-    mlx-lm renamed the per-sequence parameter between releases: 0.31.x takes
-    ``state_machines``, 0.32 takes ``stop_sequences``. Both are probed from
-    the live signature so a new release that drops both fails loudly instead
-    of silently ignoring ``ignore_eos``.
+    ids the client asked for (``stop_token_ids``; usually none). Admission
+    (``require_per_sequence_stop``) has already refused the request when the
+    installed mlx-lm cannot do this.
     """
-    params = inspect.signature(batch_generator.insert).parameters
+    param = _stop_override_param(batch_generator)
     sequences = [[int(t)] for t in stop_token_ids]
-    if "stop_sequences" in params:
+    if param == "stop_sequences":
         from mlx_lm.generate import StopSequences
 
         return {"stop_sequences": [StopSequences(sequences or None)]}
-    if "state_machines" in params:
+    if param == "state_machines":
         from mlx_lm.generate import SequenceStateMachine
 
         transitions = {"normal": [(seq, None) for seq in sequences]}
@@ -86,9 +121,8 @@ def _stop_override_insert_kwargs(
             ]
         }
     raise RuntimeError(
-        "ignore_eos needs a per-sequence stop override on "
-        "BatchGenerator.insert (stop_sequences or state_machines), and the "
-        "installed mlx-lm provides neither"
+        "BatchGenerator.insert has no per-sequence stop override; "
+        "require_per_sequence_stop() should have refused the request"
     )
 
 
@@ -751,6 +785,12 @@ def _install_mtp(
                     draft_t = draft_info["token_array"].item()
                 draft_lp = draft_info["logprobs"]
 
+                # Not ignore_eos-aware, and unreachable with it: this hook only
+                # installs on a BatchGenerator that has ``_step`` (mlx-lm 0.31.3
+                # and 0.32 have none and return early above). The API that does
+                # has one generator-wide ``stop_tokens`` set and no per-sequence
+                # override, so ``require_per_sequence_stop()`` refuses
+                # ignore_eos requests there.
                 if draft_t in self.stop_tokens:
                     augmented.append(
                         self.Response(uid, draft_t, draft_lp, "stop", None)
@@ -1566,6 +1606,8 @@ class Scheduler:
         """
         if request.request_id in self.requests:
             raise ValueError(f"Request {request.request_id} already exists")
+        if request.sampling_params.ignore_eos:
+            require_per_sequence_stop()
 
         # Tokenize if needed
         if request.prompt_token_ids is None:
