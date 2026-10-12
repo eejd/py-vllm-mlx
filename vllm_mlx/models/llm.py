@@ -11,6 +11,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
+from ..utils.tokenizer import eos_ignoring_tokenizer
+
 if TYPE_CHECKING:
     import mlx.core as mx
 
@@ -162,6 +164,7 @@ class MLXLanguageModel:
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
         logits_processors: list | None = None,
+        ignore_eos: bool = False,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -180,6 +183,8 @@ class MLXLanguageModel:
             logits_processors: Optional externally-supplied logits processors
                 (e.g. JSON schema constrained decoding).  Merged with built-in
                 penalty processors.
+            ignore_eos: Keep generating past EOS tokens until ``max_tokens``.
+                EOS tokens are counted but not rendered in the text.
 
         Returns:
             GenerationOutput with generated text and tokens
@@ -200,9 +205,12 @@ class MLXLanguageModel:
             all_processors = list(logits_processors) + all_processors
 
         # Generate text
+        tokenizer = self.tokenizer
+        if ignore_eos:
+            tokenizer = eos_ignoring_tokenizer(tokenizer)
         output_text = generate(
             self.model,
-            self.tokenizer,
+            tokenizer,
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
@@ -213,8 +221,10 @@ class MLXLanguageModel:
         # Tokenize output to get token IDs
         tokens = self.tokenizer.encode(output_text)
 
-        # Determine finish reason
-        finish_reason = "length" if len(tokens) >= max_tokens else "stop"
+        # Determine finish reason. Without EOS nothing but the cap ends
+        # generation (``tokens`` is re-encoded text, which no longer includes
+        # the hidden EOS tokens, so its length cannot be compared to the cap).
+        finish_reason = "length" if ignore_eos or len(tokens) >= max_tokens else "stop"
 
         return GenerationOutput(
             text=output_text,
@@ -235,6 +245,7 @@ class MLXLanguageModel:
         stop: list[str] | None = None,
         logits_processors: list | None = None,
         prompt_cache=None,
+        ignore_eos: bool = False,
         **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
@@ -251,6 +262,8 @@ class MLXLanguageModel:
             repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
             prompt_cache: Pre-populated KV cache (e.g. from SpecPrefill)
+            ignore_eos: Keep generating past EOS tokens until ``max_tokens``.
+                EOS tokens are counted but not rendered in the text.
 
         Yields:
             StreamingOutput for each generated token
@@ -286,10 +299,14 @@ class MLXLanguageModel:
         if prompt_cache is not None:
             mtp_kwargs["prompt_cache"] = prompt_cache
 
+        tokenizer = self.tokenizer
+        if ignore_eos:
+            tokenizer = eos_ignoring_tokenizer(tokenizer)
+
         for token_count, response in enumerate(
             stream_generate(
                 self.model,
-                self.tokenizer,
+                tokenizer,
                 prompt=prompt,
                 max_tokens=max_tokens,
                 sampler=sampler,

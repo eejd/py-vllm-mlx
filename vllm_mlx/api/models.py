@@ -180,7 +180,14 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = None
     min_p: float | None = None
     presence_penalty: float | None = None
+    # OpenAI's name for the output cap on chat completions. Takes precedence
+    # over the deprecated ``max_tokens`` when both are set (same as vLLM).
+    max_completion_tokens: int | None = Field(default=None, gt=0)
     max_tokens: int | None = Field(default=None, gt=0)
+    # vLLM sampling extension (sent by guidellm and other load generators):
+    # EOS tokens no longer end generation; only ``max_completion_tokens`` /
+    # ``max_tokens`` or an explicit ``stop`` string does.
+    ignore_eos: bool = False
     stream: bool = False
     stream_options: StreamOptions | None = (
         None  # Streaming options (include_usage, etc.)
@@ -334,6 +341,8 @@ class CompletionRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     max_tokens: int | None = Field(default=None, gt=0)
+    # vLLM sampling extension: EOS tokens no longer end generation.
+    ignore_eos: bool = False
     stream: bool = False
     stop: list[str] | None = None
     # Sampling penalties

@@ -265,6 +265,24 @@ class BaseEngine(ABC):
         """Get the tokenizer."""
         pass
 
+    async def validate_request_options(
+        self,
+        *,
+        ignore_eos: bool = False,
+        has_media: bool = False,
+        completion: bool = False,
+        mllm_draft: bool | None = None,
+    ) -> None:
+        """Raise ``UnsupportedRequestOption`` if this engine cannot honour them.
+
+        Called by the server before it starts a response, so an unsupported
+        option is an HTTP 400 for streaming and non-streaming requests alike
+        instead of a stream that dies after the first chunk. The default
+        accepts everything. ``completion`` marks /v1/completions, which some
+        engines route differently from chat; ``mllm_draft`` is the request's
+        per-request drafter override (``None``: the engine default).
+        """
+
     @property
     def preserve_native_tool_format(self) -> bool:
         """

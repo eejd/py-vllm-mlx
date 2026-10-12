@@ -464,6 +464,7 @@ class MLLMScheduler:
             presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             logits_processors=kwargs.pop("logits_processors", None),
+            ignore_eos=bool(kwargs.pop("ignore_eos", False)),
         )
 
         request = MLLMRequest(
@@ -622,6 +623,7 @@ class MLLMScheduler:
                 presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 logits_processors=request.sampling_params.logits_processors,
+                ignore_eos=request.sampling_params.ignore_eos,
                 mllm_draft=request.mllm_draft,
                 specprefill_config=request.specprefill_config,
             )
@@ -725,8 +727,18 @@ class MLLMScheduler:
                 request.first_token_time = time.time()
 
             # Decode the new token using streaming detokenizer (UTF-8 safe).
-            # Skip stop tokens — they are not content.
+            # Skip stop tokens — they are not content. Under ignore_eos an EOS
+            # token is generated and counted but does not finish the request,
+            # so it is dropped here instead: the same text a natural stop gives.
             if response.finish_reason == "stop":
+                new_text = ""
+            elif request.sampling_params.ignore_eos and (
+                response.token in self.stop_tokens
+            ):
+                if request_id not in self._detokenizer_pool:
+                    self._detokenizer_pool[request_id] = NaiveStreamingDetokenizer(
+                        tokenizer
+                    )
                 new_text = ""
             else:
                 if request_id not in self._detokenizer_pool:

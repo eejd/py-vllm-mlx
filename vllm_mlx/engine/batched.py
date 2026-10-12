@@ -823,6 +823,26 @@ class BatchedEngine(BaseEngine):
                 prepared.append(msg)
         return prepared
 
+    async def validate_request_options(
+        self,
+        *,
+        ignore_eos: bool = False,
+        has_media: bool = False,
+        completion: bool = False,
+        mllm_draft: bool | None = None,
+    ) -> None:
+        """Refuse ``ignore_eos`` when the LLM scheduler cannot honour it.
+
+        The MLLM scheduler has its own stop test and always can. The LLM
+        scheduler needs mlx-lm's per-sequence stop override on
+        ``BatchGenerator.insert``; without it the request is refused here, at
+        admission, instead of failing while it is being scheduled.
+        """
+        if ignore_eos and not self._is_mllm:
+            from ..scheduler import require_per_sequence_stop
+
+            require_per_sequence_stop()
+
     async def generate(
         self,
         prompt: str,
@@ -876,6 +896,7 @@ class BatchedEngine(BaseEngine):
                 specprefill=kwargs.pop("specprefill", None),
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
+                ignore_eos=bool(kwargs.pop("ignore_eos", False)),
             )
 
             return GenerationOutput(
@@ -903,6 +924,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
+            ignore_eos=bool(kwargs.pop("ignore_eos", False)),
         )
 
         output = await self._engine.generate(
@@ -974,6 +996,7 @@ class BatchedEngine(BaseEngine):
                 specprefill=kwargs.pop("specprefill", None),
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
+                ignore_eos=bool(kwargs.pop("ignore_eos", False)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -1004,6 +1027,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
+            ignore_eos=bool(kwargs.pop("ignore_eos", False)),
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
