@@ -687,6 +687,178 @@ class TestLlamaToolParser:
         assert all("content" in e for e in events)
         assert [e["content"] for e in events] == chunks
 
+    # --- <|python_tag|> is a control token, never content -----------------------------
+    #
+    # Llama 3.1+ puts its code-interpreter and built-in-tool output behind
+    # ``<|python_tag|>``. vLLM's llama3_json parser never sees the tag (its detokenizer
+    # skips special tokens) and llama.cpp renders it empty unless built-in tools are
+    # declared; this engine decodes special tokens, so the parser must drop the tag
+    # itself. A tag followed by a JSON call envelope stays a tool call.
+
+    NOT_A_CALL = [
+        ("<|python_tag|>import os\nprint(1)", "import os\nprint(1)"),
+        ("<|python_tag|>   import os", "   import os"),
+        ('<|python_tag|>{"a": 1}', '{"a": 1}'),
+        ('<|python_tag|>brave_search.call(query="x")', 'brave_search.call(query="x")'),
+        ("Sure.<|python_tag|>x = 1", "Sure.x = 1"),
+        ("<|python_tag|>", ""),
+        # JSON-looking text that can never be a call envelope is content, released at
+        # once instead of buffered to EOF (Python dict literals, unquoted keys)
+        ("<|python_tag|>{x: 1}", "{x: 1}"),
+        ("<|python_tag|>{'temp': 18}", "{'temp': 18}"),
+    ]
+
+    @pytest.mark.parametrize(("text", "content"), NOT_A_CALL)
+    def test_python_tag_without_a_call_is_removed_from_content(
+        self, parser, text, content
+    ):
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called and result.tool_calls == []
+        assert result.content == content
+        assert "<|python_tag|>" not in result.content
+
+    @pytest.mark.parametrize(("text", "content"), NOT_A_CALL)
+    def test_streaming_python_tag_without_a_call_matches_non_streaming(
+        self, parser, text, content
+    ):
+        # the tag arrives as one atomic delta, as the tokenizer emits it
+        head, _, tail = text.partition("<|python_tag|>")
+        chunks = [c for c in (head, "<|python_tag|>", tail[:4], tail[4:]) if c]
+        events = self._stream(parser, chunks)
+        final = parser.finalize_streaming("".join(chunks))
+        if final:
+            events.append(final)
+
+        streamed = "".join(e.get("content", "") for e in events)
+        assert streamed == content
+        assert not any("tool_calls" in e for e in events)
+
+    INCOMPLETE_CALLS = [
+        '<|python_tag|>{"name": "read_file", "para',
+        '<|python_tag|>{"name": "read_file"',
+        '<|python_tag|>{"na',
+        "<|python_tag|>{",
+        # a cut-off object of any shape may still become a call
+        '<|python_tag|>{"a": 1',
+        '<|python_tag|>{"parameters": {"x": 1}, "na',
+        '<|python_tag|>{"a": tru',
+    ]
+
+    @pytest.mark.parametrize("text", INCOMPLETE_CALLS)
+    def test_an_incomplete_tagged_call_is_hidden_without_leaking_the_tag(
+        self, parser, text
+    ):
+        # protocol markup cut off at EOF is not content (the existing streaming contract,
+        # test_streaming_finalizer_hides_incomplete_tagged_call); non-streaming agrees
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+        assert result.content == ""
+
+    @pytest.mark.parametrize("text", INCOMPLETE_CALLS)
+    def test_streaming_an_incomplete_tagged_call_is_hidden_at_eof(self, parser, text):
+        chunks = ["<|python_tag|>", text[len("<|python_tag|>") :]]
+        events = self._stream(parser, chunks)
+        final = parser.finalize_streaming("".join(chunks))
+        if final:
+            events.append(final)
+
+        assert "".join(e.get("content", "") for e in events) == ""
+        assert not any("tool_calls" in e for e in events)
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            ["<|python_tag|>", '{"parameters": {"x": 1}, ', '"name": "f"}'],
+            ["<|python_tag|>", '{"par', 'ameters": {"x": 1}, "na', 'me": "f"}'],
+            ["<|python_tag|>", '{"arguments": {}, ', '"name": "f"}'],
+            [
+                "<|python_tag|>",
+                '{"type": "function", "name": "f", "parameters": {',
+                "}}",
+            ],
+        ],
+    )
+    def test_a_tagged_call_with_any_key_order_is_never_shown_as_content(
+        self, parser, chunks
+    ):
+        events = self._stream(parser, chunks)
+
+        assert "".join(e.get("content", "") for e in events) == ""
+        calls = [c for e in events for c in e.get("tool_calls", [])]
+        assert [c["function"]["name"] for c in calls] == ["f"]
+        assert parser.extract_tool_calls("".join(chunks)).tools_called
+
+    def test_malformed_call_looking_json_after_the_tag_is_content_in_both_modes(
+        self, parser
+    ):
+        # not a valid JSON prefix (single-quoted arguments), so it is not "still arriving"
+        text = '<|python_tag|>{"name": "f", "parameters": {\'a\': 1}}'
+        body = text[len("<|python_tag|>") :]
+
+        assert parser.extract_tool_calls(text).content == body
+        events = self._stream(parser, ["<|python_tag|>", body])
+        assert "".join(e.get("content", "") for e in events) == body
+
+    @pytest.mark.parametrize("ensure_ascii", [True, False])
+    @pytest.mark.parametrize("size", [1, 2, 3, 7])
+    @pytest.mark.parametrize(
+        "key_order",
+        [("name", "parameters"), ("parameters", "name"), ("arguments", "name")],
+    )
+    def test_a_tagged_call_cut_at_any_point_never_leaks_a_fragment_as_content(
+        self, parser, ensure_ascii, size, key_order
+    ):
+        # every delta boundary, including inside a string, number, literal or \uXXXX escape
+        body = {
+            "parameters": {
+                "s": 'caf\u00e9 \U0001f600 "q" \\ \n',
+                "n": -12.5e-3,
+                "ok": True,
+                "none": None,
+                "nested": {"xs": [1, 2.5, "z"]},
+            }
+        }
+        call = {k: (body["parameters"] if k != "name" else "f") for k in key_order}
+        text = "<|python_tag|>" + json.dumps(call, ensure_ascii=ensure_ascii)
+        chunks = ["<|python_tag|>"] + [
+            text[i : i + size] for i in range(len("<|python_tag|>"), len(text), size)
+        ]
+
+        events = self._stream(parser, chunks)
+
+        assert "".join(e.get("content", "") for e in events) == ""
+        calls = [c for e in events for c in e.get("tool_calls", [])]
+        assert [c["function"]["name"] for c in calls] == ["f"]
+
+    def test_python_tag_call_next_to_code_keeps_the_call(self, parser):
+        text = '<|python_tag|>x = 1\n<|python_tag|>{"name": "read", "parameters": {}} After'
+
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called and result.tool_calls[0]["name"] == "read"
+        assert "<|python_tag|>" not in (result.content or "")
+        assert "x = 1" in result.content and "After" in result.content
+
+    def test_recorded_llama32_1b_roundtrip_reply_has_no_tag_through_the_server_cleaner(
+        self, parser
+    ):
+        # tool_roundtrip, Llama-3.2-1B-Instruct-4bit, 2026-10-12 (quantbench evidence
+        # servers-2026-10-12/vllm-mlx-llama1b/conformance.jsonl)
+        from vllm_mlx.api.utils import clean_output_text
+
+        text = (
+            "<|python_tag|>import json\n\ndef get_weather(city):\n"
+            '    return {"temp_c": 18}\n\nprint(json.dumps(get_weather("Paris")))'
+        )
+
+        result = parser.extract_tool_calls(text)
+        shown = clean_output_text(result.content)
+
+        assert not result.tools_called
+        assert "<|python_tag|>" not in shown and shown.startswith("import json")
+
 
 class TestHermesToolParser:
     """Test the Hermes tool parser."""

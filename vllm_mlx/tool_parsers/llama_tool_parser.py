@@ -109,19 +109,41 @@ class LlamaToolParser(ToolParser):
             marker_start = text.find(cls.PYTHON_TAG, cursor)
             if marker_start < 0:
                 break
-            scan = marker_start + len(cls.PYTHON_TAG)
+            marker_end = marker_start + len(cls.PYTHON_TAG)
+            scan = marker_end
             while scan < len(text) and text[scan].isspace():
                 scan += 1
 
-            try:
-                obj, length = decoder.raw_decode(text[scan:])
-            except json.JSONDecodeError:
+            if scan >= len(text):
+                # Nothing after the tag yet: JSON call or plain text, undecidable.
+                spans.append((marker_start, marker_end))
                 pending_start = marker_start
                 break
 
+            if text[scan] != "{":
+                # Llama's code-interpreter / built-in-tool lead-in
+                # (``<|python_tag|>import os`` ...), not a JSON call for a
+                # declared function. The tag is a control token, never content.
+                spans.append((marker_start, marker_end))
+                cursor = marker_end
+                continue
+
+            try:
+                obj, length = decoder.raw_decode(text[scan:])
+            except json.JSONDecodeError as exc:
+                spans.append((marker_start, marker_end))
+                if cls._json_ran_out(text[scan:], exc):
+                    # a cut-off object may still become a call envelope (any key order)
+                    pending_start = marker_start
+                    break
+                # malformed or not JSON (``{x: 1}``, single-quoted arguments): content
+                cursor = marker_end
+                continue
+
             call = cls._tool_call_from_object(obj)
             if call is None:
-                cursor = marker_start + len(cls.PYTHON_TAG)
+                spans.append((marker_start, marker_end))
+                cursor = marker_end
                 continue
 
             records.append((scan, call))
@@ -211,6 +233,20 @@ class LlamaToolParser(ToolParser):
         return bool(
             cls.BARE_JSON_MARKER.search(text) or cls.BARE_JSON_PARTIAL.search(text)
         )
+
+    # Tail of a cut-off JSON value at the decoder's error position: an unterminated string,
+    # a ``\uXXXX`` escape cut inside its four digits (the error sits on the ``u``), a partial
+    # number or a partial literal (an error at the very end has an empty tail).
+    _JSON_CUT_OFF_TAIL = re.compile(
+        r'"(?:[^"\\]|\\.)*\\?|u[0-9a-fA-F]{0,3}'
+        r"|-?\d*\.?\d*(?:[eE][+-]?\d*)?|t(?:ru?)?|f(?:a(?:ls?)?)?|n(?:ul?)?"
+    )
+
+    @classmethod
+    def _json_ran_out(cls, text: str, exc: json.JSONDecodeError) -> bool:
+        """Whether ``text`` failed to decode only because it ends early (a valid JSON prefix)
+        rather than because it is malformed (``{x: 1}``, ``{'a': 1}``)."""
+        return cls._JSON_CUT_OFF_TAIL.fullmatch(text[exc.pos :]) is not None
 
     @classmethod
     def _starts_with_complete_non_tool_json(cls, text: str) -> bool:
@@ -334,7 +370,9 @@ class LlamaToolParser(ToolParser):
 
         All three can in principle coexist in the same response.
         """
-        python_records, python_spans, _ = self._extract_python_tag_data(model_output)
+        python_records, python_spans, python_pending = self._extract_python_tag_data(
+            model_output
+        )
         xml_records, xml_spans, _ = self._extract_xml_data(model_output)
         records = sorted(python_records + xml_records, key=lambda item: item[0])
         spans = python_spans + xml_spans
@@ -342,7 +380,7 @@ class LlamaToolParser(ToolParser):
         if not records:
             bare_records, bare_spans, _ = self._extract_bare_json_data(model_output)
             records = bare_records
-            spans = bare_spans
+            spans = spans + bare_spans
 
         tool_calls = [call for _, call in records]
         cleaned_text = self._remove_spans(model_output, spans).strip()
@@ -354,8 +392,18 @@ class LlamaToolParser(ToolParser):
                 content=cleaned_text if cleaned_text else None,
             )
         else:
+            content = model_output
+            if python_pending is not None:
+                # An incomplete tagged call at EOF is protocol markup: hidden, as in
+                # finalize_streaming (a lone tag is just the control token).
+                content = content[:python_pending]
+                spans = [
+                    (s, min(e, python_pending)) for s, e in spans if s < python_pending
+                ]
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False,
+                tool_calls=[],
+                content=self._remove_spans(content, spans),
             )
 
     def extract_tool_calls_streaming(
