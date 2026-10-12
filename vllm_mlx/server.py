@@ -1212,6 +1212,22 @@ def _raise_engine_busy(exc: EngineBusy) -> None:
     ) from exc
 
 
+def _raise_preflight_error(exc: Exception, tracker=None) -> None:
+    """Map a ``validate_request_options`` failure to its HTTP error.
+
+    The check can wait on the engine (it may initialise a lazily built text
+    route under the generation lock), so besides an unsupported option it can
+    report the same retryable ``EngineBusy`` a generation attempt would.
+    """
+    if isinstance(exc, EngineBusy):
+        if tracker is not None:
+            tracker.finish(result="busy")
+        _raise_engine_busy(exc)
+    if tracker is not None:
+        tracker.finish(result="client_error")
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @dataclass
 class RequestModelContext:
     """Request-scoped engine/lease context."""
@@ -6108,9 +6124,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         if getattr(request, "ignore_eos", False):
             try:
                 await engine.validate_request_options(ignore_eos=True, completion=True)
-            except UnsupportedRequestOption as exc:
-                tracker.finish(result="client_error")
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (UnsupportedRequestOption, EngineBusy) as exc:
+                _raise_preflight_error(exc, tracker)
         if request.stream:
             response = StreamingResponse(
                 _disconnect_guard(
@@ -6342,9 +6357,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     has_media=has_media_content(request.messages),
                     mllm_draft=getattr(request, "mllm_draft", None),
                 )
-            except UnsupportedRequestOption as exc:
-                tracker.finish(result="client_error")
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (UnsupportedRequestOption, EngineBusy) as exc:
+                _raise_preflight_error(exc, tracker)
         try:
             prepared = _prepare_chat_completion_invocation(
                 engine,
@@ -6354,9 +6368,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except UnsafeRemoteURLError as exc:
             tracker.finish(result="client_error")
             _raise_remote_media_http_error(exc)
-        except UnsupportedRequestOption as exc:
-            tracker.finish(result="client_error")
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if request.stream:
             response, release_on_exit = await _build_chat_streaming_response(
@@ -6576,14 +6587,12 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             chat_request = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
             if request.ignore_eos:
-                # Streams cannot report an error after their first chunk.
-                try:
-                    await (engine or get_engine()).validate_request_options(
-                        ignore_eos=True,
-                        has_media=has_media_content(chat_request.messages),
-                    )
-                except UnsupportedRequestOption as exc:
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                # Streams cannot report an error after their first chunk; the
+                # handler below turns a refusal into the HTTP error.
+                await (engine or get_engine()).validate_request_options(
+                    ignore_eos=True,
+                    has_media=has_media_content(chat_request.messages),
+                )
             response = StreamingResponse(
                 _disconnect_guard(
                     _stream_responses_request(request, engine=engine),
@@ -6604,8 +6613,8 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
         )
     except UnsafeRemoteURLError as exc:
         _raise_remote_media_http_error(exc)
-    except UnsupportedRequestOption as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (UnsupportedRequestOption, EngineBusy) as exc:
+        _raise_preflight_error(exc)
     finally:
         if release_on_exit:
             await _release_engine_for_request(raw_request)

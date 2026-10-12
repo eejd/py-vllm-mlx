@@ -1035,10 +1035,17 @@ class SimpleEngine(BaseEngine):
         route (``_uses_text_model_route``, the predicate ``stream_chat`` itself
         routes on); media requests, completions, and chat while the drafter or
         a missing text model forces mlx-vlm cannot honour the flag.
+
+        Media requests and completions are refused without looking at the text
+        model. Only text-only chat has to know whether the text route exists,
+        which on a drafter-configured engine means initialising it, so this can
+        raise ``EngineBusy`` exactly like ``stream_chat`` would.
         """
         if not ignore_eos or not self._is_mllm:
             return
-        if not completion:
+        if not (has_media or completion):
+            if not self._loaded:
+                await self.start()
             draft = self._default_mllm_draft if mllm_draft is None else bool(mllm_draft)
             await self._ensure_text_model_for_request(mllm_draft_requested=draft)
             if self._uses_text_model_route(

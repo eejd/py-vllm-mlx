@@ -15,7 +15,7 @@ from pydantic import ValidationError
 import vllm_mlx.server as server
 from vllm_mlx.api.models import ChatCompletionRequest, CompletionRequest, Message
 from vllm_mlx.api.responses_models import ResponsesRequest
-from vllm_mlx.engine.base import GenerationOutput
+from vllm_mlx.engine.base import EngineBusy, GenerationOutput
 from vllm_mlx.request import UnsupportedRequestOption
 
 
@@ -267,6 +267,63 @@ class TestEndpointsForwardTheCapAndIgnoreEos:
         await server.create_completion(request, raw_request=None)
 
         assert "ignore_eos" not in engine.calls[0][1]
+
+
+@pytest.mark.anyio
+class TestPreflightBusy:
+    """The check can wait on the engine, so it can report the same retryable
+    503 a generation attempt would, not an unhandled 500."""
+
+    @pytest.fixture
+    def busy_engine(self, engine, monkeypatch):
+        async def busy(**kwargs):
+            raise EngineBusy("SimpleEngine serialized route is busy; retry later")
+
+        engine.validate_request_options = busy
+        monkeypatch.setattr(server, "get_engine", lambda: engine)
+        monkeypatch.setattr(server, "_model_manager", None)
+
+        async def no_preflight(raw_request):
+            return None
+
+        monkeypatch.setattr(server, "_preflight_response_format_backend", no_preflight)
+        return engine
+
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_chat(self, busy_engine, stream):
+        request = ChatCompletionRequest(
+            model="served",
+            messages=[Message(role="user", content="hi")],
+            ignore_eos=True,
+            stream=stream,
+        )
+        with pytest.raises(server.HTTPException) as exc_info:
+            await server.create_chat_completion(request, raw_request=None)
+
+        assert exc_info.value.status_code == 503
+        assert busy_engine.calls == []
+
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_completions(self, busy_engine, stream):
+        request = CompletionRequest(
+            model="served", prompt="p", ignore_eos=True, stream=stream
+        )
+        with pytest.raises(server.HTTPException) as exc_info:
+            await server.create_completion(request, raw_request=None)
+
+        assert exc_info.value.status_code == 503
+        assert busy_engine.calls == []
+
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_responses(self, busy_engine, stream):
+        request = ResponsesRequest(
+            model="served", input="hi", ignore_eos=True, stream=stream
+        )
+        with pytest.raises(server.HTTPException) as exc_info:
+            await server.create_response(request, raw_request=None)
+
+        assert exc_info.value.status_code == 503
+        assert busy_engine.calls == []
 
 
 @pytest.mark.anyio

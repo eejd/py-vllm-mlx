@@ -636,6 +636,71 @@ class TestSimpleEngineValidation:
             await engine.validate_request_options(ignore_eos=True)
         await engine.validate_request_options(ignore_eos=True, mllm_draft=False)
 
+    def _drafter_engine(self):
+        """A multimodal engine whose text route is built lazily, per request."""
+        engine = self._engine(is_mllm=True)
+        engine._mllm_draft_model_path = "drafter"
+        built = []
+
+        def initialize():
+            built.append(True)
+            engine._text_model_initialization_attempted = True
+            engine._text_model = object()
+
+        engine._initialize_text_model = initialize
+        return engine, built
+
+    @pytest.mark.anyio
+    async def test_the_lazy_text_route_is_built_for_text_only_chat(self):
+        engine, built = self._drafter_engine()
+
+        await engine.validate_request_options(ignore_eos=True)
+        await engine.validate_request_options(ignore_eos=True)
+
+        assert built == [True]  # once; the second call finds it
+
+    @pytest.mark.anyio
+    async def test_a_drafter_request_or_media_never_builds_it(self):
+        engine, built = self._drafter_engine()
+
+        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+            await engine.validate_request_options(ignore_eos=True, mllm_draft=True)
+        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+            await engine.validate_request_options(ignore_eos=True, has_media=True)
+        with pytest.raises(UnsupportedRequestOption, match="ignore_eos"):
+            await engine.validate_request_options(ignore_eos=True, completion=True)
+
+        assert built == []
+
+    @pytest.mark.anyio
+    async def test_a_busy_engine_is_reported_as_busy_not_unsupported(self):
+        from vllm_mlx.engine.base import EngineBusy
+
+        engine, built = self._drafter_engine()
+        engine._generation_lock_admission = "fail_fast"
+
+        async with engine._generation_lock:
+            with pytest.raises(EngineBusy):
+                await engine.validate_request_options(ignore_eos=True)
+
+        assert built == []
+
+    @pytest.mark.anyio
+    async def test_an_unstarted_engine_is_started_first(self):
+        engine = self._engine(is_mllm=True)
+        engine._loaded = False
+        engine._text_model = object()
+        engine._text_model_initialization_attempted = True
+
+        async def start():
+            engine._loaded = True
+
+        engine.start = start
+
+        await engine.validate_request_options(ignore_eos=True)
+
+        assert engine._loaded
+
     @pytest.mark.anyio
     async def test_the_route_itself_still_refuses_as_a_backstop(self):
         engine = self._engine(is_mllm=True)
