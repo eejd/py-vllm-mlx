@@ -801,6 +801,37 @@ class TestLlamaToolParser:
         events = self._stream(parser, ["<|python_tag|>", body])
         assert "".join(e.get("content", "") for e in events) == body
 
+    @pytest.mark.parametrize("ensure_ascii", [True, False])
+    @pytest.mark.parametrize("size", [1, 2, 3, 7])
+    @pytest.mark.parametrize(
+        "key_order",
+        [("name", "parameters"), ("parameters", "name"), ("arguments", "name")],
+    )
+    def test_a_tagged_call_cut_at_any_point_never_leaks_a_fragment_as_content(
+        self, parser, ensure_ascii, size, key_order
+    ):
+        # every delta boundary, including inside a string, number, literal or \uXXXX escape
+        body = {
+            "parameters": {
+                "s": 'caf\u00e9 \U0001f600 "q" \\ \n',
+                "n": -12.5e-3,
+                "ok": True,
+                "none": None,
+                "nested": {"xs": [1, 2.5, "z"]},
+            }
+        }
+        call = {k: (body["parameters"] if k != "name" else "f") for k in key_order}
+        text = "<|python_tag|>" + json.dumps(call, ensure_ascii=ensure_ascii)
+        chunks = ["<|python_tag|>"] + [
+            text[i : i + size] for i in range(len("<|python_tag|>"), len(text), size)
+        ]
+
+        events = self._stream(parser, chunks)
+
+        assert "".join(e.get("content", "") for e in events) == ""
+        calls = [c for e in events for c in e.get("tool_calls", [])]
+        assert [c["function"]["name"] for c in calls] == ["f"]
+
     def test_python_tag_call_next_to_code_keeps_the_call(self, parser):
         text = '<|python_tag|>x = 1\n<|python_tag|>{"name": "read", "parameters": {}} After'
 

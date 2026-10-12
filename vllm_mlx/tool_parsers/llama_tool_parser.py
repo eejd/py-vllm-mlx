@@ -235,9 +235,11 @@ class LlamaToolParser(ToolParser):
         )
 
     # Tail of a cut-off JSON value at the decoder's error position: an unterminated string,
-    # a partial number or a partial literal (an error at the very end has an empty tail).
+    # a ``\uXXXX`` escape cut inside its four digits (the error sits on the ``u``), a partial
+    # number or a partial literal (an error at the very end has an empty tail).
     _JSON_CUT_OFF_TAIL = re.compile(
-        r'"(?:[^"\\]|\\.)*\\?|-?\d*\.?\d*(?:[eE][+-]?\d*)?|t(?:ru?)?|f(?:a(?:ls?)?)?|n(?:ul?)?'
+        r'"(?:[^"\\]|\\.)*\\?|u[0-9a-fA-F]{0,3}'
+        r"|-?\d*\.?\d*(?:[eE][+-]?\d*)?|t(?:ru?)?|f(?:a(?:ls?)?)?|n(?:ul?)?"
     )
 
     @classmethod
