@@ -7,6 +7,7 @@ that transformers doesn't recognize. This module provides fallback loading
 directly from tokenizer.json.
 """
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -81,6 +82,64 @@ def collect_eos_token_ids(tokenizer, model_path=None) -> set:
                 eos_ids.add(int(config_eos))
 
     return eos_ids
+
+
+class _EosSkippingDetokenizer:
+    """Streaming detokenizer that drops EOS ids instead of rendering them.
+
+    mlx-lm's ``stream_generate`` never feeds EOS to the detokenizer because it
+    stops there. When generation runs past EOS (``ignore_eos``) the EOS tokens
+    would otherwise be decoded into the text (``<|im_end|>`` and friends). vLLM
+    hides them too (``skip_special_tokens`` defaults to true), and a natural
+    stop never shows them, so they are skipped here.
+    """
+
+    def __init__(self, inner, skip_ids):
+        self._inner = inner
+        self._skip_ids = skip_ids
+
+    def __copy__(self):
+        # TokenizerWrapper.detokenizer hands each caller a copy; the wrapped
+        # detokenizer must be copied too or concurrent callers share its state.
+        return type(self)(copy.copy(self._inner), self._skip_ids)
+
+    def add_token(self, token, *args, **kwargs):
+        if token in self._skip_ids:
+            return
+        self._inner.add_token(token, *args, **kwargs)
+
+    def __getattr__(self, name):
+        if name.startswith("__") or name in ("_inner", "_skip_ids"):
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
+def eos_ignoring_tokenizer(tokenizer):
+    """A view of ``tokenizer`` under which mlx-lm does not stop on EOS.
+
+    Implements ``ignore_eos`` for every code path that drives
+    ``mlx_lm.stream_generate``/``generate``: those stop when a token is in
+    ``tokenizer.eos_token_ids``, so the view reports an empty set, and its
+    detokenizer skips the former EOS ids so they stay out of the text.
+    The wrapped tokenizer is not modified; the result is cheap to build per
+    request (no detokenizer map rebuild).
+    """
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+
+    class _EosIgnoringTokenizer(TokenizerWrapper):
+        def __init__(self, base):
+            # Share base's state instead of re-running TokenizerWrapper.__init__,
+            # which rebuilds the detokenizer token map.
+            self.__dict__.update(base.__dict__)
+            self._eos_token_ids = set()
+            self._detokenizer = _EosSkippingDetokenizer(
+                base._detokenizer, frozenset(base.eos_token_ids)
+            )
+
+    return _EosIgnoringTokenizer(tokenizer)
 
 
 def _needs_strict_false(model_name: str) -> bool:

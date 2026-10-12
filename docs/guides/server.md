@@ -76,7 +76,7 @@ vllm-mlx serve mlx-community/Qwen3-8B-4bit \
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--max-tokens` | Default max tokens | 32768 |
-| `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
+| `--max-request-tokens` | Maximum `max_tokens` / `max_completion_tokens` accepted from API clients | 32768 |
 | `--default-temperature` | Default temperature when not specified | None |
 | `--default-top-p` | Default top_p when not specified | None |
 | `--default-chat-template-kwargs` | Default chat template kwargs used when request `chat_template_kwargs` is omitted (JSON object) | None |
@@ -132,6 +132,43 @@ response = client.completions.create(
     max_tokens=50
 )
 ```
+
+### Output length: `max_completion_tokens` and `ignore_eos`
+
+The output cap is resolved the way vLLM does it:
+
+| Endpoint | Field(s), highest precedence first | Falls back to |
+|----------|------------------------------------|---------------|
+| `/v1/chat/completions` | `max_completion_tokens`, `max_tokens` (deprecated) | `--max-tokens` |
+| `/v1/completions` | `max_tokens` | `--max-tokens` |
+| `/v1/responses` | `max_output_tokens` | `--max-tokens` |
+| `/v1/messages` (Anthropic) | `max_tokens` (required) | n/a |
+
+An explicit value above `--max-request-tokens` is answered with HTTP 400 (not applied to
+`max_output_tokens`). `finish_reason` is `length` when the cap ends generation, and
+`usage.completion_tokens` counts every generated token.
+
+`ignore_eos: true` (a vLLM sampling extension, accepted on chat completions, completions and
+`/v1/responses`) keeps generating past the model's EOS tokens until the cap, which is how load
+generators such as guidellm fix the output length:
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "Write a long story"}],
+    max_completion_tokens=256,
+    extra_body={"ignore_eos": True},
+)
+assert response.usage.completion_tokens == 256
+assert response.choices[0].finish_reason == "length"
+```
+
+EOS tokens that are generated after the first one are counted in `usage.completion_tokens` but are
+never rendered into the text (vLLM hides special tokens by default, and a natural stop does not show
+them either). Both the simple and the continuous-batching engine honour the flag. On the simple
+engine, requests that decode through mlx-vlm (image/video/audio inputs, or completions on a
+multimodal model) cannot, and are answered with HTTP 400 instead of ignoring it; text-only chat on a
+multimodal model and every text-only model are unaffected.
 
 ### Models
 

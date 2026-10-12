@@ -876,6 +876,7 @@ class BatchedEngine(BaseEngine):
                 specprefill=kwargs.pop("specprefill", None),
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
+                ignore_eos=bool(kwargs.pop("ignore_eos", False)),
             )
 
             return GenerationOutput(
@@ -903,6 +904,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
+            ignore_eos=bool(kwargs.pop("ignore_eos", False)),
         )
 
         output = await self._engine.generate(
@@ -974,6 +976,7 @@ class BatchedEngine(BaseEngine):
                 specprefill=kwargs.pop("specprefill", None),
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
+                ignore_eos=bool(kwargs.pop("ignore_eos", False)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -1004,6 +1007,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
+            ignore_eos=bool(kwargs.pop("ignore_eos", False)),
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)

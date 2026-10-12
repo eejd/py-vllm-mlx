@@ -170,6 +170,8 @@ class ResponsesRequest(BaseModel):
     )
     instructions: str | None = None
     max_output_tokens: int | None = None
+    # vLLM sampling extension: EOS tokens no longer end generation.
+    ignore_eos: bool = False
     stream: bool = False
     tools: list[ResponseFunctionTool | dict] = Field(default_factory=list)
     tool_choice: str | dict | None = "auto"

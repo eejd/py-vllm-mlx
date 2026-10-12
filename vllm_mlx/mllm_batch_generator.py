@@ -228,6 +228,9 @@ class MLLMBatchRequest:
     # Merged with built-in repetition/presence penalty processors in
     # ``_prefill_batch``.
     logits_processors: Optional[List[Callable]] = None
+    # vLLM ``ignore_eos``: this request does not stop on the generator's
+    # EOS/stop tokens; only ``max_tokens`` ends it.
+    ignore_eos: bool = False
     specprefill_config: Optional[SpecPrefillRequestConfig] = None
     specprefill_outcome: Optional[SpecPrefillOutcome] = None
     decode_rope_delta: Optional[mx.array] = None
@@ -256,6 +259,20 @@ class MLLMBatchRequest:
     vision_encoded: bool = False
     cross_attention_states: Optional[Any] = None  # For models that use cross-attention
     encoder_outputs: Optional[Any] = None  # For encoder-decoder models
+
+
+def _is_stop_token(
+    stop_tokens: set, token: int, request: Optional["MLLMBatchRequest"]
+) -> bool:
+    """Does ``token`` end ``request``?
+
+    EOS/stop tokens end a request unless it asked for ``ignore_eos``, in which
+    case only ``max_tokens`` does. Every decode path (stock step, chunked-prefill
+    step, MTP draft emission) decides through here.
+    """
+    if token not in stop_tokens:
+        return False
+    return request is None or not request.ignore_eos
 
 
 @dataclass
@@ -2756,7 +2773,7 @@ class MLLMBatchGenerator:
             finish_reason = None
             cache_fn = None
 
-            if token in self.stop_tokens:
+            if _is_stop_token(self.stop_tokens, token, req):
                 finish_reason = "stop"
                 end_idx.append(i)
             elif num_tok >= max_tok:
@@ -3543,7 +3560,15 @@ def install_mtp_mllm(
                     draft_lp = draft_info["logprobs"]
                     from_draft = draft_info.get("from_draft", True)
 
-                    if draft_t in batch_gen.stop_tokens:
+                    active = batch_gen.active_batch
+                    draft_req = None
+                    if active is not None:
+                        for bu, rq in zip(active.uids, active.requests):
+                            if bu == uid:
+                                draft_req = rq
+                                break
+
+                    if _is_stop_token(batch_gen.stop_tokens, draft_t, draft_req):
                         augmented.append(
                             MLLMBatchResponse(
                                 uid=uid,
@@ -3714,7 +3739,7 @@ def install_chunked_prefill_mllm(
 
             finish_reason = None
 
-            if token in batch_gen.stop_tokens:
+            if _is_stop_token(batch_gen.stop_tokens, token, req):
                 finish_reason = "stop"
                 end_idx.append(i)
             elif num_tok >= max_tok:

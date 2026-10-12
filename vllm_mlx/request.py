@@ -62,6 +62,11 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    # vLLM ``ignore_eos``: the model's EOS tokens do not end generation. Only
+    # ``max_tokens`` (or an explicit ``stop_token_ids`` entry) does. Post-EOS
+    # tokens are generated and counted like any other, but EOS tokens are
+    # never rendered into the output text.
+    ignore_eos: bool = False
     # Extra per-request logits processors (e.g. JSON schema constrained
     # decoding via ``lm-format-enforcer``).  These are merged with any
     # built-in processors (repetition/presence penalty) at batch time.

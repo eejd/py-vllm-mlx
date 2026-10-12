@@ -33,11 +33,13 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
+from ..utils.tokenizer import collect_eos_token_ids, eos_ignoring_tokenizer
 from .base import (
     BaseEngine,
     EngineBusy,
     EngineStopped,
     GenerationOutput,
+    UnsupportedRequestOption,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
     shield_task,
@@ -53,6 +55,23 @@ from ..mlx_streams import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_ignore_eos_on_mlx_vlm(kwargs: dict[str, Any]) -> None:
+    """Refuse ``ignore_eos`` on a route that decodes through mlx-vlm.
+
+    mlx-lm decodes (text models, and MLLM models' text-only chat route) stop on
+    ``tokenizer.eos_token_ids`` and can be told not to. mlx-vlm owns its own
+    stopping criteria and speculative drafters, and this engine has no hook
+    into them, so the flag would be silently ignored. Fail loudly instead.
+    """
+    if kwargs.get("ignore_eos"):
+        raise UnsupportedRequestOption(
+            "ignore_eos is not supported for requests decoded by mlx-vlm "
+            "(image/video/audio inputs, or completions on a multimodal model, "
+            "on the simple engine); use --continuous-batching or a text-only "
+            "chat request"
+        )
 
 
 def _bind_worker_generation_streams(stream: object | None = None) -> object:
@@ -1002,6 +1021,22 @@ class SimpleEngine(BaseEngine):
         mx.clear_cache()
         logger.info("SimpleEngine stopped")
 
+    def validate_request_options(
+        self,
+        *,
+        ignore_eos: bool = False,
+        has_media: bool = False,
+        completion: bool = False,
+    ) -> None:
+        """Refuse ``ignore_eos`` where the request is certain to reach mlx-vlm.
+
+        Media requests and completions on a multimodal model always do. Whether
+        a text-only chat request takes the mlx-lm text route depends on lazily
+        loaded state, so that case is left to the check on the route itself.
+        """
+        if ignore_eos and self._is_mllm and (has_media or completion):
+            _reject_ignore_eos_on_mlx_vlm({"ignore_eos": True})
+
     def _should_route_text_through_text_model(
         self, *, mllm_draft_requested: bool = False
     ) -> bool:
@@ -1398,6 +1433,8 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
         specprefill_backbone_pct_override = kwargs.pop("specprefill_backbone_pct", None)
         request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
+        if self._is_mllm:
+            _reject_ignore_eos_on_mlx_vlm(kwargs)
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
         if not self._is_mllm and self._draft_model is not None:
@@ -1675,6 +1712,13 @@ class SimpleEngine(BaseEngine):
         if kwargs.get("logits_processors") and not self._is_mllm:
             return await aggregate_stream_chat()
 
+        # ``model.chat()`` below returns an approximate completion count
+        # (re-tokenized text) and infers finish_reason from it. ignore_eos is
+        # used to measure exact output lengths, so take the streaming path,
+        # which counts every generated token.
+        if kwargs.get("ignore_eos") and not self._is_mllm:
+            return await aggregate_stream_chat()
+
         # Text-only requests on MLLM models should always aggregate the
         # streaming path for non-streaming chat. This keeps one execution seam
         # and avoids mlx_vlm non-stream thread/stream ownership mismatches.
@@ -1685,6 +1729,7 @@ class SimpleEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         if self._is_mllm:
+            _reject_ignore_eos_on_mlx_vlm(kwargs)
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
             output = await self._run_blocking_serialized(
@@ -1913,6 +1958,7 @@ class SimpleEngine(BaseEngine):
 
         # Build prompt using tokenizer
         if self._is_mllm:
+            _reject_ignore_eos_on_mlx_vlm(kwargs)
             if self._text_model is not None:
                 route_kind = "Media" if has_media else "Text-only"
                 logger.info("%s request → MLLM path", route_kind)
@@ -2377,7 +2423,11 @@ class SimpleEngine(BaseEngine):
                 prompt_arr = mx.array(prompt_tokens_for_decode)
                 for resp in mlx_stream_generate(
                     model,
-                    tokenizer,
+                    (
+                        eos_ignoring_tokenizer(tokenizer)
+                        if kwargs.get("ignore_eos")
+                        else tokenizer
+                    ),
                     prompt=prompt_arr,
                     max_tokens=max_tokens,
                     sampler=sampler,
@@ -2518,6 +2568,7 @@ class SimpleEngine(BaseEngine):
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
         cancel_requested = Event()
+        ignore_eos = bool(kwargs.get("ignore_eos", False))
 
         def _request_cancel() -> None:
             cancel_requested.set()
@@ -2606,8 +2657,17 @@ class SimpleEngine(BaseEngine):
                 sampler = make_sampler(temp=temperature, top_p=top_p)
                 _cancel_check()
                 first_token_id = sampler(logits[:, -1, :]).item()
-                first_text = tokenizer.decode([first_token_id])
                 eos_id = tokenizer.eos_token_id
+                if ignore_eos:
+                    # EOS does not end the response, and is not rendered.
+                    first_text = (
+                        ""
+                        if first_token_id in collect_eos_token_ids(tokenizer)
+                        else tokenizer.decode([first_token_id])
+                    )
+                    eos_id = None
+                else:
+                    first_text = tokenizer.decode([first_token_id])
 
                 results = [
                     SimpleNamespace(
@@ -2624,6 +2684,7 @@ class SimpleEngine(BaseEngine):
                         top_p=top_p,
                         stop=stop,
                         prompt_cache=cache,
+                        ignore_eos=ignore_eos,
                     ):
                         _cancel_check()
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
@@ -2738,6 +2799,14 @@ class SimpleEngine(BaseEngine):
         repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
         stop = kwargs.pop("stop", None)
         external_logits_processors = kwargs.pop("logits_processors", None)
+        # ignore_eos: mlx-lm stops when a token is in tokenizer.eos_token_ids,
+        # so decode under a view of the tokenizer that reports none.
+        ignore_eos = bool(kwargs.pop("ignore_eos", False))
+        generation_tokenizer = (
+            eos_ignoring_tokenizer(self._text_tokenizer)
+            if ignore_eos
+            else self._text_tokenizer
+        )
         abort_event = threading.Event()
 
         # Per-request enable_thinking override; fall back to env var / default True.
@@ -3008,7 +3077,7 @@ class SimpleEngine(BaseEngine):
                 resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             for resp in mlx_stream_generate(
                 model,
-                self._text_tokenizer,
+                generation_tokenizer,
                 prompt=prompt,
                 **resume_kwargs,
             ):
@@ -3139,7 +3208,7 @@ class SimpleEngine(BaseEngine):
                 retired = False
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    generation_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
@@ -3173,7 +3242,7 @@ class SimpleEngine(BaseEngine):
             else:
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    generation_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
@@ -3281,7 +3350,10 @@ class SimpleEngine(BaseEngine):
                 new_text = decoded[len(prev_decoded) :]
                 prev_decoded = decoded
 
-                is_eos = tok_id == eos_id
+                # ignore_eos: an EOS seed token is neither a stop nor text.
+                is_eos = tok_id == eos_id and not ignore_eos
+                if ignore_eos and tok_id in collect_eos_token_ids(self._text_tokenizer):
+                    new_text = ""
                 _emit_response(
                     SimpleNamespace(
                         text=new_text,
@@ -3322,7 +3394,7 @@ class SimpleEngine(BaseEngine):
                 retired = False
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    generation_tokenizer,
                     prompt=continuation_prompt,
                     max_tokens=max_tokens - token_count,
                     sampler=sampler,

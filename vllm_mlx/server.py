@@ -158,6 +158,7 @@ from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
     clean_output_text,
     extract_multimodal_content,
+    has_media_content,
     is_mllm_model,  # noqa: F401
 )
 from .audio_limits import (
@@ -179,7 +180,7 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import EngineBusy, suspend_cancellation
+from .engine.base import EngineBusy, UnsupportedRequestOption, suspend_cancellation
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -305,14 +306,29 @@ def _resolve_repetition_penalty(request_value: float | None) -> float:
     return _FALLBACK_REPETITION_PENALTY
 
 
-def _resolve_request_max_tokens(requested_value: int | None) -> int:
-    """Resolve and validate a request's max_tokens budget."""
+def _resolve_request_max_tokens(
+    requested_value: int | None,
+    *,
+    max_completion_tokens: int | None = None,
+) -> int:
+    """Resolve and validate a request's output-token budget.
+
+    Precedence matches vLLM's ``ChatCompletionRequest``:
+    ``max_completion_tokens`` > ``max_tokens`` > the server default.
+    ``max_completion_tokens`` is OpenAI's name for the chat-completions cap;
+    ``max_tokens`` is the older spelling (and the only one on /v1/completions
+    and the Anthropic API).
+    """
+    if max_completion_tokens is not None:
+        requested_value, field = max_completion_tokens, "max_completion_tokens"
+    else:
+        field = "max_tokens"
     if requested_value is None:
         return _default_max_tokens
     if requested_value > _max_request_tokens:
         raise HTTPException(
             status_code=400,
-            detail=f"max_tokens exceeds server limit ({_max_request_tokens})",
+            detail=f"{field} exceeds server limit ({_max_request_tokens})",
         )
     return requested_value
 
@@ -899,6 +915,8 @@ def _prepare_chat_completion_invocation(
     messages, images, videos, audios, has_media = _prepare_chat_messages(
         engine, request.messages
     )
+    if getattr(request, "ignore_eos", False):
+        engine.validate_request_options(ignore_eos=True, has_media=has_media)
     response_format = request.response_format
     messages, json_logits_processor = _prepare_json_logits_processor(
         engine,
@@ -919,6 +937,8 @@ def _prepare_chat_completion_invocation(
         "repetition_penalty": _resolve_repetition_penalty(request.repetition_penalty),
     }
     _attach_logit_bias_processor(chat_kwargs, getattr(request, "logit_bias", None))
+    if getattr(request, "ignore_eos", False):
+        chat_kwargs["ignore_eos"] = True
 
     if has_media:
         chat_kwargs["images"] = images if images else None
@@ -2949,6 +2969,7 @@ def _responses_request_to_chat_request(
         temperature=request.temperature,
         top_p=request.top_p,
         max_tokens=request.max_output_tokens,
+        ignore_eos=request.ignore_eos,
         stream=False,
         tools=tools,
         tool_choice=request.tool_choice,
@@ -3115,12 +3136,18 @@ def _prepare_responses_request(
         preserve_native_format=engine.preserve_native_tool_format,
     )
     messages = canonicalize_system_messages(messages)
+    if chat_request.ignore_eos:
+        engine.validate_request_options(
+            ignore_eos=True, has_media=bool(images or videos or audios)
+        )
 
     chat_kwargs = {
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(chat_request.temperature),
         "top_p": _resolve_top_p(chat_request.top_p),
     }
+    if chat_request.ignore_eos:
+        chat_kwargs["ignore_eos"] = True
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         chat_request.chat_template_kwargs
     )
@@ -6079,6 +6106,12 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     release_on_exit = True
 
     try:
+        if getattr(request, "ignore_eos", False):
+            try:
+                engine.validate_request_options(ignore_eos=True, completion=True)
+            except UnsupportedRequestOption as exc:
+                tracker.finish(result="client_error")
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if request.stream:
             response = StreamingResponse(
                 _disconnect_guard(
@@ -6122,6 +6155,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
                 comp_rep_penalty
             )
+            if getattr(request, "ignore_eos", False):
+                generate_kwargs["ignore_eos"] = True
             if request.specprefill is not None:
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
@@ -6150,6 +6185,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except EngineBusy as exc:
                 tracker.finish(result="busy")
                 _raise_engine_busy(exc)
+            except UnsupportedRequestOption as exc:
+                tracker.finish(result="client_error")
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             if output is None:
                 tracker.finish(
                     result="client_closed",
@@ -6249,7 +6287,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     ```
     """
     _validate_model_name(request.model)
-    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
+    effective_max_tokens = _resolve_request_max_tokens(
+        request.max_tokens,
+        max_completion_tokens=getattr(request, "max_completion_tokens", None),
+    )
     _raise_if_outlines_response_format_requested(request.response_format)
     await _preflight_response_format_backend(raw_request)
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
@@ -6269,6 +6310,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     logger.info(
         f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
         f"model={request.model!r} max_tokens={request.max_tokens} "
+        f"max_completion_tokens={getattr(request, 'max_completion_tokens', None)} "
+        f"ignore_eos={getattr(request, 'ignore_eos', False)} "
         f"temp={request.temperature} top_p={request.top_p} "
         f"top_k={request.top_k} min_p={request.min_p} "
         f"presence_penalty={request.presence_penalty} "
@@ -6302,6 +6345,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except UnsafeRemoteURLError as exc:
             tracker.finish(result="client_error")
             _raise_remote_media_http_error(exc)
+        except UnsupportedRequestOption as exc:
+            tracker.finish(result="client_error")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if request.stream:
             response, release_on_exit = await _build_chat_streaming_response(
@@ -6332,6 +6378,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except EngineBusy as exc:
             tracker.finish(result="busy")
             _raise_engine_busy(exc)
+        except UnsupportedRequestOption as exc:
+            tracker.finish(result="client_error")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
@@ -6517,6 +6566,15 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
         if request.stream:
             chat_request = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
+            if request.ignore_eos:
+                # Streams cannot report an error after their first chunk.
+                try:
+                    (engine or get_engine()).validate_request_options(
+                        ignore_eos=True,
+                        has_media=has_media_content(chat_request.messages),
+                    )
+                except UnsupportedRequestOption as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
             response = StreamingResponse(
                 _disconnect_guard(
                     _stream_responses_request(request, engine=engine),
@@ -6537,6 +6595,8 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
         )
     except UnsafeRemoteURLError as exc:
         _raise_remote_media_http_error(exc)
+    except UnsupportedRequestOption as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         if release_on_exit:
             await _release_engine_for_request(raw_request)
@@ -7420,6 +7480,8 @@ async def stream_completion(
     generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
         repetition_penalty
     )
+    if getattr(request, "ignore_eos", False):
+        generate_kwargs["ignore_eos"] = True
     if request.specprefill is not None:
         generate_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:

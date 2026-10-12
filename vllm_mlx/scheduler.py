@@ -11,6 +11,7 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+import inspect
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -52,6 +53,43 @@ CACHE_CORRUPTION_PATTERNS = [
     "cache",
     "BatchKVCache",
 ]
+
+
+def _stop_override_insert_kwargs(
+    batch_generator: Any, stop_token_ids: List[int]
+) -> Dict[str, Any]:
+    """``insert()`` kwargs that replace the generator-wide EOS stop set.
+
+    ``BatchGenerator`` is built with one stop-token set (the model's EOS ids)
+    shared by every sequence. A request that sets ``ignore_eos`` must not stop
+    on those ids, so it is inserted with its own stop set holding only the
+    ids the client asked for (``stop_token_ids``; usually none).
+
+    mlx-lm renamed the per-sequence parameter between releases: 0.31.x takes
+    ``state_machines``, 0.32 takes ``stop_sequences``. Both are probed from
+    the live signature so a new release that drops both fails loudly instead
+    of silently ignoring ``ignore_eos``.
+    """
+    params = inspect.signature(batch_generator.insert).parameters
+    sequences = [[int(t)] for t in stop_token_ids]
+    if "stop_sequences" in params:
+        from mlx_lm.generate import StopSequences
+
+        return {"stop_sequences": [StopSequences(sequences or None)]}
+    if "state_machines" in params:
+        from mlx_lm.generate import SequenceStateMachine
+
+        transitions = {"normal": [(seq, None) for seq in sequences]}
+        return {
+            "state_machines": [
+                SequenceStateMachine(transitions if sequences else {}, initial="normal")
+            ]
+        }
+    raise RuntimeError(
+        "ignore_eos needs a per-sequence stop override on "
+        "BatchGenerator.insert (stop_sequences or state_machines), and the "
+        "installed mlx-lm provides neither"
+    )
 
 
 def _normalize_logits_processors(logits_processors):
@@ -843,6 +881,9 @@ class Scheduler:
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
         self._detokenizer_pool: Dict[str, Any] = {}
+        # The model's EOS ids, read from the tokenizer on first use. Needed to
+        # keep EOS tokens out of the text of ``ignore_eos`` requests.
+        self._eos_token_id_set: Optional[Set[int]] = None
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -979,6 +1020,12 @@ class Scheduler:
                     # Handle case where eos_token_ids is a single int
                     stop_tokens.add(tok.eos_token_ids)
         return stop_tokens
+
+    def _eos_token_ids(self) -> Set[int]:
+        """The model's EOS token ids (cached; the tokenizer does not change)."""
+        if self._eos_token_id_set is None:
+            self._eos_token_id_set = self._get_stop_tokens()
+        return self._eos_token_id_set
 
     def _create_batch_generator(
         self, sampling_params: SamplingParams
@@ -1911,6 +1958,15 @@ class Scheduler:
                 # mlx_lm BatchGenerator never stores None per-sequence.
                 "logits_processors": [lp] if lp else [[]],
             }
+            if request.sampling_params.ignore_eos:
+                # Do not stop on EOS: the generator-wide stop set is replaced
+                # for this sequence only (see _stop_override_insert_kwargs).
+                insert_kwargs.update(
+                    _stop_override_insert_kwargs(
+                        self.batch_generator,
+                        request.sampling_params.stop_token_ids,
+                    )
+                )
             try:
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
@@ -2325,8 +2381,21 @@ class Scheduler:
 
                 request.first_token_time = _time.time()
 
-            # Decode the new token using streaming detokenizer (UTF-8 safe)
+            # Decode the new token using streaming detokenizer (UTF-8 safe).
+            # A stop-finishing token is the terminator, not content. Under
+            # ignore_eos the EOS token is generated and counted but never
+            # finishes the request, so it is dropped here instead -- the same
+            # text a natural stop would have produced for it.
             if response.finish_reason == "stop":
+                new_text = ""
+            elif (
+                request.sampling_params.ignore_eos
+                and response.token in self._eos_token_ids()
+            ):
+                # Make sure the request has a detokenizer even when every token
+                # so far was EOS: the finish path falls back to decoding the raw
+                # token ids (EOS included) when it finds none.
+                self._get_detokenizer(request_id)
                 new_text = ""
             else:
                 detok = self._get_detokenizer(request_id)
