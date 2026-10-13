@@ -85,6 +85,49 @@ def test_chunked_prefill_marks_a_preprocessing_failure_of_the_next_request():
     assert gen.unprocessed_requests == []
 
 
+def _rope_failure(_request):
+    raise RuntimeError("rope index could not be derived")
+
+
+def _preprocessed_but_rope_fails():
+    gen = _generator()
+    gen._preprocess_request = lambda request: None
+    gen._derive_request_rope_deltas = _rope_failure
+    return gen
+
+
+def test_process_prompts_does_not_blame_the_client_for_a_rope_failure():
+    """The inputs were preprocessed; what failed afterwards is the server's."""
+    gen = _preprocessed_but_rope_fails()
+
+    assert MLLMBatchGenerator._process_prompts(gen, [_request(1, "rope")]) is None
+
+    assert _only(gen._pending_error_responses).error_kind is None
+
+
+def test_process_prompts_keeps_the_kinds_apart_within_one_batch():
+    gen = _generator()
+    gen._derive_request_rope_deltas = _rope_failure
+    gen._preprocess_request = lambda request: (
+        _undecodable(request) if request.request_id == "bad" else None
+    )
+    batch = [_request(1, "bad"), _request(2, "rope")]
+
+    assert MLLMBatchGenerator._process_prompts(gen, batch) is None
+
+    kinds = {r.request_id: r.error_kind for r in gen._pending_error_responses}
+    assert kinds == {"bad": ERROR_KIND_PREPROCESSING, "rope": None}
+
+
+def test_chunked_prefill_does_not_blame_the_client_for_a_rope_failure():
+    gen = _preprocessed_but_rope_fails()
+    gen._next = lambda: []
+    install_chunked_prefill_mllm(gen, budget=1024)
+    gen.unprocessed_requests.append(_request(2, "rope-next"))
+
+    assert _only(gen._next()).error_kind is None
+
+
 def test_chunked_prefill_marks_a_preprocessing_failure_of_an_inlined_request():
     """A short request picked up while a long prefill is in flight."""
     gen = _generator()

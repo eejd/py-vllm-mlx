@@ -319,12 +319,18 @@ def test_responses_stream_ends_in_error_and_response_failed(serve, kind, outputs
         "message": "Internal server error",
     }
     assert failed["response"]["id"] == frames[0][1]["response"]["id"]
+    # a failed response did not use anything: no usage, not a zeroed one
+    assert failed["response"]["usage"] is None
 
 
 def test_responses_stream_preprocessing_failure_is_invalid_prompt(serve):
+    """The code is the failure's own, in the error event and in the response."""
     frames = _stream(serve("mllm", [_failed(ERROR_KIND_PREPROCESSING)]), "responses")
+    message = "The request's multimodal inputs could not be processed"
 
-    assert frames[-1][1]["response"]["error"]["code"] == "invalid_prompt"
+    error, failed = frames[-2][1], frames[-1][1]
+    assert (error["code"], error["message"]) == ("invalid_prompt", message)
+    assert failed["response"]["error"] == {"code": "invalid_prompt", "message": message}
 
 
 def test_failed_responses_stream_stores_nothing(serve, monkeypatch):
@@ -389,6 +395,89 @@ def test_preprocessing_failure_is_counted_as_a_client_error(serve, collector):
         r'result="client_error",stream="false"\} 1\.0',
         _scrape(collector),
     )
+
+
+def _responses_count(collector, result, stream):
+    return re.search(
+        r'vllm_mlx_inference_requests_total\{endpoint="responses",'
+        rf'result="{result}",stream="{stream}"\}} 1\.0',
+        _scrape(collector),
+    )
+
+
+def test_responses_stream_preprocessing_failure_is_a_client_error(serve, collector):
+    _stream(serve("mllm", [_failed(ERROR_KIND_PREPROCESSING)]), "responses")
+
+    assert _responses_count(collector, "client_error", "true")
+
+
+def test_responses_stream_success_is_counted_with_its_tokens(serve, collector):
+    client = serve("text", [_ok("Hel"), _ok("Hello", finished=True)])
+    _stream(client, "responses")
+
+    assert _responses_count(collector, "success", "true")
+    assert (
+        'vllm_mlx_completion_tokens_total{endpoint="responses",stream="true"} 1.0'
+        in (_scrape(collector))
+    )
+
+
+def test_responses_nonstream_success_is_counted_with_its_tokens(serve, collector):
+    client = serve("text", [_ok("Hello", finished=True)])
+    assert _post(client, "responses", stream=False).status_code == 200
+
+    assert _responses_count(collector, "success", "false")
+    assert 'vllm_mlx_prompt_tokens_total{endpoint="responses",stream="false"} 3.0' in (
+        _scrape(collector)
+    )
+
+
+def test_responses_request_the_client_gave_up_on_is_counted_as_client_closed(
+    serve, collector, monkeypatch
+):
+    async def client_gone(awaitable, *_args, **_kwargs):
+        awaitable.close()
+        return None
+
+    monkeypatch.setattr(server, "_wait_with_disconnect", client_gone)
+    client = serve("text", [_ok("Hello", finished=True)])
+
+    assert _post(client, "responses", stream=False).status_code == 499
+    assert _responses_count(collector, "client_closed", "false")
+
+
+@pytest.mark.parametrize("how", ["closed", "cancelled"])
+def test_responses_stream_the_client_left_is_counted_as_cancelled(collector, how):
+    """A stream cut short from outside never reaches the point that records
+    its outcome; the wrapper around it does."""
+    import asyncio
+
+    tracker = collector.track_inference("responses", stream=True)
+
+    async def chunks():
+        yield "event: response.created\n\n"
+        await asyncio.sleep(3600)
+        yield "unreachable"
+
+    async def consume(stream):
+        async for _ in stream:
+            pass
+
+    async def run():
+        stream = server._track_responses_stream(chunks(), tracker)
+        if how == "closed":
+            await stream.__anext__()
+            await stream.aclose()
+            return
+        task = asyncio.create_task(consume(stream))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert _responses_count(collector, "cancelled", "true")
 
 
 # --------------------------------------------------------------------------

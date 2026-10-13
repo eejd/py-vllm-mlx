@@ -5801,7 +5801,6 @@ async def _ensure_sse_terminal(
     terminal_frame: str,
     *,
     error_frame: Callable[[Exception], str] | None = None,
-    on_error: Callable[[Exception], None] | None = None,
 ) -> AsyncIterator[str]:
     """Guarantee that *terminal_frame* is emitted exactly once at the end of
     *generator*, even if the generator raises mid-stream.
@@ -5813,8 +5812,7 @@ async def _ensure_sse_terminal(
     The response is already a 200 by then, so a failure can only be reported
     in-band.  With *error_frame* the wrapper sends that frame (built from the
     exception) ahead of the terminal one; without it the stream just ends, which
-    a client cannot tell from a completion.  *on_error* lets the caller account
-    for the failure (metrics) before the frames go out.
+    a client cannot tell from a completion.
     """
     emitted = False
     failure: Exception | None = None
@@ -5826,8 +5824,6 @@ async def _ensure_sse_terminal(
     except Exception as e:
         failure = e
         logger.error(f"Streaming error, ensuring terminal frame: {e}")
-        if on_error is not None:
-            on_error(e)
     finally:
         if failure is not None and error_frame is not None:
             yield error_frame(failure)
@@ -5881,9 +5877,6 @@ async def _build_chat_streaming_response(
                 stream_generator,
                 "data: [DONE]\n\n",
                 error_frame=_openai_stream_error_frame,
-                on_error=lambda exc: metrics_tracker.finish(
-                    result=_engine_error_result(exc)
-                ),
             ),
             raw_request,
             cleanup=_make_release_cleanup(raw_request),
@@ -6430,9 +6423,6 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                         ),
                         "data: [DONE]\n\n",
                         error_frame=_openai_stream_error_frame,
-                        on_error=lambda exc: tracker.finish(
-                            result=_engine_error_result(exc)
-                        ),
                     ),
                     raw_request,
                     cleanup=_make_release_cleanup(raw_request),
@@ -7198,9 +7188,6 @@ async def create_anthropic_message(
                         ),
                         anthropic_terminal,
                         error_frame=_anthropic_stream_error_frame,
-                        on_error=lambda exc: tracker.finish(
-                            result=_engine_error_result(exc)
-                        ),
                     ),
                     request,
                     cleanup=_make_release_cleanup(request),
