@@ -130,6 +130,10 @@ class HarmonyReasoningParser(ReasoningParser):
 
     # Its markers are control tokens: streaming sites must not filter them out first.
     READS_CONTROL_TOKENS = True
+    # With thinking disabled the server still parses an output that opens a channel
+    # (the model emits analysis whatever the template kwarg says): this is the marker it
+    # looks for, so the analysis never reaches the client as content.
+    start_token = "<|channel|>"
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)

@@ -393,13 +393,18 @@ async def test_messages_stream_feeds_a_harmony_reasoning_parser_the_control_toke
     assert (seen.reasoning.strip(), seen.content.strip()) == (analysis, final)
 
 
+@pytest.mark.parametrize("with_tools", [True, False], ids=["tools", "no-tools"])
 @pytest.mark.parametrize("stream", [False, True], ids=["whole", "stream"])
-@pytest.mark.parametrize("name", ["analysis-call-final", "analysis-into-call-at-eos"])
-def test_thinking_disabled_still_returns_the_call_and_no_analysis(
-    monkeypatch, harmony_parsers, name, stream
+@pytest.mark.parametrize(
+    "name",
+    ["analysis-call-final", "analysis-into-call-at-eos", "final-at-eos", "call-only"],
+)
+def test_thinking_disabled_never_shows_the_analysis_or_a_control_token(
+    monkeypatch, harmony_parsers, name, stream, with_tools
 ):
-    """enable_thinking=false skips the reasoning parser; the tool parser alone reads the
-    channels, so the call and the answer come through and the analysis stays out."""
+    """enable_thinking=false: the model may still open an analysis channel. With or
+    without tools the answer comes out clean, a declared tool's call is returned and the
+    analysis is dropped, not shown as content."""
     raw, _analysis_text, final, calls = RAW[name]
     monkeypatch.setattr(
         srv, "_engine", _engine(raw, "tokens", thinking_open_in_prompt=False)
@@ -410,6 +415,8 @@ def test_thinking_disabled_still_returns_the_call_and_no_analysis(
         "stream": stream,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    if not with_tools:
+        del body["tools"]
 
     response = TestClient(srv.app).post("/v1/chat/completions", json=body)
 
@@ -420,6 +427,9 @@ def test_thinking_disabled_still_returns_the_call_and_no_analysis(
         ]
         deltas = [p["choices"][0]["delta"] for p in payloads]
         content = "".join(d.get("content") or "" for d in deltas)
+        reasoning = "".join(
+            d.get("reasoning") or d.get("reasoning_content") or "" for d in deltas
+        )
         indexes = {t["index"] for d in deltas for t in d.get("tool_calls") or []}
         finish = [
             p["choices"][0]["finish_reason"]
@@ -429,11 +439,15 @@ def test_thinking_disabled_still_returns_the_call_and_no_analysis(
     else:
         choice = response.json()["choices"][0]
         content = choice["message"].get("content") or ""
+        reasoning = choice["message"].get("reasoning") or ""
         indexes = set(range(len(choice["message"].get("tool_calls") or [])))
         finish = [choice["finish_reason"]]
+    expected_calls = calls if with_tools else 0
     assert content.strip() == final
-    assert len(indexes) == calls
-    assert finish == ["tool_calls"]
+    assert not reasoning
+    assert re.findall(r"<\|[a-z]+\|>|to=functions", content) == []
+    assert len(indexes) == expected_calls
+    assert finish == ["tool_calls" if expected_calls else "stop"]
 
 
 @pytest.mark.parametrize(
