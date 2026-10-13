@@ -49,6 +49,10 @@ class RequestStatus(enum.IntEnum):
         return None
 
 
+# ``RequestOutput.error_kind`` of a request whose inputs could not be preprocessed.
+ERROR_KIND_PREPROCESSING = "preprocessing"
+
+
 class UnsupportedRequestOption(ValueError):
     """Raised when the route chosen for a request cannot honour one of its options.
 
@@ -233,6 +237,10 @@ class RequestOutput:
     # Status
     finished: bool = False
     finish_reason: Optional[str] = None
+    # Why a request that finished with ``finish_reason="error"`` failed, when the
+    # scheduler can tell: ERROR_KIND_PREPROCESSING for inputs it could not
+    # preprocess (the client's fault), None for a failure while generating.
+    error_kind: Optional[str] = None
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0

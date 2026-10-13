@@ -256,6 +256,22 @@ class ResponseCompletedEvent(ResponsesEventBase):
     response: ResponseObject
 
 
+class ResponseFailedEvent(ResponsesEventBase):
+    """The response failed; ``response.error`` says how (OpenAI ``response.failed``)."""
+
+    type: Literal["response.failed"] = "response.failed"
+    response: ResponseObject
+
+
+class ResponseErrorEvent(ResponsesEventBase):
+    """Stream-level error (OpenAI ``error`` event: ``code``, ``message``, ``param``)."""
+
+    type: Literal["error"] = "error"
+    code: str | None = None
+    message: str
+    param: str | None = None
+
+
 class ResponseOutputItemAddedEvent(ResponsesEventBase):
     type: Literal["response.output_item.added"] = "response.output_item.added"
     output_index: int

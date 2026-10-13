@@ -64,21 +64,57 @@ class EngineStopped(RuntimeError):
     code = "engine_stopped"
 
 
-class GenerationError(RuntimeError):
-    """The engine aborted a request it had already accepted.
+class EngineRequestError(RuntimeError):
+    """The engine failed a request it had already accepted.
 
     A scheduler that recovers from a failed step (a Metal out-of-memory, a
     crashed command buffer) finishes every request that was running with
     ``finish_reason="error"``.  Handed on as ordinary output that is a
     successful, empty completion: HTTP 200, no error anywhere a client looks.
-    The engines raise this instead, as vLLM does for the same finish reason, so
-    the API layer can answer 500 or send an error event.  The message is
-    deliberately generic; the cause is in the engine log.
+    The engines raise a subclass instead, as vLLM does for the same finish
+    reason, so the API layer can answer with an HTTP error or, once a stream
+    has sent its 200 header, an error event.  The subclass fixes how the
+    failure is reported on each API; the message is deliberately generic, the
+    cause is in the engine log.
     """
+
+    #: HTTP status of the answer (non-stream) and ``code`` of OpenAI's error body.
+    status_code = 500
+    #: ``error.type`` of OpenAI-style bodies and stream frames.
+    openai_type = "InternalServerError"
+    #: ``error.type`` of Anthropic's error envelope.
+    anthropic_type = "api_error"
+    #: ``error.code`` of a Responses API failure.
+    responses_code = "server_error"
+
+    def __init__(self, message: str = "Internal server error"):
+        super().__init__(message)
+
+
+class GenerationError(EngineRequestError):
+    """The engine aborted a request while generating (finish reason ``error``): 500."""
 
     code = "generation_error"
 
-    def __init__(self, message: str = "Internal server error"):
+
+class RequestPreprocessingError(EngineRequestError):
+    """The engine could not preprocess the request's inputs (undecodable media): 400.
+
+    vLLM answers 400 for an input its processor rejects; the multimodal
+    scheduler preprocesses after admission, so the failure arrives as an
+    aborted request and is told apart from a generation failure by the
+    ``error_kind`` the scheduler puts on it.
+    """
+
+    code = "request_preprocessing_error"
+    status_code = 400
+    openai_type = "BadRequestError"
+    anthropic_type = "invalid_request_error"
+    responses_code = "invalid_prompt"
+
+    def __init__(
+        self, message: str = "The request's multimodal inputs could not be processed"
+    ):
         super().__init__(message)
 
 

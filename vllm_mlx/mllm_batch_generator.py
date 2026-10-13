@@ -47,6 +47,7 @@ from .mllm_specprefill import (
     request_eligibility_reason,
     run_media_specprefill,
 )
+from .request import ERROR_KIND_PREPROCESSING
 from .vision_embedding_cache import VisionEmbeddingCache
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,9 @@ class MLLMBatchResponse:
     mtp_attempted: bool = False  # True when the primary step attempted MTP
     mtp_attempted_count: int = 0  # Number of draft tokens attempted
     specprefill_outcome: Optional[SpecPrefillOutcome] = None
+    # With finish_reason "error": ERROR_KIND_PREPROCESSING when the request's
+    # inputs could not be preprocessed, None for a failure while generating.
+    error_kind: Optional[str] = None
 
 
 @dataclass
@@ -1972,6 +1976,7 @@ class MLLMBatchGenerator:
                         token=0,
                         logprobs=mx.zeros(1),
                         finish_reason="error",
+                        error_kind=ERROR_KIND_PREPROCESSING,
                         specprefill_outcome=req.specprefill_outcome,
                     )
                 )
@@ -3911,6 +3916,7 @@ def install_chunked_prefill_mllm(
                                         token=0,
                                         logprobs=mx.zeros(1),
                                         finish_reason="error",
+                                        error_kind=ERROR_KIND_PREPROCESSING,
                                     )
                                 )
                                 continue
@@ -4177,6 +4183,7 @@ def install_chunked_prefill_mllm(
                             token=0,
                             logprobs=mx.zeros(1),
                             finish_reason="error",
+                            error_kind=ERROR_KIND_PREPROCESSING,
                             specprefill_outcome=text_only_req.specprefill_outcome,
                         )
                     )
