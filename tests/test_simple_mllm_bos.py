@@ -145,9 +145,7 @@ def test_chat_prefix_cache_key_uses_the_ids_the_model_sees(boundary):
     assert token_ids == FakeTokenizer().encode(RENDERED, add_special_tokens=False)
 
 
-def test_chat_template_failure_falls_back_to_the_raw_prompt_rule(
-    boundary, monkeypatch
-):
+def test_chat_template_failure_falls_back_to_the_raw_prompt_rule(boundary, monkeypatch):
     wrapper, seen = boundary
 
     def broken(*args, **kwargs):
