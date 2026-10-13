@@ -1616,14 +1616,16 @@ class Scheduler:
                 # Handle both tokenizers and processors (for MLLM models)
                 if hasattr(self.tokenizer, "encode"):
                     request.prompt_token_ids = encode_prompt(
-                        self.tokenizer, request.prompt
+                        self.tokenizer, request.prompt, request.add_special_tokens
                     )
                 elif hasattr(self.tokenizer, "tokenizer") and hasattr(
                     self.tokenizer.tokenizer, "encode"
                 ):
                     # Processor wraps tokenizer (e.g., Qwen3VLProcessor)
                     request.prompt_token_ids = encode_prompt(
-                        self.tokenizer.tokenizer, request.prompt
+                        self.tokenizer.tokenizer,
+                        request.prompt,
+                        request.add_special_tokens,
                     )
                 else:
                     raise AttributeError(

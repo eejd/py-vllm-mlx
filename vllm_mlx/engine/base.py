@@ -335,7 +335,10 @@ class BaseEngine(ABC):
             temperature: Sampling temperature
             top_p: Top-p sampling
             stop: Stop sequences
-            **kwargs: Additional model-specific parameters
+            **kwargs: Additional model-specific parameters.
+                ``add_special_tokens`` tells the engine how ``prompt`` is
+                tokenized: False when the chat template rendered it (the
+                template owns the BOS); absent for a raw completion prompt.
 
         Returns:
             GenerationOutput with complete text
@@ -361,7 +364,10 @@ class BaseEngine(ABC):
             temperature: Sampling temperature
             top_p: Top-p sampling
             stop: Stop sequences
-            **kwargs: Additional model-specific parameters
+            **kwargs: Additional model-specific parameters.
+                ``add_special_tokens`` tells the engine how ``prompt`` is
+                tokenized: False when the chat template rendered it (the
+                template owns the BOS); absent for a raw completion prompt.
 
         Yields:
             GenerationOutput with incremental text

@@ -545,10 +545,12 @@ class _FakeCore:
             **kw,
         )
 
-    async def generate(self, prompt, sampling_params):
+    async def generate(self, prompt, sampling_params, add_special_tokens=None):
         return self._out()
 
-    async def add_request(self, prompt, sampling_params, prefix_boundary=0):
+    async def add_request(
+        self, prompt, sampling_params, prefix_boundary=0, add_special_tokens=None
+    ):
         return "r"
 
     async def stream_outputs(self, request_id):

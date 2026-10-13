@@ -47,6 +47,7 @@ from .mllm_specprefill import (
     request_eligibility_reason,
     run_media_specprefill,
 )
+from .utils.tokenizer import resolve_add_special_tokens
 from .vision_embedding_cache import VisionEmbeddingCache
 
 logger = logging.getLogger(__name__)
@@ -224,6 +225,10 @@ class MLLMBatchRequest:
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
     mllm_draft: bool = False
+    # Request kind for tokenization (vLLM ``add_special_tokens``): False for a
+    # prompt the chat template already rendered, None for a raw completion
+    # prompt (BOS added unless the prompt already starts with it).
+    add_special_tokens: Optional[bool] = None
     # Extra logits processors (e.g. JSON schema constrained decoding).
     # Merged with built-in repetition/presence penalty processors in
     # ``_prefill_batch``.
@@ -1172,6 +1177,11 @@ class MLLMBatchGenerator:
             audio=all_audio if all_audio else None,
             prompts=request.prompt,
             image_token_index=image_token_index,
+            add_special_tokens=resolve_add_special_tokens(
+                getattr(self.processor, "tokenizer", self.processor),
+                request.prompt,
+                request.add_special_tokens,
+            ),
         )
 
         request.input_ids = inputs.get("input_ids")

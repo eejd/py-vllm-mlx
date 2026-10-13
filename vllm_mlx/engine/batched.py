@@ -854,6 +854,7 @@ class BatchedEngine(BaseEngine):
         images: list[str] | None = None,
         videos: list[str] | None = None,
         audio: list[str] | None = None,
+        add_special_tokens: bool | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -868,6 +869,10 @@ class BatchedEngine(BaseEngine):
             images: Optional image URLs/paths (for MLLM)
             videos: Optional video URLs/paths (for MLLM)
             audio: Optional audio URLs/paths (for MLLM)
+            add_special_tokens: How ``prompt`` is tokenized. None (default) for a
+                raw completion prompt: the tokenizer adds its BOS unless the
+                prompt already starts with it. False when the chat template
+                rendered ``prompt`` (it owns the BOS), as in vLLM.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -885,6 +890,7 @@ class BatchedEngine(BaseEngine):
                 images=images,
                 videos=videos,
                 audio=audio,
+                add_special_tokens=add_special_tokens,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -931,6 +937,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            add_special_tokens=add_special_tokens,
         )
 
         text = clean_output_text(output.output_text)
@@ -956,6 +963,7 @@ class BatchedEngine(BaseEngine):
         images: list[str] | None = None,
         videos: list[str] | None = None,
         audio: list[str] | None = None,
+        add_special_tokens: bool | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -970,6 +978,7 @@ class BatchedEngine(BaseEngine):
             images: Optional image URLs/paths (for MLLM)
             videos: Optional video URLs/paths (for MLLM)
             audio: Optional audio URLs/paths (for MLLM)
+            add_special_tokens: How ``prompt`` is tokenized (see ``generate``)
             **kwargs: Additional model-specific parameters
 
         Yields:
@@ -985,6 +994,7 @@ class BatchedEngine(BaseEngine):
                 images=images,
                 videos=videos,
                 audio=audio,
+                add_special_tokens=add_special_tokens,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -1036,6 +1046,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            add_special_tokens=add_special_tokens,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -1121,6 +1132,7 @@ class BatchedEngine(BaseEngine):
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
             audio=all_audios if all_audios else None,
+            add_special_tokens=False,
             **kwargs,
         )
 
@@ -1172,8 +1184,10 @@ class BatchedEngine(BaseEngine):
             if hasattr(tokenizer, "tokenizer"):
                 tokenizer = tokenizer.tokenizer
 
-            real_tokens = encode_prompt(tokenizer, real_prompt)
-            dummy_tokens = encode_prompt(tokenizer, dummy_prompt)
+            # Rendered chat prompts: the template owns the BOS, exactly as when
+            # the request itself is tokenized (add_special_tokens=False).
+            real_tokens = encode_prompt(tokenizer, real_prompt, False)
+            dummy_tokens = encode_prompt(tokenizer, dummy_prompt, False)
 
             # Find LCP — the point where the two diverge is the boundary
             lcp = 0
@@ -1263,6 +1277,7 @@ class BatchedEngine(BaseEngine):
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
             audio=all_audios if all_audios else None,
+            add_special_tokens=False,
             **kwargs,
         ):
             yield output
