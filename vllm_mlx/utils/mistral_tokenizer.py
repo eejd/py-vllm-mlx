@@ -107,14 +107,30 @@ def _unicode_to_byte() -> dict[str, int]:
     return {chr(c): b for b, c in zip(keep, chars)}
 
 
+def _split_pattern(fast: Any) -> str | None:
+    """The regex of the first ``Split`` pre-tokenizer of ``fast`` (None if it has none)."""
+    pre_tokenizer = fast.backend_tokenizer.pre_tokenizer
+    if pre_tokenizer is None:
+        return None
+    state = json.loads(pre_tokenizer.__getstate__())
+    for part in state.get("pretokenizers", [state]):
+        pattern = part.get("pattern") if part.get("type") == "Split" else None
+        if isinstance(pattern, dict) and "Regex" in pattern:
+            return pattern["Regex"]
+    return None
+
+
 def _token_mismatch(fast: Any, tekken_path: Path) -> str | None:
-    """Compare every id of ``fast`` with ``tekken.json``: control-token names, bytes."""
+    """Compare ``fast`` with ``tekken.json``: the pre-tokenizer regex, the control-token
+    names and the bytes of every id."""
     with open(tekken_path, encoding="utf-8") as handle:
         tekken = json.load(handle)
     config = tekken["config"]
     n_special = config["default_num_special_tokens"]
     n_regular = config["default_vocab_size"] - n_special
 
+    if _split_pattern(fast) != config["pattern"]:
+        return "pre-tokenizer regex differs from tekken.json's pattern"
     token_of_id = {i: token for token, i in fast.get_vocab().items()}
     to_byte = _unicode_to_byte()
 

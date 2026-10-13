@@ -437,6 +437,22 @@ class TestFastTokenizerSelection:
         self._edit_tokenizer_json(tmp_path, swap_inst)
         assert mt.fast_tokenizer_config(tmp_path, None) is None
 
+    def test_keeps_mistral_common_when_the_pretokenizer_regex_differs(
+        self, tmp_path, caplog
+    ):
+        # The fixture's byte-only vocabulary encodes the same under any splitting
+        # regex, so neither the probes nor the token check can tell: only comparing
+        # the regex with tekken.json's pattern does.
+        def split_on_digit_runs(data):
+            split = data["pre_tokenizer"]["pretokenizers"][0]
+            split["pattern"]["Regex"] = _PATTERN.replace(r"|\p{N}|", r"|\p{N}+|")
+            assert split["pattern"]["Regex"] != _PATTERN
+
+        self._edit_tokenizer_json(tmp_path, split_on_digit_runs)
+        with caplog.at_level(logging.WARNING, logger=mt.logger.name):
+            assert mt.fast_tokenizer_config(tmp_path, None) is None
+        assert "pre-tokenizer regex differs" in caplog.text
+
     def test_repairs_a_tokenizer_json_with_the_old_regex(self, tmp_path):
         build_tekken_checkpoint(
             tmp_path, merged_digits=True, wrong_regex=True, large_vocab=True
@@ -812,12 +828,15 @@ class TestRealDevstral:
         # reads that as text, the fast tokenizer as the control token (documented).
         import re
 
-        control = re.compile("|".join(map(re.escape, real_fast.get_added_vocab())))
         docs = Path(__file__).resolve().parent.parent / "docs"
+        if not docs.is_dir():
+            pytest.skip(f"{docs} not found: no corpus to encode")
+        control = re.compile("|".join(map(re.escape, real_fast.get_added_vocab())))
         text = "\n".join(path.read_text() for path in sorted(docs.rglob("*.md")))
         chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)]
         chunks = [chunk for chunk in chunks if not control.search(chunk)]
-        assert len(chunks) > 100
+        if len(chunks) < 100:
+            pytest.skip(f"only {len(chunks)} usable chunks under {docs}")
         for number, chunk in enumerate(chunks):
             assert real_fast.encode(chunk, add_special_tokens=False) == (
                 real_reference.encode(chunk, add_special_tokens=False)
@@ -884,15 +903,23 @@ class TestRealDevstralLoad:
             ids = prepare_inputs(processor, prompts=text)["input_ids"].tolist()[0]
             assert ids == reference_ids(reference, messages, **kwargs), name
 
-    def test_image_prompt_encodes_to_the_mistral_common_ids(self, engine, snapshot):
+    @pytest.mark.parametrize("size", [(224, 168), (640, 480)])
+    def test_image_prompt_encodes_to_the_mistral_common_ids(
+        self, engine, snapshot, size
+    ):
+        # The image tiles with patch_size 14 / spatial_merge_size 2 (from
+        # processor_config.json); the processor's own defaults (16 / 1) expand to a
+        # different, much larger number of [IMG] tokens, so a processor rebuilt
+        # without those settings fails here.
         import base64
         import io
 
         from PIL import Image
 
         reference = mt.reference_tokenizer(snapshot)
+        image = Image.new("RGB", size, (200, 30, 30))
         buffer = io.BytesIO()
-        Image.new("RGB", (224, 168), (200, 30, 30)).save(buffer, "PNG")
+        image.save(buffer, "PNG")
         url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
         expected = reference_ids(
             reference,
@@ -919,7 +946,6 @@ class TestRealDevstralLoad:
         text = processor.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        image = Image.new("RGB", (224, 168), (200, 30, 30))
         out = processor(text=text, images=[image], add_special_tokens=False)
         assert list(out["input_ids"][0]) == expected
 
