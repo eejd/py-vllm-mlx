@@ -998,16 +998,38 @@ class TestLlamaToolParser:
         shown = "".join(e.get("content", "") for e in events + [final or {}])
         assert shown == ""
 
-    def test_the_end_of_generation_release_is_limited_to_a_cut_off_call(self, parser):
-        # Scope guard (#67 is about an unterminated call): text after a call's separator
-        # that is not a call at all is released neither earlier nor later than before.
+    @pytest.mark.parametrize(
+        "after",
+        [
+            "; and then some prose",
+            "; <|python_tag|>and then some prose",
+            "; <|python_tag|>[1, 2]",
+            "; {x: 1}",
+            "; true",
+        ],
+    )
+    def test_text_after_the_separator_that_cannot_be_a_call_is_content(
+        self, parser, after
+    ):
+        # Whatever follows a call's separator and cannot become another call is the
+        # model's text, shown by the stream as the whole-text answer shows it (vLLM's
+        # llama3_json returns the whole output as content when it does not parse as
+        # calls; it never drops text). The tag, a control token, is not content.
         call = '<|python_tag|>{"name": "read", "parameters": {}}'
-        text = call + "; and then some prose"
+        text = call + after
 
-        events = self._stream(parser, [call, text[len(call) :]])
+        whole = parser.extract_tool_calls(text)
+        events = self._stream(parser, [call, after])
+        final = parser.finalize_streaming(text)
 
-        assert parser.finalize_streaming(text) == {"content": ""}
-        assert "".join(e.get("content", "") for e in events) == ""
+        shown = "".join(e.get("content", "") for e in events + [final or {}])
+        assert [c["function"]["name"] for e in events for c in e.get("tool_calls", [])] == [
+            "read"
+        ]
+        assert shown.strip() == (whole.content or "").strip() == after.replace(
+            "<|python_tag|>", ""
+        ).strip()
+        assert "<|python_tag|>" not in shown
 
     @pytest.mark.parametrize("size", [1, 4, 10_000])
     def test_a_tag_repeated_after_the_separator_is_another_call(self, parser, size):

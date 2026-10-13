@@ -8245,6 +8245,17 @@ async def stream_chat_completion(
                 finish_reason_emitted = True
                 fallback_call_emitted = True
 
+        if (
+            tool_parser
+            and tool_accumulated_text
+            and tool_calls_detected
+            and hasattr(tool_parser, "log_incomplete_call")
+        ):
+            # The re-parse above runs only when no call went out; a parser that logs a
+            # call cut off at the end of generation does it here too, so a complete call
+            # followed by a cut-off one is reported on every path.
+            tool_parser.log_incomplete_call(tool_accumulated_text)
+
         reasoning_watch.warn_if_no_call(tool_calls_detected or fallback_call_emitted)
 
         # Terminal-chunk guard: if the engine's finished output was swallowed

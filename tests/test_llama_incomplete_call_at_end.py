@@ -327,9 +327,10 @@ async def test_a_complete_call_then_an_unterminated_one_keeps_the_call_and_relea
     assert calls == ["echo_args"]
     assert "".join(texts) == '; {"name": "echo_args", "parame'
     assert TAG not in "".join(texts)
-    # the chat stream re-parses only when no call went out, so it logs nothing here
+    # every path logs it once, chat stream included
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warnings) == (0 if site == "chat" else 1)
+    assert len(warnings) == 1
+    assert "1 complete call(s)" in warnings[0].getMessage()
 
 
 @pytest.mark.parametrize("site", SITES)
