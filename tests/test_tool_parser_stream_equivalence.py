@@ -219,11 +219,6 @@ REASONS = {
         "index 0), so a client that merges by index gets corrupt arguments"
     ),
     "call-lost": "the stream emits fewer calls than the whole text returns",
-    "text-in-arguments": (
-        "text after the call is streamed as more of the call's arguments, which are "
-        "then not valid JSON"
-    ),
-    "other": "the stream and the whole text differ in another way",
     "whole-call-from-cut-off": (
         "the whole-text parse returns a call for a call that was cut off"
     ),
@@ -247,7 +242,6 @@ REASONS = {
 KNOWN_WHOLE_DEVIATIONS: dict[tuple[str, str], tuple[str, ...]] = {
     ("deepseek_v4", "cut-off"): ("whole-call-from-cut-off",),
     ("qwen3_coder", "cut-off"): ("whole-call-from-cut-off",),
-    ("mistral", "call-then-text"): ("whole-call-lost",),
     ("step3p5", "two-calls"): ("whole-call-lost",),
     ("qwen", "cut-off"): ("whole-text-lost",),
     ("step3p5", "cut-off"): ("whole-text-lost",),
@@ -259,7 +253,6 @@ KNOWN_FINISH_VIOLATIONS: dict[tuple[str, str], tuple[str, ...]] = {
         for name in ("deepseek", "granite", "kimi", "xlam")
         for scenario in ("call", "text-then-call", "call-then-text", "two-calls")
     },
-    ("mistral", "call-then-text"): ("finish-tool-calls-for-no-call",),
     ("mistral", "cut-off"): ("finish-tool-calls-for-no-call",),
     ("poolside_v1", "cut-off"): ("finish-tool-calls-for-no-call",),
 }
@@ -325,11 +318,6 @@ KNOWN_VIOLATIONS: dict[
         "call-lost",
         ("chat",),
         ("lines", "tokens", "tokens-x3"),
-    ),
-    ("mistral", "call-then-text"): (
-        "text-in-arguments+text-dropped",
-        ("anthropic", "chat"),
-        CHUNKINGS,
     ),
     ("mistral", "cut-off"): (
         "cut-off+truncated-call-emitted",
