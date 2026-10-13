@@ -16,16 +16,48 @@ contains the user-facing response.
 """
 
 from .base import DeltaMessage, ReasoningParser
-from .harmony_channels import Body, HarmonyScanner, Open, Plain, parse_messages
+from .harmony_channels import (
+    CONTENT,
+    REASONING,
+    Body,
+    BodyTrimmer,
+    HarmonyScanner,
+    Open,
+    Plain,
+    parse_messages,
+    segment_kind,
+)
+
+
+def split_messages(model_output: str) -> tuple[str | None, str | None]:
+    """(reasoning, content) of a complete Harmony output, as vLLM's Harmony parser reads
+    it: the analysis messages, and the final and call-less commentary (preamble)
+    messages. Several messages of a kind are joined with a newline; calls are neither.
+    """
+    messages, _ = parse_messages(model_output)
+    reasoning = "\n".join(
+        m.body.strip()
+        for m in messages
+        if m.body.strip() and segment_kind(m.channel, m.recipient) == REASONING
+    )
+    content = "\n".join(
+        m.body.strip()
+        for m in messages
+        if m.body.strip() and segment_kind(m.channel, m.recipient) == CONTENT
+    )
+    return reasoning or None, content or None
 
 
 class HarmonyStreamingReader:
-    """Routes the bodies of a Harmony stream: analysis is reasoning, final is content.
+    """Routes the bodies of a Harmony stream: analysis is reasoning, final and preamble
+    messages are content.
 
-    Shared by the Harmony reasoning parsers. Commentary (tool calls, preambles) and
-    every other channel is not routed: the tool parser reads it from the raw stream.
-    Several analysis (or final) messages are joined with a newline, as the whole-text
-    extraction does. ``plain_text_is_content`` says what text outside any message is:
+    Shared by the Harmony reasoning parsers. Messages addressed to a function (the
+    calls) and every other channel are not routed: the tool parser reads them from the
+    raw stream. Several messages of a kind are joined with a newline, as the whole-text
+    extraction does; each message body is stripped, as the whole-text extraction strips
+    it (leading whitespace dropped, trailing whitespace held until more text follows).
+    ``plain_text_is_content`` says what text outside any message is:
     content for a parser whose whole-text extraction returns an untagged output as
     content, dropped otherwise.
     """
@@ -33,11 +65,13 @@ class HarmonyStreamingReader:
     def __init__(self, plain_text_is_content: bool) -> None:
         self._plain_text_is_content = plain_text_is_content
         self._scanner = HarmonyScanner()
+        self._trim = BodyTrimmer()
         self.reset()
 
     def reset(self) -> None:
         self._scanner.reset()
-        self._emitted = {"analysis": False, "final": False}
+        self._trim.reset()
+        self._emitted = {REASONING: False, CONTENT: False}
         self._message_started = False
 
     def feed(self, delta: str, *, final: bool = False) -> DeltaMessage | None:
@@ -49,21 +83,24 @@ class HarmonyStreamingReader:
         for event in events:
             if isinstance(event, Open):
                 self._message_started = False
+                self._trim.reset()
             elif isinstance(event, Body):
-                if event.channel not in self._emitted:
+                kind = segment_kind(event.channel, event.recipient)
+                if kind not in self._emitted:
                     continue
-                text = event.text
+                text = self._trim.feed(event.text)
+                if not text:
+                    continue
                 if not self._message_started:
-                    text = text.lstrip()
-                    if not text:
-                        continue
                     self._message_started = True
-                    if self._emitted[event.channel]:
+                    if self._emitted[kind]:
                         text = "\n" + text
-                self._emitted[event.channel] = True
-                (reasoning if event.channel == "analysis" else content).append(text)
+                self._emitted[kind] = True
+                (reasoning if kind == REASONING else content).append(text)
             elif (
-                isinstance(event, Plain) and event.leading and self._plain_text_is_content
+                isinstance(event, Plain)
+                and event.leading
+                and self._plain_text_is_content
             ):
                 content.append(event.text)
         if not reasoning and not content:
@@ -77,9 +114,9 @@ class HarmonyReasoningParser(ReasoningParser):
     """
     Reasoning parser for GPT-OSS models using Harmony format.
 
-    Extracts reasoning from the 'analysis' channel and content from
-    the 'final' channel. Commentary channels (tool calls) are ignored
-    since they are handled by the tool parser.
+    Extracts reasoning from the 'analysis' channel and content from the 'final'
+    channel and from commentary messages addressed to no one (preambles to the user);
+    messages addressed to a function are tool calls, handled by the tool parser.
 
     Example:
         Input: "<|channel|>analysis<|message|>Thinking...<|end|>
@@ -90,6 +127,9 @@ class HarmonyReasoningParser(ReasoningParser):
     stops on without decoding them, so the text often ends without one: a message that
     runs to the end of the text is read like a terminated one.
     """
+
+    # Its markers are control tokens: streaming sites must not filter them out first.
+    READS_CONTROL_TOKENS = True
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
@@ -111,14 +151,7 @@ class HarmonyReasoningParser(ReasoningParser):
         Returns:
             (reasoning, content) tuple. Either may be None.
         """
-        messages, _ = parse_messages(model_output)
-        reasoning = "\n".join(
-            m.body.strip() for m in messages if m.channel == "analysis" and m.body.strip()
-        )
-        content = "\n".join(
-            m.body.strip() for m in messages if m.channel == "final" and m.body.strip()
-        )
-        return reasoning or None, content or None
+        return split_messages(model_output)
 
     def extract_reasoning_streaming(
         self,

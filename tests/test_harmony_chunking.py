@@ -137,7 +137,7 @@ def _stream_reasoning(parser, chunks):
     if msg is not None:
         reasoning.append(msg.reasoning or "")
         content.append(msg.content or "")
-    return "".join(reasoning).strip(), "".join(content).strip()
+    return "".join(reasoning), "".join(content)
 
 
 @pytest.mark.parametrize("parser_name", ["gpt_oss", "harmony"])
@@ -150,7 +150,7 @@ def test_reasoning_stream_equals_whole_text(parser_name, name, label, chunks):
 
     streamed = _stream_reasoning(get_parser(parser_name)(), chunks)
 
-    assert streamed == ((reasoning or "").strip(), (content or "").strip())
+    assert streamed == (reasoning or "", content or "")
 
 
 def _stream_tool_parser(chunks):
@@ -168,9 +168,12 @@ def _stream_tool_parser(chunks):
         calls += final.get("tool_calls") or []
         content.append(final.get("content") or "")
     return (
-        [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls],
+        [
+            (c["function"]["name"], json.loads(c["function"]["arguments"]))
+            for c in calls
+        ],
         [c["index"] for c in calls],
-        "".join(content).strip(),
+        "".join(content),
     )
 
 
@@ -183,7 +186,7 @@ def test_tool_parser_stream_equals_whole_text(name, label, chunks):
 
     assert calls == [(c["name"], json.loads(c["arguments"])) for c in whole.tool_calls]
     assert indexes == list(range(len(calls)))
-    assert content == (whole.content or "").strip()
+    assert content == (whole.content or "")
     # the analysis, the call text and every control token stay out of the content
     assert not re.search(r"<\|[a-z]+\|>|to=functions", content)
 
@@ -250,3 +253,79 @@ def test_scanner_does_not_start_a_message_inside_a_body():
     messages, _ = parse_messages("<|channel|>analysis<|message|>a<|message|>b<|end|>")
 
     assert [(m.channel, m.body) for m in messages] == [("analysis", "ab")]
+
+
+# --- absolute expectations (the stream/whole comparisons above cannot see both being wrong)
+
+
+@pytest.mark.parametrize("parser_name", ["gpt_oss", "harmony"])
+def test_a_partial_token_at_the_end_of_the_text_is_text_not_lost(parser_name):
+    text = "<|channel|>analysis<|message|>a < b <|"
+
+    for _label, chunks in _chunkings(text):
+        assert _stream_reasoning(get_parser(parser_name)(), chunks) == ("a < b <|", "")
+    assert get_parser(parser_name)().extract_reasoning(text) == ("a < b <|", None)
+
+
+def test_a_recipient_in_the_role_header_makes_a_call():
+    text = (
+        "<|start|>assistant to=functions.search<|channel|>commentary json"
+        '<|message|>{"q": 1}<|call|>'
+    )
+
+    whole = HarmonyToolParser().extract_tool_calls(text)
+    streamed = _stream_tool_parser([text])
+
+    assert [(c["name"], json.loads(c["arguments"])) for c in whole.tool_calls] == [
+        ("search", {"q": 1})
+    ]
+    assert streamed[0] == [("search", {"q": 1})]
+
+
+@pytest.mark.parametrize("channel", ["analysis", "commentary", "final"])
+def test_a_message_addressed_to_a_function_is_a_call_in_any_channel(channel):
+    text = (
+        f"<|channel|>{channel} to=functions.search <|constrain|>json"
+        '<|message|>{"q": 1}<|call|>'
+    )
+
+    whole = HarmonyToolParser().extract_tool_calls(text)
+    reasoning, content = get_parser("harmony")().extract_reasoning(text)
+
+    assert [c["name"] for c in whole.tool_calls] == ["search"]
+    assert (reasoning, content) == (None, None)  # the arguments are neither
+    assert _stream_tool_parser(list(text))[0] == [("search", {"q": 1})]
+
+
+def test_a_commentary_message_to_no_one_is_content_for_every_reader():
+    text = (
+        "<|channel|>analysis<|message|>Need.<|end|>"
+        "<|channel|>commentary<|message|>Looking it up.<|end|>"
+        "<|channel|>final<|message|>Done.<|end|>"
+    )
+
+    assert get_parser("harmony")().extract_reasoning(text) == (
+        "Need.",
+        "Looking it up.\nDone.",
+    )
+    assert HarmonyToolParser().extract_tool_calls(text).content == (
+        "Looking it up.\nDone."
+    )
+    assert _stream_tool_parser(_tokens(text))[2] == "Looking it up.\nDone."
+
+
+@pytest.mark.parametrize(
+    "body", ["  \n Think.  \n", "    indented()\n  more   ", "\n\n x \n\n"]
+)
+def test_message_bodies_are_stripped_the_same_way_streaming_and_whole(body):
+    text = (
+        f"<|channel|>analysis<|message|>{body}<|end|><|channel|>final<|message|>{body}"
+    )
+
+    for name in ("gpt_oss", "harmony"):
+        want = get_parser(name)().extract_reasoning(text)
+        assert want == (body.strip(), body.strip())
+        for label, chunks in _chunkings(text):
+            assert _stream_reasoning(get_parser(name)(), chunks) == want, label
+    for label, chunks in _chunkings(text):
+        assert _stream_tool_parser(chunks)[2] == body.strip(), label

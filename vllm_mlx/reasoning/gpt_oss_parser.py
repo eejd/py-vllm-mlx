@@ -13,8 +13,7 @@ the 'final' channel, stripping all structural tokens from API responses.
 """
 
 from .base import DeltaMessage, ReasoningParser
-from .harmony_channels import parse_messages
-from .harmony_parser import HarmonyStreamingReader
+from .harmony_parser import HarmonyStreamingReader, split_messages
 
 
 class GptOssReasoningParser(ReasoningParser):
@@ -34,6 +33,9 @@ class GptOssReasoningParser(ReasoningParser):
     message is usually missing from the text (it is a stop token); a message that
     runs to the end of the text is read like a terminated one.
     """
+
+    # Its markers are control tokens: streaming sites must not filter them out first.
+    READS_CONTROL_TOKENS = True
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
@@ -55,19 +57,13 @@ class GptOssReasoningParser(ReasoningParser):
         if not model_output or "<|channel|>" not in model_output:
             return None, model_output if model_output else None
 
-        messages, _ = parse_messages(model_output)
-        reasoning = "\n".join(
-            m.body.strip() for m in messages if m.channel == "analysis" and m.body.strip()
-        )
-        content = "\n".join(
-            m.body.strip() for m in messages if m.channel == "final" and m.body.strip()
-        )
+        reasoning, content = split_messages(model_output)
 
         # If no channels found, return as plain content
-        if not reasoning and not content:
+        if reasoning is None and content is None:
             return None, model_output
 
-        return reasoning or None, content or None
+        return reasoning, content
 
     def extract_reasoning_streaming(
         self,

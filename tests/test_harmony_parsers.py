@@ -435,7 +435,9 @@ class TestHarmonyReasoningParser:
     def test_streaming_reset(self, parser):
         """Reset drops a half-read message: the next stream starts from scratch."""
         parser.extract_reasoning_streaming(
-            "", "<|channel|>analysis<|message|>half", "<|channel|>analysis<|message|>half"
+            "",
+            "<|channel|>analysis<|message|>half",
+            "<|channel|>analysis<|message|>half",
         )
         parser.reset_state()
         # text that follows only a half-read analysis message is not reasoning

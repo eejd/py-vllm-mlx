@@ -34,7 +34,9 @@ ANALYSIS = "The user wants it. I should call echo_args."
 FINAL = "Done, the call went out."
 # the model plans the call in the analysis channel, in words
 ANALYSIS_MENTIONING_A_CALL = (
-    "I could call to=functions.echo_args with " + json.dumps({"text": TEXT}) + " but no."
+    "I could call to=functions.echo_args with "
+    + json.dumps({"text": TEXT})
+    + " but no."
 )
 ARGS = json.dumps({"text": TEXT})
 
@@ -83,7 +85,7 @@ RAW = {
         + "<|start|>assistant"
         + _COMMENTARY_CALL_AT_EOS,
         ANALYSIS,
-        "",
+        "Looking it up.",  # a commentary message to no one is content, as in vLLM
         1,
     ),
     # the call without an analysis at all
@@ -102,6 +104,29 @@ RAW = {
         _analysis(ANALYSIS_MENTIONING_A_CALL),
         ANALYSIS_MENTIONING_A_CALL,
         "",
+        0,
+    ),
+    # a message addressed to a function is a call whatever its channel (vLLM's reading)
+    "call-in-the-analysis-channel": (
+        "<|channel|>analysis to=functions.echo_args <|constrain|>json"
+        f"<|message|>{ARGS}<|call|>",
+        "",
+        "",
+        1,
+    ),
+    # a commentary message addressed to no one is content (a preamble to the user)
+    "preamble-only": (
+        _analysis(ANALYSIS)
+        + "<|start|>assistant<|channel|>commentary<|message|>Looking it up.<|end|>",
+        ANALYSIS,
+        "Looking it up.",
+        0,
+    ),
+    "cut-off-in-a-preamble": (
+        _analysis(ANALYSIS)
+        + "<|start|>assistant<|channel|>commentary<|message|>Looking",
+        ANALYSIS,
+        "Looking",
         0,
     ),
     # a generation cut off inside the analysis
@@ -224,7 +249,9 @@ async def test_streaming_equals_non_streaming(
 
 
 def _post(monkeypatch, path, raw, chunking, stream):
-    monkeypatch.setattr(srv, "_engine", _engine(raw, chunking, thinking_open_in_prompt=False))
+    monkeypatch.setattr(
+        srv, "_engine", _engine(raw, chunking, thinking_open_in_prompt=False)
+    )
     monkeypatch.setattr(srv, "_model_name", "test-model")
     body = ENDPOINT_BODIES[path]()
     if stream:
@@ -267,7 +294,9 @@ def test_chat_stream_finish_reason(monkeypatch, harmony_parsers, name, chunking)
         for p in _sse_payloads(response.text.splitlines(True))
         if p.get("choices")
     ]
-    indexes = {tc["index"] for c in choices for tc in c["delta"].get("tool_calls") or []}
+    indexes = {
+        tc["index"] for c in choices for tc in c["delta"].get("tool_calls") or []
+    }
     assert len(indexes) == calls
     assert [c["finish_reason"] for c in choices if c["finish_reason"]] == [
         "tool_calls" if calls else "stop"
@@ -301,7 +330,8 @@ async def test_tool_parser_alone_streaming(
     monkeypatch, no_reasoning_parser, site, name, chunking
 ):
     """Without a reasoning parser the analysis is dropped, calls and the final
-    message come through; a delta that is only control tokens still reaches the parser."""
+    message come through; a delta that is only control tokens still reaches the parser.
+    """
     raw, _analysis_text, final, calls = RAW[name]
 
     seen = await _run(
@@ -311,3 +341,53 @@ async def test_tool_parser_alone_streaming(
     assert seen.calls == [("echo_args", {"text": TEXT})] * calls
     assert seen.content.strip() == final
     assert re.findall(r"<\|[a-z]+\|>", seen.content) == []
+
+
+@pytest.mark.parametrize("chunking", ["tokens", "x3"])
+@pytest.mark.parametrize("name", list(RAW))
+def test_chat_stream_sends_no_empty_chunk(monkeypatch, harmony_parsers, name, chunking):
+    """Control tokens the parsers consume must not become empty deltas on the wire."""
+    raw, *_ = RAW[name]
+
+    response = _post(monkeypatch, "/v1/chat/completions", raw, chunking, stream=True)
+
+    for payload in _sse_payloads(response.text.splitlines(True)):
+        for choice in payload.get("choices") or []:
+            delta = choice["delta"]
+            assert (
+                delta.get("content")
+                or delta.get("reasoning_content")
+                or delta.get("reasoning")
+                or delta.get("tool_calls")
+                or delta.get("role")
+                or choice.get("finish_reason")
+            ), payload
+
+
+@pytest.mark.parametrize("chunking", CHUNKINGS)
+@pytest.mark.parametrize("tool_parser", ["hermes", "qwen"])
+@pytest.mark.parametrize(
+    "name",
+    ["analysis-final-eos" if False else "final-at-eos", "call-mentioned-in-analysis"],
+)
+@pytest.mark.anyio
+async def test_messages_stream_feeds_a_harmony_reasoning_parser_the_control_tokens(
+    monkeypatch, harmony_parsers, name, tool_parser, chunking
+):
+    """The reasoning parser alone needs them, whatever tool parser is configured."""
+    monkeypatch.setattr(srv, "_tool_call_parser", tool_parser)
+    monkeypatch.setattr(
+        srv, "_tool_parser_instance", ToolParserManager.get_tool_parser(tool_parser)()
+    )
+    raw, analysis, final, calls = RAW[name]
+
+    seen = await _run(
+        "anthropic",
+        monkeypatch,
+        raw,
+        chunking,
+        stream=True,
+        thinking_open_in_prompt=False,
+    )
+
+    assert (seen.reasoning.strip(), seen.content.strip()) == (analysis, final)

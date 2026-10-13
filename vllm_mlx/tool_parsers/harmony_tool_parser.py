@@ -17,19 +17,22 @@ The final response is in the 'final' channel:
 """
 
 import json
-import re
 import uuid
 from collections.abc import Sequence
 from typing import Any
 
 from ..reasoning.harmony_channels import (
     CHANNEL,
+    CONTENT,
+    BodyTrimmer,
     Body,
     Close,
     HarmonyScanner,
     Open,
     Plain,
+    function_name,
     parse_messages,
+    segment_kind,
 )
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
@@ -41,17 +44,6 @@ from .abstract_tool_parser import (
 def _generate_tool_id() -> str:
     """Generate a unique tool call ID."""
     return f"call_{uuid.uuid4().hex[:8]}"
-
-
-_FUNCTION_RECIPIENT = re.compile(r"functions\.(\w+)")
-
-
-def _function_name(channel: str | None, recipient: str | None) -> str | None:
-    """The function a commentary message is addressed to, if it is a call."""
-    if channel != "commentary" or not recipient:
-        return None
-    match = _FUNCTION_RECIPIENT.fullmatch(recipient)
-    return match.group(1) if match else None
 
 
 def _build_call(name: str, body: str, terminator: str | None) -> dict[str, Any] | None:
@@ -123,19 +115,22 @@ class HarmonyToolParser(ToolParser):
 
         tool_calls = []
         for message in messages:
-            name = _function_name(message.channel, message.recipient)
+            name = function_name(message.recipient)
             if name is None:
                 continue
             call = _build_call(name, message.body, message.terminator)
             if call is not None:
                 tool_calls.append(call)
 
-        final = "\n".join(
-            m.body.strip() for m in messages if m.channel == "final" and m.body.strip()
+        # The answer: final messages and preambles (commentary addressed to no one), as
+        # vLLM's Harmony parser reads them. Text outside any message is an answer only
+        # when the model used no channels at all; an analysis or a cut-off call is not.
+        spoken = "\n".join(
+            m.body.strip()
+            for m in messages
+            if m.body.strip() and segment_kind(m.channel, m.recipient) == CONTENT
         )
-        # Text outside any message is an answer only when the model used no
-        # channels at all; an analysis or a cut-off call is not content.
-        content = final or (None if messages else plain.strip()) or None
+        content = spoken or (None if messages else plain.strip()) or None
 
         if tool_calls:
             return ExtractedToolCallInformation(
@@ -154,33 +149,36 @@ class HarmonyToolParser(ToolParser):
 
     def _reset_stream(self) -> None:
         self._scanner = HarmonyScanner()
+        self._trim = BodyTrimmer()
         self._fed = 0  # length of the text the scanner has been given
         self._call: tuple[str, list[str]] | None = None  # open call: name, body parts
         self._call_index = 0
-        self._final_started = False  # inside a final message, nothing emitted yet
-        self._final_emitted = False
+        self._spoken = False  # inside a final or preamble message
+        self._spoken_started = False  # ... and no text of it has been emitted yet
+        self._spoken_emitted = False
 
     def _consume(
         self, events: list, content: list[str], calls: list[dict[str, Any]]
     ) -> None:
         for event in events:
             if isinstance(event, Open):
-                name = _function_name(event.channel, event.recipient)
+                name = function_name(event.recipient)
                 self._call = (name, []) if name else None
-                self._final_started = event.channel == "final"
+                self._spoken = segment_kind(event.channel, event.recipient) == CONTENT
+                self._spoken_started = True
+                self._trim.reset()
             elif isinstance(event, Body):
                 if self._call is not None:
                     self._call[1].append(event.text)
-                elif event.channel == "final":
-                    text = event.text
-                    if self._final_started:
-                        text = text.lstrip()
-                        if not text:
-                            continue
-                        self._final_started = False
-                        if self._final_emitted:
+                elif self._spoken:
+                    text = self._trim.feed(event.text)
+                    if not text:
+                        continue
+                    if self._spoken_started:
+                        self._spoken_started = False
+                        if self._spoken_emitted:
                             text = "\n" + text
-                    self._final_emitted = True
+                    self._spoken_emitted = True
                     content.append(text)
             elif isinstance(event, Close):
                 if self._call is not None:
