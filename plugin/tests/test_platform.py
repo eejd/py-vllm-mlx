@@ -113,3 +113,19 @@ def test_device_info():
     assert "available" in info
     assert "chip_name" in info
     assert "memory_gb" in info
+
+
+@needs_vllm_and_torch
+def test_get_attn_backend_cls_accepts_the_selectors_call():
+    """vLLM's selector passes ``attn_selector_config=`` and ``num_heads=`` by name."""
+    import torch
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_mlx_plugin.vllm_platform import MLXPlatform
+
+    config = AttentionSelectorConfig(
+        head_size=64, dtype=torch.float16, kv_cache_dtype=None, block_size=16
+    )
+    assert (
+        MLXPlatform.get_attn_backend_cls(None, attn_selector_config=config, num_heads=8)
+        == "vllm_mlx_plugin.attention.MLXAttentionBackend"
+    )

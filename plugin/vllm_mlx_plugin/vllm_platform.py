@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
 
 
 def _get_apple_chip_name() -> str:
@@ -214,15 +216,9 @@ class MLXPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(
         cls,
-        selected_backend,
-        head_size: int,
-        dtype: torch.dtype,
-        kv_cache_dtype,
-        block_size: int,
-        use_mla: bool,
-        has_sink: bool,
-        use_sparse: bool,
-        attn_type: str | None = None,
+        selected_backend: "AttentionBackendEnum",
+        attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         """Return MLX attention backend class path."""
         # Use our custom MLX attention backend
