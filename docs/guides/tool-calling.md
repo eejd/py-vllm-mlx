@@ -107,6 +107,13 @@ vllm-mlx serve mlx-community/Mistral-7B-Instruct-v0.3-4bit \
   --enable-auto-tool-choice --tool-call-parser mistral
 ```
 
+Checkpoints that ship `tekken.json` (Ministral 3, Devstral Small 2, Mistral Small 3.x) are
+served with their `tokenizer.json` fast tokenizer, checked at load time to be identical to
+the mistral-common one, so `[INST]`, `[TOOL_CALLS]` and the other control tokens in the
+rendered prompt are encoded as the control tokens the model was trained on. Without a
+`tokenizer.json`, or if it differs, the server logs a warning and these models are
+prompted with the control tokens spelled out as plain text.
+
 ### Qwen
 
 ```bash

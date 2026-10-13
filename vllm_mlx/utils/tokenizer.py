@@ -189,6 +189,23 @@ def _install_custom_chat_template(model_name: str, tokenizer):
     return install_deepseek_v4(tokenizer, model_name=model_name)
 
 
+def _prefer_fast_mistral_tokenizer(model_name: str, tokenizer_config: dict | None):
+    """Have mlx-lm load the tokenizer.json tokenizer of Mistral tekken checkpoints.
+
+    See ``mistral_tokenizer``: the mistral-common tokenizer ``transformers`` picks
+    by default cannot read the prompt string this server renders.
+    """
+    from mlx_lm.utils import _download
+
+    from .mistral_tokenizer import fast_tokenizer_config
+
+    try:
+        model_path = _download(model_name)
+    except Exception:
+        return tokenizer_config  # the load that follows reports the real error
+    return fast_tokenizer_config(model_path, tokenizer_config)
+
+
 def load_model_with_fallback(
     model_name: str,
     tokenizer_config: dict = None,
@@ -206,6 +223,7 @@ def load_model_with_fallback(
     Returns:
         Tuple of (model, tokenizer)
     """
+    tokenizer_config = _prefer_fast_mistral_tokenizer(model_name, tokenizer_config)
     model, tokenizer = _load_model_with_fallback(model_name, tokenizer_config)
     tokenizer = _install_custom_chat_template(model_name, tokenizer)
     apply_chat_template_override(tokenizer, chat_template)
