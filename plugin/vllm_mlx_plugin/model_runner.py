@@ -8,13 +8,13 @@ handling with mlx-lm's inference capabilities.
 Includes low-level optimizations:
 - mx.compile() for kernel fusion
 - Memory bandwidth optimization
-- Per-request mlx-lm generators (KV cache lives inside each generator)
+- Per-request mlx-lm KV caches, fed in scheduler-sized chunks
 """
 
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple
 
 import mlx.core as mx
 import numpy as np
@@ -26,22 +26,152 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# vLLM samples greedily below this temperature (``_SAMPLING_EPS``).
+_GREEDY_TEMPERATURE = 1e-5
+
+
+class _Step(NamedTuple):
+    """One request in a scheduled step."""
+
+    req_id: str
+    # Tokens of its own sequence the scheduler has now accounted for.
+    reached: int
+    # Whether this step completes everything the request knows, i.e. yields a
+    # token (False: a chunk of a longer prefill).
+    samples: bool
+
 
 class StructuredOutputError(RuntimeError):
-    """The grammar bitmask could not be applied; the step must not continue."""
+    """The grammar bitmask is unusable; the step must not continue."""
 
 
-class _TokenSource(Protocol):
-    def next_token(self, bitmask_row: Any) -> int: ...
+class _Sampler:
+    """mlx-lm's sampler chain, with ``top_k`` resolved against the logits width.
+
+    vLLM treats ``top_k`` >= vocab as disabled; mlx-lm raises for it, from
+    inside ``mx.compile(inputs=mx.random.state, ...)``, which leaves the
+    process-wide MLX RNG state unusable: every later ``temperature > 0`` sample
+    fails until restart.  The width is only known from the logits, so the chain
+    is built on first use for each width.
+    """
+
+    def __init__(self, temp: float, top_p: float, min_p: float, top_k: int) -> None:
+        self._args = (temp, top_p, min_p)
+        self._top_k = top_k
+        self._by_width: dict[int, Any] = {}
+
+    def __call__(self, logprobs: "mx.array") -> "mx.array":
+        width = logprobs.shape[-1]
+        sampler = self._by_width.get(width)
+        if sampler is None:
+            from mlx_lm.sample_utils import make_sampler
+
+            temp, top_p, min_p = self._args
+            top_k = self._top_k if 0 < self._top_k < width else 0
+            sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
+            self._by_width[width] = sampler
+        return sampler(logprobs)
 
 
-class _PipelinedSteps:
-    """mlx-lm's ``generate_step`` for a request with no grammar constraint."""
+def _apply_grammar_bitmask(logits: "mx.array", bitmask_row: Any) -> "mx.array | None":
+    """Set the logits of tokens the grammar forbids to -inf.
 
-    def __init__(self, generator: Iterator) -> None:
-        self._generator = generator
+    ``logits`` is ``(1, vocab)``; ``bitmask_row`` is one int32 row of
+    ``GrammarOutput.grammar_bitmask``.  The mask is applied by xgrammar's
+    ``apply_token_bitmask_inplace`` -- the call vLLM's GPU runner and
+    vllm-metal use on the same bitmask -- on a float32 CPU copy of the row.
+
+    Returns ``None`` when the grammar leaves no token allowed.  Anything that
+    makes the bitmask unusable (wrong dtype or shape, narrower than the logits,
+    xgrammar/torch missing or failing) raises ``StructuredOutputError``:
+    sampling on regardless would hand back text that ignores the grammar.
+    """
+    try:
+        import torch
+        import xgrammar as xgr
+
+        bitmask = np.asarray(bitmask_row)
+        vocab = logits.shape[-1]
+        if bitmask.dtype != np.int32 or bitmask.ndim != 1:
+            raise ValueError(
+                f"expected a 1-D int32 bitmask row, got {bitmask.dtype} "
+                f"with shape {bitmask.shape}"
+            )
+        if bitmask.shape[0] * 32 < vocab:
+            raise ValueError(
+                f"a bitmask of {bitmask.shape[0]} words covers "
+                f"{bitmask.shape[0] * 32} tokens, the logits have {vocab}; "
+                "the tokens past that would stay unconstrained"
+            )
+        row = np.array(logits.astype(mx.float32))  # writable copy, evaluates
+        xgr.apply_token_bitmask_inplace(
+            torch.from_numpy(row), torch.from_numpy(bitmask[None])
+        )
+    except Exception as e:
+        raise StructuredOutputError(f"cannot apply the grammar bitmask: {e}") from e
+    if np.isneginf(row).all():
+        return None
+    return mx.array(row).astype(logits.dtype)
+
+
+class _RequestState:
+    """One request's model state: its KV cache and how far it has been fed.
+
+    ``tokens`` is everything the model must see, in order (the prompt, or the
+    whole history of a resumed request); ``fed`` of them are in the cache.
+    Between steps ``fed <= len(tokens) - 1``: the last token is always left
+    to produce the logits the next token comes from.
+
+    Tokens are produced one of two ways.  An unconstrained request runs on
+    mlx-lm's ``generate_step`` (``prompt_cache=`` takes over the cache), which
+    samples one token ahead of the one it yields.  A structured-output request
+    cannot: the grammar bitmask for token n+1 exists only after token n was
+    accepted by the engine, so it steps one token at a time and applies the
+    bitmask to the logits it samples from.
+    """
+
+    PREFILL_STEP_SIZE = 2048
+
+    def __init__(
+        self,
+        model: Any,
+        tokens: list[int],
+        sampler: Any,
+        processors: list[Any],
+        structured: bool,
+    ) -> None:
+        from mlx_lm.models.cache import make_prompt_cache
+
+        if not tokens:
+            raise ValueError("a request needs at least one prompt token")
+        self._model = model
+        self._sampler = sampler
+        self._processors = processors
+        self.structured = structured
+        self.tokens = list(tokens)
+        self.fed = 0
+        self._cache = make_prompt_cache(model)
+        self._generator: Iterator | None = None
+
+    def prefill_to(self, upto: int) -> None:
+        """Feed ``tokens[fed:upto]`` (never the last token) to the cache."""
+        from mlx_lm.generate import generation_stream
+
+        upto = min(upto, len(self.tokens) - 1)
+        if self._generator is not None or upto <= self.fed:
+            return
+        with mx.stream(generation_stream):
+            while self.fed < upto:
+                n = min(self.PREFILL_STEP_SIZE, upto - self.fed)
+                chunk = mx.array(self.tokens[self.fed : self.fed + n])
+                self._model(chunk[None], cache=self._cache)
+                mx.eval([c.state for c in self._cache])
+                self.fed += n
+                mx.clear_cache()
 
     def next_token(self, bitmask_row: Any) -> int:
+        if self.structured:
+            return self._masked_step(bitmask_row)
         if bitmask_row is not None:
             # generate_step already sampled this token before the bitmask
             # existed; dropping the constraint silently would break the grammar.
@@ -49,74 +179,45 @@ class _PipelinedSteps:
                 "a grammar bitmask arrived for a request started without "
                 "structured outputs"
             )
+        if self._generator is None:
+            from mlx_lm.generate import generate_step
+
+            # vLLM's scheduler enforces max_tokens / stop conditions; keep the
+            # generator open for the whole context window.
+            self._generator = generate_step(
+                prompt=mx.array(self.tokens[self.fed :]),
+                model=self._model,
+                max_tokens=-1,
+                sampler=self._sampler,
+                logits_processors=self._processors or None,
+                prompt_cache=self._cache,
+            )
         token, _logprobs = next(self._generator)
         return int(token.item()) if hasattr(token, "item") else int(token)
 
-
-def _apply_grammar_bitmask(logits: "mx.array", bitmask_row: Any) -> "mx.array":
-    """Set the logits of tokens the grammar forbids to -inf.
-
-    ``logits`` is ``(1, vocab)``; ``bitmask_row`` is one int32 row of
-    ``GrammarOutput.grammar_bitmask``.  The mask is applied by xgrammar's
-    ``apply_token_bitmask_inplace`` -- the call vLLM's GPU runner and
-    vllm-metal use on the same bitmask -- on a float32 CPU copy of the row.
-    """
-    try:
-        import torch
-        import xgrammar as xgr
-    except ImportError as e:
-        raise StructuredOutputError(
-            f"xgrammar and torch are required to apply a grammar bitmask: {e}"
-        ) from e
-
-    row = np.array(logits.astype(mx.float32))  # writable copy, evaluates the logits
-    xgr.apply_token_bitmask_inplace(
-        torch.from_numpy(row), torch.from_numpy(np.asarray(bitmask_row)[None])
-    )
-    return mx.array(row).astype(logits.dtype)
-
-
-class _MaskedStepper:
-    """One request's tokens, one at a time, with the grammar applied per step.
-
-    Same computation as mlx-lm's ``generate_step`` (chunked prefill, then one
-    forward per token) without its one-token lookahead, and with
-    ``bitmask_row`` applied to the logits before the log-softmax and sampler,
-    so top-p / min-p / top-k see the constrained distribution.
-    """
-
-    PREFILL_STEP_SIZE = 2048
-
-    def __init__(self, model: Any, prompt_token_ids: list[int], sampler: Any) -> None:
-        self._model = model
-        self._sampler = sampler
-        self._cache: list[Any] | None = None  # built on the first step
-        self._pending = mx.array(prompt_token_ids)  # tokens not yet fed to the model
-
-    def next_token(self, bitmask_row: Any) -> int:
+    def _masked_step(self, bitmask_row: Any) -> int:
         from mlx_lm.generate import generation_stream
-        from mlx_lm.models.cache import make_prompt_cache
 
-        if len(self._pending) == 0:
-            raise ValueError("a request needs at least one prompt token")
-        if self._cache is None:
-            self._cache = make_prompt_cache(self._model)
-
+        self.prefill_to(len(self.tokens) - 1)
         with mx.stream(generation_stream):
-            # Feed all but the last pending token in chunks (the cache keeps
-            # them); the last one yields the logits the next token comes from.
-            while len(self._pending) > 1:
-                n = min(self.PREFILL_STEP_SIZE, len(self._pending) - 1)
-                self._model(self._pending[:n][None], cache=self._cache)
-                mx.eval([c.state for c in self._cache])
-                self._pending = self._pending[n:]
-                mx.clear_cache()
-            logits = self._model(self._pending[None], cache=self._cache)[:, -1, :]
+            last = mx.array(self.tokens[self.fed :])
+            logits = self._model(last[None], cache=self._cache)[:, -1, :]
+            for processor in self._processors:
+                logits = processor(mx.array(self.tokens), logits)
             if bitmask_row is not None:
-                logits = _apply_grammar_bitmask(logits, bitmask_row)
+                masked = _apply_grammar_bitmask(logits, bitmask_row)
+                if masked is None:
+                    # The grammar allows nothing.  Sample unconstrained: the
+                    # scheduler rejects that token and ends this request alone
+                    # with an error (FINISHED_ERROR), as it does for a CUDA
+                    # runner whose mask leaves nothing.
+                    logger.error("the grammar allows no token for this request")
+                else:
+                    logits = masked
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             token = int(self._sampler(logprobs).item())
-        self._pending = mx.array([token])
+        self.fed = len(self.tokens)
+        self.tokens.append(token)
         return token
 
 
@@ -162,17 +263,15 @@ class MLXModelRunner:
         self.tokenizer = None
         self._loaded = False
 
-        # Per-request generation state (vLLM >= 0.27 step contract):
-        # each request owns a token source (an mlx-lm generate_step generator,
-        # or a _MaskedStepper for structured outputs) whose KV cache persists
-        # between scheduler steps.
-        self._gens: dict[str, _TokenSource] = {}
-        self._tokens: dict[str, list[int]] = {}
+        # Per-request state (vLLM >= 0.27 step contract): each request owns a
+        # _RequestState (its KV cache and how far it has been fed) that
+        # persists between scheduler steps.  Sampling params and prompt length
+        # outlive a preemption, which drops the state, for the resume.
+        self._requests: dict[str, _RequestState] = {}
         self._params: dict[str, Any] = {}
         self._prompt_lens: dict[str, int] = {}
-        # (request id, whether this step produces a token) for the requests
-        # execute_model scheduled and sample_tokens has yet to step.
-        self._scheduled_steps: list[tuple[str, bool]] = []
+        # The requests execute_model scheduled and sample_tokens has yet to run.
+        self._scheduled_steps: list[_Step] = []
 
         # Cache for prompt processing
         self._prompt_cache = None
@@ -334,10 +433,10 @@ class MLXModelRunner:
     ) -> ModelRunnerOutput | None:
         """Register one scheduler step (vLLM >= 0.27 contract).
 
-        Finished requests are released, new requests get their generator and
-        resumed (preempted) requests are rebuilt from the scheduler's token
-        history.  No token is produced here: when requests were scheduled the
-        step is stashed and ``None`` returned, so the engine collects it via
+        Finished requests are released, preempted ones lose their cache (the
+        scheduler sends their history again on resume), new requests get their
+        state.  Nothing is computed here: when requests were scheduled the step
+        is stashed and ``None`` returned, so the engine collects it via
         ``sample_tokens`` -- the same two-phase protocol vllm_swift uses --
         together with the grammar bitmask, which vLLM only computes after
         ``execute_model`` (``EngineCore.step``) and which must reach the
@@ -349,8 +448,10 @@ class MLXModelRunner:
 
         for req_id in scheduler_output.finished_req_ids:
             self._release(req_id)
+        for req_id in getattr(scheduler_output, "preempted_req_ids", None) or ():
+            self._requests.pop(req_id, None)
 
-        steps: list[tuple[str, bool]] = []
+        steps: list[_Step] = []
         scheduled = scheduler_output.num_scheduled_tokens
 
         for req_data in scheduler_output.scheduled_new_reqs:
@@ -358,24 +459,25 @@ class MLXModelRunner:
             prompt = req_data.prompt_token_ids or []
             self._params[req_id] = req_data.sampling_params
             self._prompt_lens[req_id] = len(prompt)
-            self._gens[req_id] = self._start_request(prompt, req_data.sampling_params)
-            self._tokens[req_id] = []
-            computed = req_data.num_computed_tokens
-            steps.append((req_id, computed + scheduled[req_id] >= len(prompt)))
+            self._requests[req_id] = self._new_state(prompt, req_data.sampling_params)
+            # ``num_computed_tokens`` > 0 is a vLLM prefix-cache hit, which
+            # speaks for vLLM's KV blocks; MLX keeps its own cache and feeds
+            # the request from its first token.
+            reached = req_data.num_computed_tokens + scheduled[req_id]
+            steps.append(_Step(req_id, reached, reached >= len(prompt)))
 
         cached = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached.req_ids):
             if req_id in cached.resumed_req_ids:
-                # Preempted and re-prefilled by the scheduler: the old
-                # generator's KV state is stale, rebuild from the full token
-                # history the scheduler sends for resumed requests.
+                # Preempted and re-prefilled by the scheduler: rebuild from the
+                # full token history it sends for resumed requests.
                 self._resume_request(req_id, cached.all_token_ids.get(req_id))
             # The step produces a token once the scheduled tokens reach the end
             # of everything the request knows: prompt plus outputs so far
             # (``num_output_tokens`` counts the async scheduler's pending ones).
             total = self._prompt_lens.get(req_id, 0) + cached.num_output_tokens[i]
-            computed = cached.num_computed_tokens[i]
-            steps.append((req_id, computed + scheduled[req_id] >= total))
+            reached = cached.num_computed_tokens[i] + scheduled[req_id]
+            steps.append(_Step(req_id, reached, reached >= total))
 
         if steps:
             self._scheduled_steps = steps
@@ -383,14 +485,16 @@ class MLXModelRunner:
         return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
 
     def sample_tokens(self, grammar_output: Any = None) -> ModelRunnerOutput | None:
-        """Advance every request scheduled by ``execute_model`` by one token.
+        """Run the step ``execute_model`` registered.
 
         A request whose scheduled tokens only cover part of its prompt (a
-        chunked prefill) samples nothing and reports an empty list, as vLLM's
-        own runners do: the async scheduler counts one pending output per
-        request that completes its prompt, and a token for a request that does
-        not drives that count negative (``assert request.num_output_placeholders
-        >= 0``), which kills the engine core.
+        chunked prefill) feeds that chunk to its cache and reports an empty
+        list, as vLLM's own runners do: the async scheduler counts one pending
+        output per request that completes its prompt, and a token for a request
+        that does not drives that count negative (``assert
+        request.num_output_placeholders >= 0``), which kills the engine core.
+        The scheduler's per-step token budget therefore bounds the work of a
+        step here too.  Any other request advances by one token.
 
         ``grammar_output`` carries the structured-output bitmask rows, in
         ``structured_output_request_ids`` order (one row per request: this
@@ -401,11 +505,18 @@ class MLXModelRunner:
         if not steps:
             return None
         rows = self._bitmask_rows(grammar_output)
-        req_ids = [req_id for req_id, _ in steps]
-        sampled_token_ids = [
-            self._step_request(req_id, rows.get(req_id)) if samples else []
-            for req_id, samples in steps
-        ]
+        req_ids = [step.req_id for step in steps]
+        sampled_token_ids = []
+        for step in steps:
+            if step.samples:
+                sampled_token_ids.append(
+                    self._step_request(step.req_id, rows.get(step.req_id))
+                )
+            else:
+                state = self._requests.get(step.req_id)
+                if state is not None:
+                    state.prefill_to(step.reached)
+                sampled_token_ids.append([])
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
@@ -427,79 +538,62 @@ class MLXModelRunner:
         return {rid: bitmask[i] for i, rid in enumerate(ids)}
 
     def _release(self, req_id: str) -> None:
-        self._gens.pop(req_id, None)
-        self._tokens.pop(req_id, None)
+        self._requests.pop(req_id, None)
         self._params.pop(req_id, None)
         self._prompt_lens.pop(req_id, None)
 
     def _resume_request(self, req_id: str, all_token_ids: list[int] | None) -> None:
-        """Rebuild a preempted request's generator from its full token history."""
+        """Rebuild a preempted request's state from its full token history."""
         if not all_token_ids:
             logger.error(f"Resumed request {req_id} without token history")
-            self._gens.pop(req_id, None)
+            self._requests.pop(req_id, None)
             return
-        params = self._params.get(req_id)
-        self._gens[req_id] = self._start_request(list(all_token_ids), params)
-        self._tokens.setdefault(req_id, [])
+        self._requests[req_id] = self._new_state(
+            list(all_token_ids), self._params.get(req_id)
+        )
 
     def _eos_token_id(self) -> int | None:
         return getattr(self.tokenizer, "eos_token_id", None)
 
-    def _start_request(
-        self, prompt_token_ids: list[int], sampling_params: Any
-    ) -> "_TokenSource":
-        """Create the persistent token source for one request.
-
-        An unconstrained request runs on mlx-lm's ``generate_step``, which
-        samples one token ahead of the one it yields.  A structured-output
-        request cannot: the grammar bitmask for token n+1 only exists after
-        token n was accepted by the engine, so it steps one token at a time
-        (``_MaskedStepper``) and applies the bitmask to the logits it samples.
-        """
-        from mlx_lm.sample_utils import make_sampler
+    def _new_state(
+        self, token_ids: list[int], sampling_params: Any
+    ) -> "_RequestState":
+        """Create the model state for one request from its sampling params."""
+        from mlx_lm.sample_utils import make_logits_processors
 
         temp = float(getattr(sampling_params, "temperature", 1.0) or 0.0)
+        if temp < _GREEDY_TEMPERATURE:  # vLLM: below this is greedy decoding
+            temp = 0.0
         top_p_raw = getattr(sampling_params, "top_p", None)
         # vLLM: 1.0 = disabled; mlx-lm: 0.0 = disabled.
         top_p = 0.0 if top_p_raw is None or top_p_raw >= 1.0 else float(top_p_raw)
         min_p = float(getattr(sampling_params, "min_p", 0.0) or 0.0)
         top_k = int(getattr(sampling_params, "top_k", 0) or 0)
-        if top_k < 0:  # vLLM uses -1 / 0 for "disabled"
-            top_k = 0
-        sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
-
-        if getattr(sampling_params, "structured_outputs", None) is not None:
-            return _MaskedStepper(self.model, prompt_token_ids, sampler)
-
-        from mlx_lm.generate import generate_step
-
-        # vLLM's scheduler enforces max_tokens / stop conditions; keep the
-        # generator open for the whole context window.
-        return _PipelinedSteps(
-            generate_step(
-                prompt=mx.array(prompt_token_ids),
-                model=self.model,
-                max_tokens=-1,
-                sampler=sampler,
-            )
+        logit_bias = getattr(sampling_params, "logit_bias", None)
+        return _RequestState(
+            self.model,
+            token_ids,
+            _Sampler(temp, top_p, min_p, top_k),
+            make_logits_processors(logit_bias=logit_bias) if logit_bias else [],
+            getattr(sampling_params, "structured_outputs", None) is not None,
         )
 
     def _step_request(self, req_id: str, bitmask_row: Any = None) -> list[int]:
         """Advance one request by one token.
 
-        A request that can no longer generate (missing/exhausted generator or
+        A request that can no longer generate (missing/exhausted state or
         an mlx-lm error) is terminated by emitting EOS: the scheduler only
         stops a request on a sampled stop token -- an empty list leaves it
         running forever (vllm/v1/core/sched/scheduler.py update_from_output).
         A structured-output failure is not that: terminating with EOS would
         hand back text that silently ignores the grammar, so it propagates.
         """
-        source = self._gens.get(req_id)
-        if source is None:
-            logger.error(f"No generator for request {req_id}; terminating it")
+        state = self._requests.get(req_id)
+        if state is None:
+            logger.error(f"No state for request {req_id}; terminating it")
             return self._terminate(req_id)
         try:
-            tok = source.next_token(bitmask_row)
+            return [state.next_token(bitmask_row)]
         except StopIteration:
             return self._terminate(req_id)
         except StructuredOutputError:
@@ -507,11 +601,9 @@ class MLXModelRunner:
         except Exception as e:
             logger.error(f"Generation failed for {req_id}: {e}")
             return self._terminate(req_id)
-        self._tokens[req_id].append(tok)
-        return [tok]
 
     def _terminate(self, req_id: str) -> list[int]:
-        self._gens.pop(req_id, None)
+        self._requests.pop(req_id, None)
         eos = self._eos_token_id()
         return [int(eos)] if eos is not None else []
 

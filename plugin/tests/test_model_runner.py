@@ -93,25 +93,31 @@ class _Driver:
         grammar=None,
         chunk=None,
         finished=(),
+        preempted=(),
+        prefix=None,
     ) -> dict[str, list[int]]:
         """``new``: (req_id, prompt, params) tuples; ``decode``: running req ids;
         ``resumed``: {req_id: all token ids} of preempted requests rescheduled;
-        ``chunk``: {req_id: n} caps the prefill tokens scheduled this step."""
+        ``chunk``: {req_id: n} caps the prefill tokens scheduled this step;
+        ``prefix``: {req_id: n} new requests that vLLM's prefix cache already
+        holds the first n tokens of."""
         resumed = resumed or {}
         chunk = chunk or {}
+        prefix = prefix or {}
         num_scheduled: dict[str, int] = {}
         new_reqs = []
         for req_id, prompt, params in new:
             self.prompt_len[req_id] = len(prompt)
-            self.computed[req_id] = 0
+            self.computed[req_id] = prefix.get(req_id, 0)
             self.outputs[req_id] = 0
-            num_scheduled[req_id] = min(chunk.get(req_id, len(prompt)), len(prompt))
+            left = len(prompt) - self.computed[req_id]
+            num_scheduled[req_id] = min(chunk.get(req_id, left), left)
             new_reqs.append(
                 SimpleNamespace(
                     req_id=req_id,
                     prompt_token_ids=prompt,
                     sampling_params=params,
-                    num_computed_tokens=0,
+                    num_computed_tokens=self.computed[req_id],
                 )
             )
         cached_ids = list(decode) + list(resumed)
@@ -142,6 +148,7 @@ class _Driver:
             ),
             num_scheduled_tokens=num_scheduled,
             finished_req_ids=set(finished),
+            preempted_req_ids=set(preempted),
         )
 
         assert self.runner.execute_model(scheduler_output) is None
@@ -229,7 +236,7 @@ def test_cleanup_only_step_returns_an_empty_output_directly():
         )
     )
     assert out.req_ids == [] and out.sampled_token_ids == []
-    assert "a" not in d.runner._gens and "a" not in d.runner._prompt_lens
+    assert "a" not in d.runner._requests and "a" not in d.runner._prompt_lens
 
 
 def test_grammar_bitmask_constrains_the_sampled_token():
@@ -371,3 +378,257 @@ def test_misshapen_bitmask_is_an_error():
     bad = GrammarOutput(["s"], np.stack([_allowed(3), _allowed(4)]))
     with pytest.raises(StructuredOutputError):
         d.step(new=[("s", PROMPT, _structured())], grammar=bad)
+
+
+LONG_PROMPT = list(range(5, 17))  # 12 tokens
+
+
+def _greedy_tokens(params_factory, prompt, n):
+    d = _Driver()
+    out = [d.tokens(d.step(new=[("a", prompt, params_factory())]))["a"]]
+    for _ in range(n - 1):
+        out.append(d.tokens(d.step(decode=["a"]))["a"])
+    return out
+
+
+# -- sampling parameters ----------------------------------------------------
+
+
+@pytest.mark.parametrize("top_k", [VOCAB, VOCAB + 1, 10**6])
+def test_top_k_at_or_above_the_vocab_is_disabled_and_does_not_poison_sampling(
+    top_k, caplog
+):
+    """vLLM treats top_k >= vocab as disabled.  mlx-lm raises inside an
+    mx.compile that owns the global RNG state, which breaks every later
+    temperature > 0 sample in the process (and the error would be turned into
+    an EOS, i.e. an empty answer)."""
+    d = _Driver()
+    with caplog.at_level("ERROR"):
+        for req_id, k in (("big", top_k), ("after", 5)):
+            params = SamplingParams(temperature=1.0, top_k=k)
+            d.step(new=[(req_id, PROMPT, params)])
+            for _ in range(3):
+                d.step(decode=[req_id])
+    assert not [r for r in caplog.records if r.levelname == "ERROR"], caplog.text
+
+
+def test_top_k_above_the_vocab_samples_like_no_top_k():
+    mx.random.seed(7)
+    free = _greedy_tokens(lambda: SamplingParams(temperature=1.0, top_k=0), PROMPT, 6)
+    mx.random.seed(7)
+    big = _greedy_tokens(
+        lambda: SamplingParams(temperature=1.0, top_k=VOCAB * 3), PROMPT, 6
+    )
+    assert big == free
+
+
+def test_temperature_above_zero_samples():
+    greedy = _unconstrained_run(PROMPT, 24)
+    mx.random.seed(3)
+    sampled = _greedy_tokens(lambda: SamplingParams(temperature=1.5), PROMPT, 24)
+    assert sampled != greedy
+
+
+@pytest.mark.parametrize(
+    "narrow",
+    [dict(top_k=1), dict(top_p=0.001), dict(min_p=0.999)],
+    ids=["top_k", "top_p", "min_p"],
+)
+@pytest.mark.parametrize("structured", [False, True], ids=["plain", "structured"])
+def test_top_k_top_p_min_p_narrow_the_distribution_to_the_greedy_token(
+    narrow, structured
+):
+    """Each filter, set to keep only the top token, makes temperature 1 greedy."""
+    greedy = _unconstrained_run(PROMPT, 8)
+    mx.random.seed(11)
+    so = StructuredOutputsParams(json_object=True) if structured else None
+    got = _greedy_tokens(
+        lambda: SamplingParams(temperature=1.0, structured_outputs=so, **narrow),
+        PROMPT,
+        8,
+    )
+    assert got == greedy
+
+
+@pytest.mark.parametrize("structured", [False, True], ids=["plain", "structured"])
+def test_logit_bias_steers_the_sampled_token(structured):
+    so = StructuredOutputsParams(json_object=True) if structured else None
+    got = _greedy_tokens(
+        lambda: SamplingParams(
+            temperature=0.0, logit_bias={55: 100.0}, structured_outputs=so
+        ),
+        PROMPT,
+        4,
+    )
+    assert got == [55] * 4
+
+
+# -- structured-output failures ---------------------------------------------
+
+
+def _structured_step(bitmask):
+    d = _Driver()
+    out = GrammarOutput(["s"], bitmask)
+    return d, lambda: d.step(new=[("s", PROMPT, _structured())], grammar=out)
+
+
+@pytest.mark.parametrize(
+    "bitmask",
+    [
+        _allowed(3).astype(np.int64)[None],  # wrong dtype
+        _allowed(3)[None, :3],  # 96 token bits for a 100-token vocab
+    ],
+    ids=["int64", "narrower-than-vocab"],
+)
+def test_an_unusable_bitmask_raises_instead_of_ending_the_request(bitmask):
+    _, run = _structured_step(bitmask)
+    with pytest.raises(StructuredOutputError):
+        run()
+
+
+def test_a_grammar_that_allows_no_token_leaves_the_decision_to_the_scheduler():
+    """Not EOS (a clean stop) and not an arbitrary NaN token: the unconstrained
+    sample goes back, and the scheduler's grammar rejects it and ends the
+    request with an error, without taking the engine down."""
+    free = _unconstrained_run(PROMPT, 1)[0]
+    d = _Driver()
+    zero = np.zeros((1, (VOCAB + 31) // 32), dtype=np.int32)
+    got = d.tokens(
+        d.step(
+            new=[("s", PROMPT, _structured())],
+            grammar=GrammarOutput(["s"], zero),
+        )
+    )
+    assert got == {"s": free}
+
+
+# -- prefill ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("structured", [False, True], ids=["plain", "structured"])
+def test_a_partial_chunk_is_prefilled_when_scheduled(structured):
+    """The step budget bounds the work: a chunk is fed to the cache in its own
+    step, not all at once when the prompt completes."""
+    so = StructuredOutputsParams(json_object=True) if structured else None
+    d = _Driver()
+    params = SamplingParams(temperature=0.0, structured_outputs=so)
+    assert d.step(new=[("a", LONG_PROMPT, params)], chunk={"a": 5}) == {"a": []}
+    assert d.runner._requests["a"].fed == 5
+    assert d.step(decode=["a"], chunk={"a": 4}) == {"a": []}
+    assert d.runner._requests["a"].fed == 9
+    first = d.tokens(d.step(decode=["a"]))["a"]
+    assert first == _unconstrained_run(LONG_PROMPT, 1)[0]
+
+
+@pytest.mark.parametrize("structured", [False, True], ids=["plain", "structured"])
+def test_prompt_longer_than_one_prefill_step_gives_the_same_tokens(
+    structured, monkeypatch
+):
+    from vllm_mlx_plugin.model_runner import _RequestState
+
+    free = _unconstrained_run(LONG_PROMPT, 4)
+    monkeypatch.setattr(_RequestState, "PREFILL_STEP_SIZE", 3)
+    so = StructuredOutputsParams(json_object=True) if structured else None
+    got = _greedy_tokens(
+        lambda: SamplingParams(temperature=0.0, structured_outputs=so),
+        LONG_PROMPT,
+        4,
+    )
+    assert got == free
+
+
+def test_prefill_is_fed_in_prefill_step_sized_forward_passes(monkeypatch):
+    from vllm_mlx_plugin.model_runner import MLXModelRunner, _RequestState
+
+    monkeypatch.setattr(_RequestState, "PREFILL_STEP_SIZE", 3)
+    calls = []
+    new_state = MLXModelRunner._new_state
+
+    def spied(self, tokens, params):
+        state = new_state(self, tokens, params)
+        model = state._model
+        state._model = lambda x, **kw: calls.append(x.shape[1]) or model(x, **kw)
+        return state
+
+    monkeypatch.setattr(MLXModelRunner, "_new_state", spied)
+    d = _Driver()
+    d.step(new=[("a", LONG_PROMPT, _plain())], chunk={"a": 10})
+    assert calls == [3, 3, 3, 1]
+
+
+@pytest.mark.parametrize("structured", [False, True], ids=["plain", "structured"])
+def test_a_prefix_cache_hit_is_still_fed_from_the_first_token(structured):
+    """vLLM's num_computed_tokens speaks for its own KV blocks, not MLX's."""
+    so = StructuredOutputsParams(json_object=True) if structured else None
+    free = _unconstrained_run(LONG_PROMPT, 2)
+    d = _Driver()
+    params = SamplingParams(temperature=0.0, structured_outputs=so)
+    first = d.tokens(d.step(new=[("a", LONG_PROMPT, params)], prefix={"a": 8}))
+    assert first == {"a": free[0]}
+    assert d.tokens(d.step(decode=["a"])) == {"a": free[1]}
+
+
+def test_a_prefix_cache_hit_that_still_has_chunks_to_go_samples_nothing_yet():
+    d = _Driver()
+    out = d.step(
+        new=[("a", LONG_PROMPT, _plain())], prefix={"a": 4}, chunk={"a": 3}
+    )
+    assert out == {"a": []}
+    assert d.runner._requests["a"].fed == 7
+
+
+# -- preemption, cleanup ----------------------------------------------------
+
+
+def test_a_preempted_request_gives_up_its_cache_and_resumes_from_the_history():
+    free = _unconstrained_run(PROMPT, 4)
+    d = _Driver()
+    d.step(new=[("a", PROMPT, _plain())])
+    d.step(decode=["a"])
+    # The scheduler preempts it in a step that runs something else.
+    d.step(new=[("b", PROMPT, _plain())], preempted=["a"])
+    assert "a" not in d.runner._requests
+    assert "a" in d.runner._params and "a" in d.runner._prompt_lens
+    history = PROMPT + free[:2]
+    assert d.tokens(d.step(resumed={"a": history}))["a"] == free[2]
+    assert d.tokens(d.step(decode=["a"]))["a"] == free[3]
+
+
+def test_a_resumed_request_is_rebuilt_not_continued_from_the_stale_cache():
+    """If the old state were kept, resuming with a *different* history would
+    go on from it; the rebuild starts from what the scheduler sent."""
+    d = _Driver()
+    d.step(new=[("a", PROMPT, _plain())])
+    other = [30, 31, 32, 33, 34]
+    got = d.tokens(d.step(resumed={"a": other}))["a"]
+    assert got == _unconstrained_run(other, 1)[0]
+
+
+def test_finishing_a_request_forgets_everything_about_it():
+    d = _Driver()
+    d.step(new=[("a", PROMPT, _plain())])
+    d.step(finished=["a"], new=[("b", PROMPT, _plain())])
+    r = d.runner
+    assert "a" not in r._requests and "a" not in r._params
+    assert "a" not in r._prompt_lens
+
+
+# -- failure handling -------------------------------------------------------
+
+
+def test_a_request_that_cannot_generate_is_ended_with_eos():
+    """Without a sampled stop token the scheduler would keep it running."""
+    runner = _runner()
+    assert runner._step_request("ghost") == [EOS]
+
+
+def test_an_mlx_error_ends_that_request_with_eos():
+    d = _Driver()
+    d.step(new=[("a", PROMPT, _plain())])
+
+    def boom(_row):
+        raise RuntimeError("metal failure")
+
+    d.runner._requests["a"].next_token = boom
+    assert d.runner._step_request("a") == [EOS]
+    assert "a" not in d.runner._requests
