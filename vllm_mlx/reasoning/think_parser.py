@@ -10,6 +10,13 @@ Supports three scenarios:
 2. Only closing tag (think injected in prompt): reasoning</think>content
 3. No tags: pure content
 
+Everything between the tags is reasoning, whatever it contains. A parser here
+never turns text inside the thinking into content: tool-call markup the model
+drafts while thinking stays in the reasoning, and tool calls are parsed from the
+content part only (the server hands the tool parser nothing else). A call that
+exists only inside the thinking is therefore not a call, and a generation cut
+off inside the thinking has no content and no calls.
+
 Performance: The streaming parser uses a state machine to track the current
 phase (pre-think / thinking / content). A tag that arrives split across delta
 boundaries is handled by withholding the fragment until it either completes or
@@ -17,13 +24,9 @@ is ruled out, so every search stays inside the current delta and the per-token
 cost does not grow with output length.
 """
 
-import logging
-import re
 from abc import abstractmethod
 
 from .base import DeltaMessage, ReasoningParser
-
-logger = logging.getLogger(__name__)
 
 
 def _partial_suffix_len(text: str, markers: tuple[str, ...]) -> int:
@@ -70,20 +73,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
     def end_token(self) -> str:
         """The token/tag that ends reasoning content (e.g., '</think>')."""
 
-    _TOOL_CALL_START = "<tool_call>"
-    _TOOL_CALL_END = "</tool_call>"
-    _TOOL_CALL_CLOSED_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-    _TOOL_CALL_UNCLOSED_RE = re.compile(r"<tool_call>\s*[\{<].*$", re.DOTALL)
-
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
         # Streaming state — reset per request via reset_state()
         self._phase: str = "pre_think"  # "pre_think" | "thinking" | "content"
         self._content_started = False
         self._content_buffer = ""
-        # Tool call promotion state.
-        self._in_tool_call = False
-        self._tool_call_buffer = ""
         # Trailing text withheld because it might be the start of a tag.
         self._pending = ""
         # Template injected an open <think>: untagged output is reasoning.
@@ -95,8 +90,6 @@ class BaseThinkingReasoningParser(ReasoningParser):
         self._phase = "pre_think"
         self._content_started = False
         self._content_buffer = ""
-        self._in_tool_call = False
-        self._tool_call_buffer = ""
         self._pending = ""
 
     def _merge_pending(self, delta_text: str) -> str:
@@ -146,12 +139,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         if self.end_token in text:
             reasoning, content = self._extract_complete_reasoning(text)
-            return self._promote_tool_calls(reasoning, content)
+            return reasoning, content
 
         if self.start_token in text:
             _, _, reasoning = text.partition(self.start_token)
             reasoning = reasoning.strip() or None
-            return self._promote_tool_calls(reasoning, None)
+            return reasoning, None
 
         return None, model_output
 
@@ -187,7 +180,6 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         start_tok = self.start_token
         end_tok = self.end_token
-        tc_start = self._TOOL_CALL_START
 
         # ── Phase: pre_think ──────────────────────────────────────
         # Haven't seen a completed tag yet. Could be:
@@ -210,14 +202,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
                     content = after[eidx + len(end_tok) :]
                     return self._transition_to_content(reasoning, content)
 
-                if tc_start in after:
-                    tc_idx = after.find(tc_start)
-                    self._in_tool_call = True
-                    self._tool_call_buffer = after[tc_idx:]
-                    before = after[:tc_idx]
-                    return DeltaMessage(reasoning=before) if before else None
-
-                after = self._hold(after, (tc_start, end_tok))
+                after = self._hold(after, (end_tok,))
                 return DeltaMessage(reasoning=after) if after else None
 
             # Implicit mode: </think> completed without an explicit <think>.
@@ -232,28 +217,18 @@ class BaseThinkingReasoningParser(ReasoningParser):
             # non-parser path handles it. This path only activates when
             # a reasoning parser is explicitly configured.
             #
-            # <tool_call> is withheld alongside the tags: an explicit <think>
-            # can hand the rest of a delta straight to the thinking phase,
-            # which needs that marker intact to promote the block.
-            delta_text = self._hold(delta_text, (start_tok, end_tok, tc_start))
+            # An explicit <think> can hand the rest of a delta straight to the
+            # thinking phase, so a partial tag is withheld here too.
+            delta_text = self._hold(delta_text, (start_tok, end_tok))
             return DeltaMessage(reasoning=delta_text) if delta_text else None
 
         # ── Phase: thinking ───────────────────────────────────────
-        # Inside a reasoning block, waiting for end tag.
-        # Also detects <tool_call> blocks and promotes them to content.
+        # Inside a reasoning block, waiting for end tag. Everything up to it is
+        # reasoning, whatever it looks like: tool-call markup the model drafts in
+        # its thinking stays reasoning (see the module docstring).
         if self._phase == "thinking":
-            if self._in_tool_call:
-                return self._thinking_tool_call(previous_text, current_text, delta_text)
-
             delta_text = self._merge_pending(delta_text)
-            tc_idx = delta_text.find(tc_start)
             idx = delta_text.find(end_tok)
-
-            if tc_idx != -1 and (idx == -1 or tc_idx < idx):
-                self._in_tool_call = True
-                reasoning = delta_text[:tc_idx]
-                self._tool_call_buffer = delta_text[tc_idx:]
-                return DeltaMessage(reasoning=reasoning) if reasoning else None
 
             if idx != -1:
                 self._phase = "content"
@@ -261,7 +236,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 content = delta_text[idx + len(end_tok) :]
                 return self._transition_to_content(reasoning, content)
 
-            delta_text = self._hold(delta_text, (tc_start, end_tok))
+            delta_text = self._hold(delta_text, (end_tok,))
             return DeltaMessage(reasoning=delta_text) if delta_text else None
 
         # ── Phase: content ────────────────────────────────────────
@@ -308,7 +283,6 @@ class BaseThinkingReasoningParser(ReasoningParser):
         self, reasoning: str | None, content: str | None
     ) -> DeltaMessage | None:
         """Return a delta while suppressing leading post-transition think blocks."""
-        reasoning, content = self._promote_tool_calls(reasoning, content)
         content_msg = self._content_delta(content or "")
         extra_reasoning = content_msg.reasoning if content_msg else None
         final_content = content_msg.content if content_msg else None
@@ -369,95 +343,13 @@ class BaseThinkingReasoningParser(ReasoningParser):
             return DeltaMessage(reasoning="".join(reasoning_parts))
         return None
 
-    def _thinking_tool_call(
-        self,
-        previous_text: str,
-        current_text: str,
-        delta_text: str,
-    ) -> DeltaMessage | None:
-        """Handle streaming while inside a <tool_call> during thinking phase."""
-        tc_end = self._TOOL_CALL_END
-        end_tok = self.end_token
-
-        # The buffer already holds everything since the tool call opened, so a
-        # marker completing now is inside it — no need to search the whole
-        # accumulated output for it.
-        if tc_end in self._tool_call_buffer + delta_text:
-            self._tool_call_buffer += delta_text
-            idx = self._tool_call_buffer.find(tc_end)
-            promoted = self._tool_call_buffer[: idx + len(tc_end)]
-            remainder = self._tool_call_buffer[idx + len(tc_end) :]
-            self._tool_call_buffer = ""
-            self._in_tool_call = False
-            logger.warning("Promoted streaming tool_call block from reasoning")
-
-            if end_tok in remainder:
-                self._phase = "content"
-                eidx = remainder.find(end_tok)
-                reasoning = remainder[:eidx].strip() or None
-                after_think = remainder[eidx + len(end_tok) :]
-                content_msg = self._content_delta(after_think) if after_think else None
-                final_content = promoted + (
-                    (content_msg.content or "") if content_msg else ""
-                )
-                extra_r = content_msg.reasoning if content_msg else None
-                r_text = (reasoning or "") + (extra_r or "")
-                return DeltaMessage(
-                    content=final_content or None,
-                    reasoning=r_text or None,
-                )
-
-            tc_start = self._TOOL_CALL_START
-            if tc_start in remainder:
-                tc_idx = remainder.find(tc_start)
-                self._in_tool_call = True
-                self._tool_call_buffer = remainder[tc_idx:]
-                reasoning = remainder[:tc_idx].strip() or None
-                return DeltaMessage(content=promoted, reasoning=reasoning)
-
-            reasoning = remainder.strip() or None
-            return DeltaMessage(content=promoted, reasoning=reasoning)
-
-        if end_tok in self._tool_call_buffer + delta_text:
-            self._tool_call_buffer += delta_text
-            self._in_tool_call = False
-            self._phase = "content"
-            logger.warning(
-                "Promoted unclosed streaming tool_call "
-                "(think ended before tool_call closed)"
-            )
-            idx = self._tool_call_buffer.find(end_tok)
-            if idx >= 0:
-                promoted = self._tool_call_buffer[:idx]
-                after = self._tool_call_buffer[idx + len(end_tok) :]
-            else:
-                promoted = self._tool_call_buffer
-                after = ""
-            self._tool_call_buffer = ""
-            content_msg = self._content_delta(after) if after else None
-            final_content = (
-                promoted + (content_msg.content or "") if content_msg else promoted
-            )
-            return DeltaMessage(content=final_content or None)
-
-        self._tool_call_buffer += delta_text
-        return None
-
     def finalize_stream(self) -> DeltaMessage | None:
-        """Flush text buffered mid-stream: a tool call or a partial tag.
+        """Flush text withheld mid-stream because it might have been a tag.
 
         A generation that stops on a tag prefix — say the model's last token is
         a bare ``<`` — would otherwise drop those characters, since they were
         withheld pending a tag that never arrived.
         """
-        if self._in_tool_call and self._tool_call_buffer:
-            promoted = self._tool_call_buffer
-            self._tool_call_buffer = ""
-            self._in_tool_call = False
-            self._pending = ""
-            logger.warning("Promoted unclosed streaming tool_call at stream end")
-            return DeltaMessage(content=promoted)
-
         if self._pending:
             leftover = self._pending
             self._pending = ""
@@ -465,59 +357,3 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 return DeltaMessage(content=leftover)
             return DeltaMessage(reasoning=leftover)
         return None
-
-    @classmethod
-    def _promote_tool_calls(
-        cls, reasoning: str | None, content: str | None
-    ) -> tuple[str | None, str | None]:
-        if not reasoning or "<tool_call>" not in reasoning:
-            return reasoning, content
-
-        # Closed regex first: extract complete <tool_call>...</tool_call> blocks.
-        # Then unclosed regex on the already-stripped reasoning.
-        closed: list[str] = []
-
-        def _collect_closed(match):
-            closed.append(match.group(0))
-            return ""
-
-        cleaned = cls._TOOL_CALL_CLOSED_RE.sub(_collect_closed, reasoning)
-
-        unclosed_match = cls._TOOL_CALL_UNCLOSED_RE.search(cleaned)
-        unclosed_block = None
-        if unclosed_match:
-            unclosed_block = unclosed_match.group(0)
-            cleaned = cleaned[: unclosed_match.start()]
-
-        cleaned = cleaned.strip() or None
-        promoted_count = len(closed) + (1 if unclosed_block else 0)
-
-        if promoted_count == 0:
-            return reasoning, content
-
-        result_content = content or ""
-
-        if unclosed_block:
-            result_content = (
-                unclosed_block + "\n" + result_content
-                if result_content
-                else unclosed_block
-            )
-
-        if closed:
-            closed_text = "\n".join(closed)
-            result_content = (
-                result_content + "\n" + closed_text if result_content else closed_text
-            )
-
-        result_content = result_content.strip() or None
-
-        logger.warning(
-            "Promoted %d tool_call block(s) from reasoning to content "
-            "(%d closed, %d unclosed)",
-            promoted_count,
-            len(closed),
-            1 if unclosed_block else 0,
-        )
-
-        return cleaned, result_content

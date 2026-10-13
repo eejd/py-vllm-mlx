@@ -271,6 +271,12 @@ class TestResponsesStream:
             model="test-model",
             messages=[{"role": "user", "content": "weather?"}],
             stream=True,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {}},
+                }
+            ],
         )
         engine = _engine(_stream_output(BUFFERED_OUTPUT), _stream_output("", "stop"))
         monkeypatch.setattr(
@@ -345,6 +351,12 @@ class TestResponsesStream:
             model="test-model",
             messages=[{"role": "user", "content": "weather?"}],
             stream=True,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {}},
+                }
+            ],
         )
         engine = _engine(_stream_output(BUFFERED_OUTPUT), _stream_output("", "stop"))
         monkeypatch.setattr(
