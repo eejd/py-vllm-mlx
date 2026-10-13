@@ -126,29 +126,48 @@ _DEFAULT_SYSTEM_MESSAGE = re.compile(
     r"(\s*-?%\})",
     re.DOTALL,
 )
+# ``{%- if default_system_message != '' %}``, ``{%- if messages[0]['role'] != 'system'
+# and default_system_message != '' %}`` or a bare ``if default_system_message``: the
+# template renders the default only when it is not empty.
+_DEFAULT_GUARD = re.compile(
+    r"""\{%-?\s*(?:el)?if\b(?:[^%]*?\bdefault_system_message\s*!=\s*(?:''|"")"""
+    r"""|\s+default_system_message\s*(?:and\b[^%]*)?-?%\})"""
+)
 
 
-def template_without_default_system_message(template: str) -> tuple[str, int]:
-    """``template`` with its default system message emptied, and that message's length.
+def template_without_default_system_message(template: str) -> tuple[str, str]:
+    """``template`` with its default system message emptied, and the text dropped.
 
-    The length is 0, and the template returned as it is, when there is nothing to
-    drop: no ``default_system_message``, one that is already empty, or one that is not
-    a string literal this can find (then a warning says so: the default stays).
+    The text (as written in the template, escapes included) is "" and the template is
+    returned as it is when there is nothing to drop or it is not safe to drop:
+
+    - no ``default_system_message``, or one that is already empty;
+    - a template that renders the default whether or not it is empty (no
+      ``if default_system_message != ''`` around it, as in the Mistral Small 3.x
+      templates, which would then emit an empty ``[SYSTEM_PROMPT][/SYSTEM_PROMPT]``
+      block: a prompt mistral-common does not build either; those defaults carry the
+      real date, from ``strftime_now``, and stay);
+    - a default that is not one string literal this can find (a warning says so).
     """
     if "default_system_message" not in template:
-        return template, 0
+        return template, ""
+    if _DEFAULT_GUARD.search(template) is None:
+        logger.debug(
+            "the chat template renders default_system_message unconditionally: "
+            "emptying it would not give mistral-common's prompt, so it stays"
+        )
+        return template, ""
     match = _DEFAULT_SYSTEM_MESSAGE.search(template)
     if match is None:
         logger.warning(
             "the chat template mentions default_system_message but not as a string "
             "literal this server can empty: its default system prompt stays"
         )
-        return template, 0
-    length = len(match.group(2)) - 2
-    if length == 0:
-        return template, 0
-    emptied = template[: match.start(2)] + "''" + template[match.end(2) :]
-    return emptied, length
+        return template, ""
+    dropped = match.group(2)[1:-1]
+    if not dropped:
+        return template, ""
+    return template[: match.start(2)] + "''" + template[match.end(2) :], dropped
 
 
 def drop_default_system_prompt(target: Any, model_path: str | Path) -> bool:
@@ -157,29 +176,35 @@ def drop_default_system_prompt(target: Any, model_path: str | Path) -> bool:
     mistral-common renders no system prompt for a request that has none, but a
     ``default_system_message`` in the checkpoint's chat template is rendered as one.
     This empties it on ``target`` (a tokenizer or a processor) and on the tokenizer
-    inside a processor. Only ``tekken.json`` checkpoints, the ones mistral-common
-    serves, are touched; a request's own ``system`` message is rendered as before.
-    ``--chat-template`` replaces the template afterwards and so overrides this.
-    Returns whether a default was dropped.
+    inside a processor, when the template renders it only if it is not empty (see
+    ``template_without_default_system_message``). Only ``tekken.json`` checkpoints, the
+    ones mistral-common serves, are touched; a request's own ``system`` message is
+    rendered as before. ``--chat-template`` replaces the template afterwards and so
+    overrides this. Returns whether a default was dropped.
     """
     if not (Path(model_path) / "tekken.json").is_file():
         return False
     inner = getattr(target, "tokenizer", None)
-    dropped = 0
+    dropped = ""
     for holder in (target, inner) if inner is not None else (target,):
         template = getattr(holder, "chat_template", None)
         if not isinstance(template, str):
             continue
-        emptied, length = template_without_default_system_message(template)
-        if length:
+        emptied, text = template_without_default_system_message(template)
+        if text:
             holder.chat_template = emptied
-            dropped = max(dropped, length)
+            dropped = dropped or text
     if dropped:
         logger.info(
-            "Mistral tekken checkpoint: dropped the chat template's default system "
-            "prompt (%d characters) as mistral-common builds no system prompt for a "
-            "request without one; send a system message to set one",
-            dropped,
+            "Mistral tekken checkpoint %s: dropped the chat template's default system "
+            "prompt (%d characters, starting %r). A request without a system message "
+            "is now prompted without one, as mistral-common and vLLM's mistral "
+            "tokenizer mode do. To use that prompt, send it as the system message "
+            "(the model card's SYSTEM_PROMPT.txt) or serve the checkpoint's own "
+            "template with --chat-template",
+            Path(model_path).name,
+            len(dropped),
+            dropped[:60],
         )
     return bool(dropped)
 

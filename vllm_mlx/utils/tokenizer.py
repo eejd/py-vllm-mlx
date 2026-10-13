@@ -209,11 +209,18 @@ def _prefer_fast_mistral_tokenizer(model_name: str, tokenizer_config: dict | Non
 def _drop_mistral_default_system_prompt(model_name: str, tokenizer) -> None:
     """Render Mistral tekken checkpoints' prompts as mistral-common does.
 
-    See ``mistral_tokenizer.drop_default_system_prompt``.
+    See ``mistral_tokenizer.drop_default_system_prompt``. Only a template with a
+    ``default_system_message`` makes this locate the checkpoint's files.
     """
-    from mlx_lm.utils import _download
+    from .mistral_tokenizer import (
+        drop_default_system_prompt,
+        mentions_default_system_message,
+    )
 
-    from .mistral_tokenizer import drop_default_system_prompt
+    if not mentions_default_system_message(tokenizer):
+        return
+
+    from mlx_lm.utils import _download
 
     try:
         model_path = _download(model_name)

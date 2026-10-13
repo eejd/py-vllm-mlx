@@ -105,31 +105,39 @@ class TestTemplateEdit:
         ],
     )
     def test_any_string_literal_is_emptied(self, literal):
-        template = "{%- set default_system_message = " + literal + " %}\n{{ x }}"
+        template = (
+            "{%- set default_system_message = " + literal + " %}\n"
+            "{%- if default_system_message != '' %}{{ default_system_message }}"
+            "{%- endif %}"
+        )
 
-        emptied, length = mt.template_without_default_system_message(template)
+        emptied, dropped = mt.template_without_default_system_message(template)
 
-        assert emptied == "{%- set default_system_message = '' %}\n{{ x }}"
-        assert length == len(literal) - 2
+        assert emptied == template.replace(literal, "''", 1)
+        assert dropped == literal[1:-1]
 
     @pytest.mark.parametrize(
         "template",
         [
             "{{ x }}",
             "{%- set default_system_message = '' %}{{ x }}",
-            '{% set default_system_message = "" %}{{ x }}',
+            "{% set default_system_message = '' %}"
+            '{% if default_system_message != "" %}{{ x }}{% endif %}',
         ],
     )
     def test_nothing_to_drop_leaves_the_template_alone(self, template):
-        assert mt.template_without_default_system_message(template) == (template, 0)
+        assert mt.template_without_default_system_message(template) == (template, "")
 
     def test_a_default_that_is_not_a_literal_stays_and_is_reported(self, caplog):
-        template = "{% set default_system_message = prompts | join %}{{ x }}"
+        template = (
+            "{% set default_system_message = prompts | join %}"
+            "{% if default_system_message != '' %}{{ x }}{% endif %}"
+        )
 
         with caplog.at_level(logging.WARNING, logger=mt.logger.name):
             assert mt.template_without_default_system_message(template) == (
                 template,
-                0,
+                "",
             )
 
         assert "default system prompt stays" in caplog.text
@@ -148,6 +156,55 @@ class TestTemplateEdit:
             "{% if default_system_message != '' %}[SYSTEM_PROMPT]"
             "{{ default_system_message }}{% endif %}"
         )
+
+
+_DATA = Path(__file__).parent / "data"
+
+
+class TestUnguardedDefaults:
+    """Mistral Small 3.x templates: ``"..." + today + "..."`` rendered whether or not it
+    is empty. Emptying it would emit ``[SYSTEM_PROMPT][/SYSTEM_PROMPT]``, which
+    mistral-common does not build either, so these keep their default (with the real
+    date from ``strftime_now``) and nothing is logged above debug level.
+
+    The files are the ``chat_template`` of mistralai/Mistral-Small-3.1-24B-Instruct-2503
+    (``chat_template.json``) and mistralai/Mistral-Small-24B-Instruct-2501
+    (``tokenizer_config.json``), unedited.
+    """
+
+    @pytest.fixture(params=["mistral_small_3_1_2503", "mistral_small_2501"])
+    def small_template(self, request):
+        return (_DATA / f"{request.param}_chat_template.jinja").read_text()
+
+    def test_the_template_is_left_alone_without_a_warning(
+        self, small_template, caplog
+    ):
+        assert "default_system_message" in small_template
+
+        with caplog.at_level(logging.INFO, logger=mt.logger.name):
+            assert mt.template_without_default_system_message(small_template) == (
+                small_template,
+                "",
+            )
+
+        assert caplog.text == ""
+
+    def test_a_load_keeps_the_default_and_renders_the_real_date(
+        self, small_template, tmp_path, caplog
+    ):
+        import datetime
+
+        checkpoint = build_tekken_checkpoint(tmp_path / "small", small_template)
+        tokenizer = _fast(checkpoint)
+
+        with caplog.at_level(logging.INFO, logger=mt.logger.name):
+            assert not mt.drop_default_system_prompt(tokenizer, checkpoint)
+
+        text = _text(tokenizer, PLAIN)
+        assert tokenizer.chat_template == small_template
+        assert text.startswith("<s>[SYSTEM_PROMPT]You are Mistral Small 3")
+        assert datetime.date.today().isoformat() in text
+        assert caplog.text == ""
 
 
 class TestDropDefaultSystemPrompt:
@@ -197,6 +254,92 @@ class TestDropDefaultSystemPrompt:
 
         assert mt.drop_default_system_prompt(tokenizer, checkpoint)
         assert not mt.drop_default_system_prompt(tokenizer, checkpoint)
+
+    def test_the_log_says_what_was_dropped_and_how_to_get_it_back(
+        self, checkpoint, caplog
+    ):
+        """A Reasoning checkpoint's default is its thinking-format prompt: the operator
+        must be able to see from the log that it is gone and what to do about it."""
+        template = TEMPLATE_WITH_DEFAULT.replace(
+            DEFAULT, "# HOW YOU SHOULD THINK AND ANSWER\\n\\nFirst draft your thinking."
+        )
+        tokenizer = SimpleNamespace(chat_template=template)
+
+        with caplog.at_level(logging.INFO, logger=mt.logger.name):
+            assert mt.drop_default_system_prompt(tokenizer, checkpoint)
+
+        message = caplog.records[-1].getMessage()
+        assert checkpoint.name in message
+        assert "'# HOW YOU SHOULD THINK AND ANSWER" in message
+        assert "SYSTEM_PROMPT.txt" in message
+        assert "--chat-template" in message
+        assert "send it as the system message" in message
+
+    def test_a_default_dropped_from_one_holder_is_still_reported(
+        self, checkpoint, caplog
+    ):
+        inner = SimpleNamespace(chat_template=TEMPLATE_WITH_DEFAULT)
+        processor = SimpleNamespace(chat_template=None, tokenizer=inner)
+
+        with caplog.at_level(logging.INFO, logger=mt.logger.name):
+            assert mt.drop_default_system_prompt(processor, checkpoint)
+
+        assert "{today}" not in inner.chat_template
+        assert "dropped the chat template's default system prompt" in caplog.text
+
+
+_OFFICIAL = {
+    # name: (what the default starts with)
+    "ministral_3_3b_instruct_2512": "You are Ministral-3-3B-Instruct-2512",
+    "ministral_3_3b_reasoning_2512": "# HOW YOU SHOULD THINK AND ANSWER",
+    "devstral_small_2_2512": "You are operating as and within Mistral Vibe",
+}
+
+
+class TestOfficialTemplates:
+    """The ``chat_template.jinja`` of the mistralai repos, unedited (they guard the
+    default as ``messages[0]['role'] != 'system' and default_system_message != ''``,
+    unlike the mlx-community Ministral file). Rendered through a synthetic tekken
+    checkpoint, the ids equal mistral-common's for every conversation once the default
+    is dropped, and differ for those without a system message before."""
+
+    @pytest.fixture(params=sorted(_OFFICIAL))
+    def official(self, request, tmp_path):
+        name = request.param
+        template = (_DATA / f"mistral_{name}_official_chat_template.jinja").read_text()
+        checkpoint = build_tekken_checkpoint(tmp_path / name, template)
+        return name, checkpoint, mt.reference_tokenizer(checkpoint)
+
+    def _equal(self, tokenizer, reference, case):
+        messages, tools = DEVSTRAL_CASES[case]
+        kwargs = {"tools": tools} if tools else {}
+        return string_pipeline_ids(
+            tokenizer, _server_shaped(messages), enable_thinking=True, **kwargs
+        ) == reference_ids(reference, messages, **kwargs)
+
+    def test_the_default_is_a_difference_before(self, official):
+        _, checkpoint, reference = official
+        tokenizer = _fast(checkpoint)
+
+        assert not self._equal(tokenizer, reference, "plain")
+        assert self._equal(tokenizer, reference, "system")
+
+    @pytest.mark.parametrize("case", sorted(DEVSTRAL_CASES))
+    def test_every_conversation_matches_mistral_common_after(self, official, case):
+        _, checkpoint, reference = official
+        tokenizer = _fast(checkpoint)
+
+        assert mt.drop_default_system_prompt(tokenizer, checkpoint)
+
+        assert self._equal(tokenizer, reference, case)
+
+    def test_the_log_shows_the_start_of_the_dropped_default(self, official, caplog):
+        name, checkpoint, _ = official
+
+        with caplog.at_level(logging.INFO, logger=mt.logger.name):
+            assert mt.drop_default_system_prompt(_fast(checkpoint), checkpoint)
+
+        assert f"starting '{_OFFICIAL[name]}" in caplog.text
 
 
 class TestLoadSites:
@@ -303,6 +446,34 @@ class TestLoadSites:
         monkeypatch.setattr(mlx_vlm.utils, "get_model_path", forbidden)
 
         MLXMultimodalLM("plain-model").load()
+
+    def test_llm_path_without_a_default_never_looks_for_its_files(self, monkeypatch):
+        import mlx_lm.utils
+
+        from vllm_mlx.utils.tokenizer import _drop_mistral_default_system_prompt
+
+        calls = []
+        monkeypatch.setattr(
+            mlx_lm.utils, "_download", lambda name: calls.append(name) or name
+        )
+
+        _drop_mistral_default_system_prompt(
+            "plain-model", SimpleNamespace(chat_template="{{ messages }}")
+        )
+
+        assert calls == []
+
+    def test_llm_path_with_a_default_locates_the_files(self, checkpoint, monkeypatch):
+        import mlx_lm.utils
+
+        from vllm_mlx.utils.tokenizer import _drop_mistral_default_system_prompt
+
+        monkeypatch.setattr(mlx_lm.utils, "_download", lambda name: checkpoint)
+        tokenizer = SimpleNamespace(chat_template=TEMPLATE_WITH_DEFAULT)
+
+        _drop_mistral_default_system_prompt("tekken-test", tokenizer)
+
+        assert "{today}" not in tokenizer.chat_template
 
 
 _HUBS = [
