@@ -62,7 +62,6 @@ def test_model_stream_generate_passes_num_draft_tokens():
     model.model = object()
     tokenizer = MagicMock()
     tokenizer.encode.return_value = [1, 2, 3]
-    tokenizer.bos_token = None
     model.tokenizer = tokenizer
 
     captured_kwargs = {}
