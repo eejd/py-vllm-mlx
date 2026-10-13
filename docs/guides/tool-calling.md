@@ -264,7 +264,9 @@ parser (a port of vLLM's, same accepted language) reads it:
   numbers, `True`/`False`/`None` or `true`/`false`/`null`, lists, tuples/sets as lists,
   dicts with literal keys); a positional argument, `**kwargs`, a variable, an
   expression, an empty list or any other element leaves the **whole** answer in
-  `content`; dotted names (`a.b(x=1)`) are kept dotted;
+  `content`; dotted names (`a.b(x=1)`) are kept dotted; a Python comment between two
+  calls or before the `]` also leaves it in `content` (the bracket scan does not read
+  comments);
 * text after the closing `]` is returned as `content` next to the calls;
 * streaming withholds a leading `[...` until it is known to be a call list or not: the
   calls of a list are emitted once, with their absolute index, when its `]` arrives

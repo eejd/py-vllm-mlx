@@ -56,7 +56,12 @@ def _non_streaming(text):
     return calls, result.content
 
 
-def _stream(text, size, parser=None):
+def _stream_without_finalize(text):
+    """One character per delta, and no end-of-response hook: what streaming alone does."""
+    return _stream(text, 1, finalize=False)
+
+
+def _stream(text, size, parser=None, finalize=True):
     """Stream ``text`` in ``size``-character deltas the way the server does.
 
     Returns ``(calls, content, emissions)``: calls by absolute index, the content
@@ -68,7 +73,7 @@ def _stream(text, size, parser=None):
     for n, delta in enumerate(deltas):
         previous, acc = acc, acc + delta
         outs = [parser.extract_tool_calls_streaming(previous, acc, delta)]
-        if n == len(deltas) - 1:
+        if finalize and n == len(deltas) - 1:
             outs.append(parser.finalize_streaming(acc))
         for out in outs:
             for tc in (out or {}).get("tool_calls", []):
@@ -262,6 +267,19 @@ class TestCallShape:
             "[f(*args)]",
             "[f(**kwargs)]",
             "[f(k=1, **kwargs)]",
+            "[f(**{'a': 1})]",  # a literal spread: its key is None, not a name
+            "[f(**{})]",
+            "[a..b(x=1)]",  # callee shapes
+            "[a.(x=1)]",
+            "[.a(x=1)]",
+            "[a. 1b(x=1)]",
+            "[1a(x=1)]",
+            "[a b(x=1)]",
+            "[a.b c(x=1)]",
+            "[a.b-c(x=1)]",
+            "[f(a=1) # note\n]",  # a comment between the call and the bracket
+            "[f(a=1, # it's\n b=2)]",  # a quote in a comment opens a string
+            "[f(a=1) # note\n, g()]",
             "[f(from=1)]",  # reserved word as keyword
             "[]",
             "[ ]",
@@ -313,6 +331,11 @@ class TestCallShape:
     def test_python_formatting_is_accepted(self, text, size):
         calls, content = _both(text, size)
         assert [c[0] for c in calls] and content is None
+
+    @pytest.mark.parametrize("size", [1, 7, 100_000])
+    def test_a_comment_inside_the_arguments_is_python_and_accepted(self, size):
+        calls, content = _both("[f(a=1, # note\n b=2)]", size)
+        assert calls == [("f", {"a": 1, "b": 2})] and content is None
 
     @pytest.mark.parametrize("size", [1, 100_000])
     @pytest.mark.parametrize(
@@ -449,6 +472,22 @@ class TestStreaming:
         # released at the ``:``, not at the end of the response
         assert "".join(got) == text
         assert got[-1] != "" or size == 1
+
+    @pytest.mark.parametrize(
+        "text",
+        ["[a b", "[a.(", "[a..", "[1a", "[a. 1", "[a.b c", "[.", "[a-", "[Hi!"],
+    )
+    def test_text_that_cannot_be_a_callee_is_released_without_waiting_for_the_end(
+        self, text
+    ):
+        # no finalize call: it is released by the character that rules it out
+        calls, content, _ = _stream_without_finalize(text)
+        assert calls == {} and content == text
+
+    @pytest.mark.parametrize("text", ["[a", "[a ", "[a.", "[a . b", "[a.b  ", "[_x1"])
+    def test_a_possible_callee_is_withheld_until_the_end_decides(self, text):
+        calls, content, _ = _stream_without_finalize(text)
+        assert calls == {} and content == ""
 
     @pytest.mark.parametrize(
         "text",
@@ -681,3 +720,25 @@ class TestCost:
         assert content == ""
         # re-reading the open call on every delta would take minutes
         assert time.perf_counter() - started < 10
+
+    def test_an_endless_identifier_after_the_bracket_costs_each_delta_its_own_length(
+        self,
+    ):
+        # re-reading the identifier on every delta is quadratic: 11 s for 100k characters
+        for text in ("[" + "a" * 100_000, "[" + "a . " * 30_000, "[" + "a.b" * 30_000):
+            parser = _parser()
+            started = time.perf_counter()
+            acc = ""
+            for ch in text:
+                previous, acc = acc, acc + ch
+                assert parser.extract_tool_calls_streaming(previous, acc, ch) is None
+            assert parser.finalize_streaming(acc) == {"content": text}
+            assert time.perf_counter() - started < 3
+
+    def test_a_string_full_of_quotes_is_scanned_without_copying_the_tail(self):
+        body = "'a" * 500_000
+        text = f"[f(x='''{body}''')]"
+        started = time.perf_counter()
+        assert _non_streaming(text)[0] == [("f", {"x": body})]
+        # slicing the rest of the text at every quote takes seconds
+        assert time.perf_counter() - started < 1.5

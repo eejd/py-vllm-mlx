@@ -20,7 +20,11 @@ Semantics follow vLLM's ``vllm/tool_parsers/pythonic_tool_parser.py`` (v0.31):
   vLLM's shared helper adds on top (tuples and sets become lists, an f-string without
   placeholders is a string, ``-1``/``+1`` are numbers; bytes, complex numbers,
   ``...``, names, operators and f-string placeholders are rejected);
-* dotted names (``a.b.c(...)``) keep the dotted form.
+* dotted names (``a.b.c(...)``) keep the dotted form;
+* Python comments are not understood by the bracket scan: a comment between two calls
+  or before the closing ``]`` leaves the response as content (vLLM's non-streaming regex
+  rejects it too), and one inside a call's arguments is accepted unless it holds a
+  quote or bracket.
 
 Where this port differs from vLLM, on purpose:
 
@@ -50,7 +54,6 @@ Where this port differs from vLLM, on purpose:
 
 import ast
 import json
-import re
 import warnings
 from collections.abc import Sequence
 from typing import Any
@@ -66,14 +69,12 @@ from .lfm2_tool_parser import _call_name
 # Python's own inter-token whitespace (``str.isspace`` also accepts NBSP and friends,
 # which Python rejects).
 _WS = " \t\r\n\f"
-_WS_CLASS = "[ \\t\\r\\n\\f]"
-# A callee: ``name`` or ``a.b.c``. Possessive quantifiers keep the match linear.
-_NAME = r"[^\W\d]\w*+"
-_CALLEE = re.compile(rf"{_NAME}(?:{_WS_CLASS}*+\.{_WS_CLASS}*+{_NAME})*+\Z")
-# What a callee can still become: the same, optionally ending in a dot.
-_CALLEE_PREFIX = re.compile(
-    rf"{_NAME}(?:{_WS_CLASS}*+\.{_WS_CLASS}*+{_NAME})*+{_WS_CLASS}*+(?:\.{_WS_CLASS}*+)?\Z"
-)
+
+
+def _is_word(char: str) -> bool:
+    """``\\w`` for one character: letters, digits and ``_`` of any script."""
+    return char.isalnum() or char == "_"
+
 
 _JSON_NAME_LITERALS = {"null": None, "true": True, "false": False}
 _CLOSERS = {")": "(", "]": "[", "}": "{"}
@@ -166,6 +167,7 @@ class _ListScanner:
         self._phase = "start"  # start | elem | sep | callee | args
         self._pos = 0
         self._callee = 0  # offset of the callee being read
+        self._cstate = "start"  # callee: start | name | gap | dot
         self._stack: list[str] = []
         self._string: tuple[str, bool] | None = None  # (quote, triple)
 
@@ -202,16 +204,40 @@ class _ListScanner:
                     # ``[]`` is not a call list; a trailing comma is legal Python.
                     return self._finish(i + 1) if self.calls else self._fail()
                 else:
-                    self._callee, self._phase = i, "callee"
+                    self._callee, self._cstate, self._phase = i, "start", "callee"
             elif phase == "callee":
-                paren = text.find("(", self._callee)
-                if paren == -1:
-                    if _CALLEE_PREFIX.match(text, self._callee):
-                        return _INCOMPLETE
-                    return self._fail()
-                if not _CALLEE.match(text[self._callee : paren].rstrip(_WS)):
-                    return self._fail()
-                self._pos, self._phase = paren, "args"
+                # ``name`` or ``a.b.c`` (blanks allowed around the dots) up to the
+                # ``(``: one character at a time, resumed where the last delta ended,
+                # so an endless identifier costs a delta only its own length.
+                i, state = self._pos, self._cstate
+                opened = False
+                while i < n:
+                    char = text[i]
+                    if char == "(":
+                        if state not in ("name", "gap"):
+                            return self._fail()
+                        opened = True
+                        break
+                    if char in _WS:
+                        if state == "name":
+                            state = "gap"
+                        elif state == "start":
+                            return self._fail()
+                    elif char == ".":
+                        if state not in ("name", "gap"):
+                            return self._fail()
+                        state = "dot"
+                    elif _is_word(char):
+                        if state == "gap" or (state != "name" and char.isdecimal()):
+                            return self._fail()
+                        state = "name"
+                    else:
+                        return self._fail()
+                    i += 1
+                self._pos, self._cstate = i, state
+                if not opened:
+                    return _INCOMPLETE
+                self._phase = "args"
                 self._stack, self._string = [], None
             else:  # args
                 end = self._scan_args(text)
@@ -249,7 +275,7 @@ class _ListScanner:
                 elif triple:
                     if text.startswith(quote * 3, i):
                         string, i = None, i + 3
-                    elif char == quote and text[i:] == quote * (n - i):
+                    elif char == quote and n - i < 3 and text[i:] == quote * (n - i):
                         break  # one or two quotes: maybe the end of the string
                     else:
                         i += 1

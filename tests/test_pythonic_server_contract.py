@@ -314,12 +314,16 @@ async def test_the_finishing_delta_may_close_the_list(monkeypatch, site):
 
 @pytest.mark.parametrize("site", SITES)
 @pytest.mark.parametrize("finish_on_last_delta", [False, True])
+@pytest.mark.parametrize("size", [5, len(CALL) + 3, 10_000])
 @pytest.mark.anyio
 async def test_text_after_the_list_is_content_next_to_the_calls(
-    monkeypatch, site, finish_on_last_delta
+    monkeypatch, site, finish_on_last_delta, size
 ):
+    # size len(CALL)+3 and 10_000 put the tail in the delta that closes the list; the
+    # server then sends that text as its own chunk ahead of the calls (the order of
+    # chunks is the server's; the aggregate equals the non-streaming content)
     engine = _engine(
-        _chunked(CALL + "\n\nChecking now.", 5),
+        _chunked(CALL + "\n\nChecking now.", size),
         finish_on_last_delta=finish_on_last_delta,
     )
 
