@@ -8,6 +8,9 @@ implemented``. These tests drive the worker through that same resolution.
 """
 
 import importlib.util
+import json
+import os
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +21,19 @@ needs_vllm_and_torch = pytest.mark.skipif(
     reason="vllm and torch are not installed",
 )
 pytestmark = needs_vllm_and_torch
+
+_TINY_LLAMA_CONFIG = {
+    "architectures": ["LlamaForCausalLM"],
+    "model_type": "llama",
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "vocab_size": 100,
+    "max_position_embeddings": 256,
+    "torch_dtype": "float16",
+}
 
 
 def _layout_api():
@@ -97,6 +113,7 @@ def test_initialize_from_config_adopts_the_resolved_layout(worker):
 
 
 def test_initialize_from_config_without_a_layout_leaves_it_unset(worker):
+    _layout_api()
     _rpc(worker, "initialize_from_config", SimpleNamespace(num_blocks=3))
     assert worker.cache_config.kv_cache_layout is None
 
@@ -143,9 +160,15 @@ def test_worker_resolves_every_engine_core_rpc(method):
     from vllm.v1.worker.worker_base import WorkerBase
     from vllm_mlx_plugin.worker import MLXWorker
 
+    if not hasattr(MLXWorker, method) and not hasattr(WorkerBase, method):
+        # Defined only by a newer WorkerBase (set_kv_cache_layout and
+        # supports_draft_weight_updates arrived after 0.27): MLXWorker inherits
+        # them there, and the engine of an older vLLM never calls them.
+        pytest.skip(f"this vLLM's WorkerBase predates {method}")
     assert callable(getattr(MLXWorker, method, None))
-    # WorkerBase leaves these as ``raise NotImplementedError``: the worker
-    # must supply its own.
+    # WorkerBase leaves these as ``raise NotImplementedError`` or as a default
+    # that does not fit MLX (``synchronize_device`` waits on torch.accelerator,
+    # which does not cover MLX's queue): the worker must supply its own.
     if method in {
         "get_kv_cache_spec",
         "compile_or_warm_up_model",
@@ -155,5 +178,56 @@ def test_worker_resolves_every_engine_core_rpc(method):
         "remove_lora",
         "pin_lora",
         "list_loras",
+        "synchronize_device",
     }:
-        assert getattr(MLXWorker, method) is not getattr(WorkerBase, method)
+        assert getattr(MLXWorker, method) is not getattr(WorkerBase, method, None)
+
+
+def test_synchronize_device_waits_on_mlx(worker, monkeypatch):
+    # The engine core's pause path calls this RPC (EngineCore._finish_pause).
+    mx = pytest.importorskip("mlx.core")
+    calls = []
+    monkeypatch.setattr(mx, "synchronize", lambda *a, **k: calls.append(1))
+
+    assert _rpc(worker, "synchronize_device") is None
+    assert calls == [1]
+
+
+def test_sample_tokens_hands_the_grammar_output_to_the_runner(worker):
+    seen = []
+    worker.model_runner = SimpleNamespace(
+        sample_tokens=lambda grammar_output: seen.append(grammar_output) or "output"
+    )
+    grammar = object()
+
+    assert _rpc(worker, "sample_tokens", grammar) == "output"
+    assert seen == [grammar]
+
+
+def test_constructor_runs_workerbase_init_and_keeps_the_ranks():
+    """MLXWorker(...) as ``WorkerWrapperBase.init_worker`` builds it."""
+    from vllm.config import ModelConfig, VllmConfig
+    from vllm_mlx_plugin.worker import MLXWorker
+
+    with tempfile.TemporaryDirectory() as model_dir:
+        with open(os.path.join(model_dir, "config.json"), "w") as f:
+            json.dump(_TINY_LLAMA_CONFIG, f)
+        model_config = ModelConfig(
+            model=model_dir, tokenizer=model_dir, skip_tokenizer_init=True
+        )
+        vllm_config = VllmConfig(model_config=model_config)
+
+        w = MLXWorker(
+            vllm_config,
+            local_rank=1,
+            rank=3,
+            distributed_init_method="file:///unused",
+            is_driver_worker=False,
+        )
+
+    assert (w.rank, w.local_rank, w.is_driver_worker) == (3, 1, False)
+    assert w.model_config is model_config
+    assert w.cache_config is vllm_config.cache_config
+    # WorkerBase.__init__ records the rank on the shared parallel config.
+    assert w.parallel_config.rank == 3
+    assert w.model_runner is None

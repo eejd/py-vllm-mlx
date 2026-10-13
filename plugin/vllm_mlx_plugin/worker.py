@@ -252,10 +252,14 @@ class MLXWorker(WorkerBase):
         """vLLM >= 0.27 worker hook; MLX keeps no vLLM-side multimodal cache."""
 
     def sample_tokens(self, grammar_output=None):
-        """vLLM >= 0.27 two-phase step: return the output stashed by execute_model."""
+        """vLLM >= 0.27 two-phase step: sample what execute_model scheduled.
+
+        ``grammar_output`` (structured outputs) is applied to the logits of
+        the requests it names before they are sampled.
+        """
         if self.model_runner is None:
             return None
-        return self.model_runner.take_pending_output()
+        return self.model_runner.sample_tokens(grammar_output)
 
     # -- vLLM >= 0.27 worker RPC surface (collective_rpc targets) ----------
     def get_supported_tasks(self) -> tuple:
