@@ -1592,7 +1592,17 @@ class SimpleEngine(BaseEngine):
                             if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
                             else prompt_tokens
                         )
-                        completion_tokens += 1
+                        # mlx-vlm streams one chunk per token and then a last chunk with
+                        # no new token that flushes the detokenizer (the text of the
+                        # final token(s)) and carries the finish reason. Stopping at
+                        # the cap on the last token chunk dropped that text.
+                        vlm_stream = self._is_mllm and isinstance(
+                            getattr(chunk, "generation_tokens", None), int
+                        )
+                        if vlm_stream:
+                            completion_tokens = chunk.generation_tokens
+                        else:
+                            completion_tokens += 1
                         if request_id in self._active_requests:
                             self._active_requests[request_id].update(
                                 {
@@ -1604,10 +1614,13 @@ class SimpleEngine(BaseEngine):
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                         accumulated_text += new_text
 
-                        finished = (
-                            getattr(chunk, "finished", False)
-                            or completion_tokens >= max_tokens
-                        )
+                        if vlm_stream:
+                            finished = getattr(chunk, "finish_reason", None) is not None
+                        else:
+                            finished = (
+                                getattr(chunk, "finished", False)
+                                or completion_tokens >= max_tokens
+                            )
                         finish_reason = None
                         if finished:
                             finish_reason = getattr(chunk, "finish_reason", None)

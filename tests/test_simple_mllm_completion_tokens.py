@@ -295,7 +295,14 @@ def wrapper(monkeypatch):
     models.cache = cache
     video = ModuleType("mlx_vlm.video_generate")
     video.generate = generate
-    for module in (vlm, prompt_utils, models, cache, video):
+    # Where the wrapper tokenizes the prompt itself (#94) mlx-vlm's ``prepare_inputs``
+    # runs before ``generate``; without a stub the real one loads the fake image.
+    utils = ModuleType("mlx_vlm.utils")
+    utils.prepare_inputs = lambda *a, **k: {
+        "input_ids": [[1, 2, 3]],
+        "attention_mask": [[1, 1, 1]],
+    }
+    for module in (vlm, prompt_utils, models, cache, video, utils):
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
     model = MLXMultimodalLM("test-model", enable_cache=False)
@@ -336,3 +343,100 @@ def test_wrapper_routes_report_the_finish_reason_of_mlx_vlm(wrapper, route, fini
         result = list(wrapper.stream_chat(messages=_IMAGE_CHAT))[-1]
 
     assert result.finish_reason == finish
+
+
+class _RawModel(_Model):
+    """``model.stream_generate`` (raw ``/v1/completions``) yielding mlx-vlm chunks."""
+
+    def __init__(self, chunks):
+        super().__init__(chunks)
+        self.calls = []
+
+    def stream_generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self._chunks)
+
+
+def _drive_raw(engine, max_tokens):
+    async def scenario():
+        return [c async for c in engine.stream_generate("p", max_tokens=max_tokens)]
+
+    try:
+        return asyncio.run(scenario())
+    finally:
+        if engine._generation_executor is not None:
+            engine._generation_executor.shutdown(wait=True)
+
+
+def _flush_chunks(n_content, *, flush_text, flush_count, finish):
+    """mlx-vlm's sequence where the detokenizer still holds text after the last token."""
+    chunks = _mlx_vlm_chunks(n_content, flush_count=flush_count, finish=finish)
+    chunks[-1].text = flush_text
+    return chunks
+
+
+class TestRawCompletionsStream:
+    """``SimpleEngine.stream_generate`` on an MLLM: the flush chunk is part of the reply.
+
+    At ``max_tokens`` the engine stopped on the last token chunk, one chunk before
+    mlx-vlm's flush chunk, so the text still buffered in the detokenizer (the last
+    word piece) never reached the client: Gemma-3 cap 3 answered ``, in`` where
+    the batched engine answered ``, in a``.
+    """
+
+    def test_text_held_by_the_detokenizer_at_the_cap_is_delivered(self, monkeypatch):
+        chunks = _flush_chunks(3, flush_text="LAST", flush_count=3, finish="length")
+        engine = _engine(_RawModel(chunks), monkeypatch)
+
+        outputs = _drive_raw(engine, max_tokens=3)
+
+        assert outputs[-1].text == "t0 t1 t2 LAST"
+        assert outputs[-1].new_text == "LAST"
+
+    def test_the_cap_is_reported_as_length_with_exactly_the_cap_tokens(
+        self, monkeypatch
+    ):
+        chunks = _flush_chunks(3, flush_text="LAST", flush_count=3, finish="length")
+        engine = _engine(_RawModel(chunks), monkeypatch)
+
+        outputs = _drive_raw(engine, max_tokens=3)
+
+        assert outputs[-1].finish_reason == "length"
+        assert outputs[-1].completion_tokens == 3
+        # Only the flush chunk ends the request.
+        assert [o.finished for o in outputs] == [False, False, False, True]
+
+    def test_natural_stop_counts_the_stop_token_and_keeps_the_flush_text(
+        self, monkeypatch
+    ):
+        chunks = _flush_chunks(5, flush_text="END", flush_count=6, finish="stop")
+        engine = _engine(_RawModel(chunks), monkeypatch)
+
+        outputs = _drive_raw(engine, max_tokens=16)
+
+        assert outputs[-1].text.endswith("t4 END")
+        assert outputs[-1].finish_reason == "stop"
+        assert outputs[-1].completion_tokens == 6
+
+    def test_a_stop_token_only_reply(self, monkeypatch):
+        chunks = _flush_chunks(0, flush_text="", flush_count=1, finish="stop")
+        engine = _engine(_RawModel(chunks), monkeypatch)
+
+        (final,) = _drive_raw(engine, max_tokens=16)
+
+        assert (final.text, final.completion_tokens, final.finish_reason) == (
+            "",
+            1,
+            "stop",
+        )
+
+    def test_a_stream_without_counts_still_stops_at_the_cap(self, monkeypatch):
+        # A custom ``stream_generate`` (no ``generation_tokens``) is counted per chunk.
+        chunks = [SimpleNamespace(text=f"w{i}") for i in range(10)]
+        engine = _engine(_RawModel(chunks), monkeypatch)
+
+        outputs = _drive_raw(engine, max_tokens=3)
+
+        assert outputs[-1].completion_tokens == 3
+        assert outputs[-1].finish_reason == "length"
+        assert outputs[-1].text == "w0w1w2"
