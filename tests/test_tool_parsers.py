@@ -673,11 +673,14 @@ class TestLlamaToolParser:
 
         assert parser.finalize_streaming(text) == {"content": text}
 
-    def test_streaming_finalizer_hides_incomplete_tagged_call(self, parser):
-        """Incomplete protocol markup must not leak when the stream ends."""
+    def test_streaming_finalizer_releases_incomplete_tagged_call_as_content(
+        self, parser
+    ):
+        """A tagged call cut off at the end of generation can never complete: its text
+        is content, without the control token (#67)."""
         text = '<|python_tag|>{"name": "read"'
 
-        assert parser.finalize_streaming(text) == {"content": ""}
+        assert parser.finalize_streaming(text) == {"content": '{"name": "read"'}
 
     def test_streaming_plain_text_streams_as_content(self, parser):
         """Plain assistant text without a tool marker must stream per chunk
@@ -746,26 +749,29 @@ class TestLlamaToolParser:
     ]
 
     @pytest.mark.parametrize("text", INCOMPLETE_CALLS)
-    def test_an_incomplete_tagged_call_is_hidden_without_leaking_the_tag(
+    def test_an_incomplete_tagged_call_at_eof_is_content_without_the_tag(
         self, parser, text
     ):
-        # protocol markup cut off at EOF is not content (the existing streaming contract,
-        # test_streaming_finalizer_hides_incomplete_tagged_call); non-streaming agrees
+        # extract_tool_calls only sees a finished response, so the call can never complete
         result = parser.extract_tool_calls(text)
 
-        assert not result.tools_called
-        assert result.content == ""
+        assert not result.tools_called and result.tool_calls == []
+        assert result.content == text[len("<|python_tag|>") :]
 
     @pytest.mark.parametrize("text", INCOMPLETE_CALLS)
-    def test_streaming_an_incomplete_tagged_call_is_hidden_at_eof(self, parser, text):
+    def test_streaming_an_incomplete_tagged_call_is_held_back_then_released_at_eof(
+        self, parser, text
+    ):
         chunks = ["<|python_tag|>", text[len("<|python_tag|>") :]]
         events = self._stream(parser, chunks)
-        final = parser.finalize_streaming("".join(chunks))
-        if final:
-            events.append(final)
 
-        assert "".join(e.get("content", "") for e in events) == ""
-        assert not any("tool_calls" in e for e in events)
+        # generation still running: nothing of the call is shown
+        assert events == []
+
+        final = parser.finalize_streaming("".join(chunks))
+
+        assert final == {"content": text[len("<|python_tag|>") :]}
+        assert parser.extract_tool_calls(text).content == final["content"]
 
     @pytest.mark.parametrize(
         "chunks",
@@ -831,6 +837,148 @@ class TestLlamaToolParser:
         assert "".join(e.get("content", "") for e in events) == ""
         calls = [c for e in events for c in e.get("tool_calls", [])]
         assert [c["function"]["name"] for c in calls] == ["f"]
+
+    @pytest.mark.parametrize("size", [1, 5, 10_000])
+    @pytest.mark.parametrize(
+        "key_order",
+        [("name", "parameters"), ("parameters", "name"), ("arguments", "name")],
+    )
+    def test_every_prefix_of_a_call_is_pending_mid_stream_and_content_once_final(
+        self, parser, size, key_order
+    ):
+        # The final-vs-pending contract, swept over every cut point of a valid call: while
+        # generation runs the prefix is hidden; once it ended there the prefix is content
+        # (tag stripped) in both modes; the whole call is a call.
+        tag = "<|python_tag|>"
+        params = {"s": 'caf\u00e9 "q" \\ \n', "n": -12.5e-3, "xs": [1, {"k": None}]}
+        call = {k: (params if k != "name" else "f") for k in key_order}
+        text = tag + json.dumps(call)
+
+        for cut in range(len(tag), len(text)):
+            prefix = text[:cut]
+            body = prefix[len(tag) :]
+            parser.reset()
+            chunks = [tag] + [
+                prefix[i : i + size] for i in range(len(tag), len(prefix), size)
+            ]
+            events = self._stream(parser, chunks)
+            assert events == [], (prefix, events)  # pending: nothing shown yet
+
+            final = parser.finalize_streaming(prefix)
+            streamed = "".join(e.get("content", "") for e in events + [final])
+            result = parser.extract_tool_calls(prefix)
+            assert streamed == body == result.content, prefix
+            assert not result.tools_called and result.tool_calls == [], prefix
+
+        events = self._stream(parser, [tag] + [text[len(tag) :]])
+        assert parser.finalize_streaming(text) is None
+        assert "".join(e.get("content", "") for e in events) == ""
+        assert [c["function"]["name"] for e in events for c in e["tool_calls"]] == ["f"]
+        assert parser.extract_tool_calls(text).tools_called
+
+    # The 1B model of #67 closes the envelope one brace short; the same payload with the
+    # brace is the OpenAI ``{"type": "function", "function": {...}}`` shape, which this
+    # parser (like upstream vLLM's llama3_json) does not accept as a call.
+    ONE_B_PAYLOAD = (
+        '{"type": "function", "function": {"name": "echo_args", '
+        '"parameters": {"text": "hello", "n": 3}}'
+    )
+
+    def test_observed_1b_payload_missing_its_last_brace_is_content_in_both_modes(
+        self, parser
+    ):
+        text = "<|python_tag|>" + self.ONE_B_PAYLOAD
+
+        result = parser.extract_tool_calls(text)
+        assert not result.tools_called and result.tool_calls == []
+        assert result.content == self.ONE_B_PAYLOAD
+
+        chunks = ["<|python_tag|>", self.ONE_B_PAYLOAD[:30], self.ONE_B_PAYLOAD[30:]]
+        events = self._stream(parser, chunks)
+        assert events == []
+        final = parser.finalize_streaming("".join(chunks))
+        assert final == {"content": self.ONE_B_PAYLOAD}
+
+    def test_observed_1b_payload_with_the_brace_added_is_still_not_a_call(self, parser):
+        # documents upstream parity: the OpenAI-shaped envelope is rejected even complete
+        text = "<|python_tag|>" + self.ONE_B_PAYLOAD + "}"
+
+        result = parser.extract_tool_calls(text)
+        assert not result.tools_called and result.tool_calls == []
+        assert result.content == self.ONE_B_PAYLOAD + "}"
+
+        events = self._stream(parser, ["<|python_tag|>", self.ONE_B_PAYLOAD + "}"])
+        assert not any("tool_calls" in e for e in events)
+        assert "".join(e.get("content", "") for e in events) == result.content
+        assert parser.finalize_streaming(text) is None
+
+    def test_finalizing_after_a_complete_call_emits_nothing_extra(self, parser):
+        text = 'Sure.<|python_tag|>{"name": "read", "parameters": {"p": 1}}'
+        events = self._stream(parser, ["Sure.", "<|python_tag|>", text[19:]])
+
+        assert parser.finalize_streaming(text) is None
+        assert [
+            c["function"]["name"] for e in events for c in e.get("tool_calls", [])
+        ] == ["read"]
+        assert "".join(e.get("content", "") for e in events) == "Sure."
+
+    def test_text_before_an_incomplete_call_is_not_repeated_by_the_finalizer(
+        self, parser
+    ):
+        chunks = ["Let me check. ", '<|python_tag|>{"name": "re']
+        events = self._stream(parser, chunks)
+        final = parser.finalize_streaming("".join(chunks))
+
+        shown = "".join(e.get("content", "") for e in events + [final])
+        assert shown == 'Let me check. {"name": "re'
+        assert shown == parser.extract_tool_calls("".join(chunks)).content
+
+    @pytest.mark.parametrize("next_tag", ["", "<|python_tag|>"])
+    def test_an_incomplete_call_after_a_complete_one_keeps_the_call(
+        self, parser, next_tag
+    ):
+        first = '<|python_tag|>{"name": "a", "parameters": {}}'
+        text = first + "; " + next_tag + '{"name": "b", "parame'
+        result = parser.extract_tool_calls(text)
+        assert [c["name"] for c in result.tool_calls] == ["a"]
+        assert "<|python_tag|>" not in result.content
+
+        events = self._stream(parser, [first, text[len(first) :]])
+        final = parser.finalize_streaming(text)
+        assert [
+            c["function"]["name"] for e in events for c in e.get("tool_calls", [])
+        ] == ["a"]
+        shown = "".join(e.get("content", "") for e in events + [final])
+        assert "<|python_tag|>" not in shown
+        assert shown.strip() == result.content
+        assert "parame" in shown  # released, not hidden
+
+    def test_the_incomplete_call_is_logged_with_its_raw_text(self, parser, caplog):
+        text = "<|python_tag|>" + self.ONE_B_PAYLOAD
+
+        with caplog.at_level(
+            "WARNING", logger="vllm_mlx.tool_parsers.llama_tool_parser"
+        ):
+            parser.extract_tool_calls(text)
+            parser.extract_tool_calls('<|python_tag|>{"a": "' + "x" * 5000)
+            parser.extract_tool_calls('<|python_tag|>{"name": "f", "parameters": {}}')
+            parser.extract_tool_calls("<|python_tag|>import os")
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2  # a complete call and plain code log nothing
+        assert "end of generation" in warnings[0].getMessage()
+        assert "echo_args" in warnings[0].getMessage()
+        assert len(warnings[1].getMessage()) < 800  # raw text is truncated
+
+    def test_the_finalizer_hook_is_a_no_op_for_other_parsers(self):
+        from vllm_mlx import server
+
+        for name in ("hermes", "qwen", "mistral", "deepseek"):
+            other = ToolParserManager.get_tool_parser(name)()
+            text = '<|python_tag|>{"name": "f", "parameters": {"a'
+            assert server._finalize_streaming_tool_result(other, text, None) is None
+            kept = {"content": "kept"}
+            assert server._finalize_streaming_tool_result(other, text, kept) is kept
 
     def test_python_tag_call_next_to_code_keeps_the_call(self, parser):
         text = '<|python_tag|>x = 1\n<|python_tag|>{"name": "read", "parameters": {}} After'

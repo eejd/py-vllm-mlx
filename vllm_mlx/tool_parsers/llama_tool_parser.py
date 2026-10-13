@@ -12,6 +12,7 @@ Handles Llama's tool calling formats:
 """
 
 import json
+import logging
 import re
 import uuid
 from collections.abc import Sequence
@@ -22,6 +23,17 @@ from .abstract_tool_parser import (
     ToolParser,
     ToolParserManager,
 )
+
+logger = logging.getLogger(__name__)
+
+_LOG_EXCERPT_CHARS = 500
+
+
+def _log_excerpt(text: str) -> str:
+    """Model output cut to a log-sized excerpt."""
+    if len(text) <= _LOG_EXCERPT_CHARS:
+        return text
+    return f"{text[:_LOG_EXCERPT_CHARS]}... [{len(text)} chars]"
 
 
 def generate_tool_id() -> str:
@@ -62,6 +74,9 @@ class LlamaToolParser(ToolParser):
     # changing the behavior of other configured parsers such as ``auto``.
     STREAMING_MARKERS = (PYTHON_TAG,)
     SUPPORTS_BARE_JSON_STREAMING = True
+    # A tagged call can still be pending after the delta that emitted content or a call;
+    # the server's end-of-stream hook must then run too, to release it as content.
+    FINALIZE_AFTER_RESULT = True
 
     @staticmethod
     def _tool_call_from_object(obj: object) -> dict | None:
@@ -93,6 +108,15 @@ class LlamaToolParser(ToolParser):
             cursor = end
         parts.append(text[cursor:])
         return "".join(parts)
+
+    @classmethod
+    def _final_text(cls, text: str, spans: list[tuple[int, int]]) -> str:
+        """Content of a finished response: consumed spans removed and no control token left.
+
+        The scan stops at an incomplete call, so a tag after it (``<call>; <|python_tag|>{``)
+        has no span of its own; the tag is never content.
+        """
+        return cls._remove_spans(text, spans).replace(cls.PYTHON_TAG, "")
 
     @classmethod
     def _extract_python_tag_data(
@@ -383,7 +407,7 @@ class LlamaToolParser(ToolParser):
             spans = spans + bare_spans
 
         tool_calls = [call for _, call in records]
-        cleaned_text = self._remove_spans(model_output, spans).strip()
+        cleaned_text = self._final_text(model_output, spans).strip()
 
         if tool_calls:
             return ExtractedToolCallInformation(
@@ -392,18 +416,22 @@ class LlamaToolParser(ToolParser):
                 content=cleaned_text if cleaned_text else None,
             )
         else:
-            content = model_output
             if python_pending is not None:
-                # An incomplete tagged call at EOF is protocol markup: hidden, as in
-                # finalize_streaming (a lone tag is just the control token).
-                content = content[:python_pending]
-                spans = [
-                    (s, min(e, python_pending)) for s, e in spans if s < python_pending
-                ]
+                # extract_tool_calls only ever sees a finished response, so a tagged call
+                # still incomplete here can never complete. It is returned as content, the
+                # control token stripped (it is in ``spans``); hiding it would answer an
+                # empty reply for a model that did generate text (#67). Same rule as
+                # finalize_streaming. Every streaming site re-parses the finished text
+                # with this method, so this is the one place the situation is logged.
+                logger.warning(
+                    "Llama tool call incomplete at end of generation (EOS or length "
+                    "cap), returned as content with no tool_calls: %r",
+                    _log_excerpt(model_output),
+                )
             return ExtractedToolCallInformation(
                 tools_called=False,
                 tool_calls=[],
-                content=self._remove_spans(content, spans),
+                content=self._final_text(model_output, spans),
             )
 
     def extract_tool_calls_streaming(
@@ -449,10 +477,20 @@ class LlamaToolParser(ToolParser):
         return {"content": delta_text}
 
     def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
-        """Resolve an incomplete Llama prefix when generation has ended."""
-        calls, _, pending = self._stream_state(current_text)
+        """Resolve an incomplete Llama prefix when generation has ended.
+
+        A tagged call that is still incomplete can no longer complete: its text, the
+        control token stripped, is released as content, as ``extract_tool_calls`` returns
+        it. While generation runs ``extract_tool_calls_streaming`` holds it back.
+        """
+        calls, visible, pending = self._stream_state(current_text)
         if not pending:
             return None
+        _, python_spans, python_pending = self._extract_python_tag_data(current_text)
+        if python_pending is not None:
+            _, xml_spans, _ = self._extract_xml_data(current_text)
+            final = self._final_text(current_text, python_spans + xml_spans)
+            return {"content": self._visible_delta(visible, final)}
         if not calls and current_text.lstrip().startswith("{"):
             return {"content": current_text}
         return {"content": ""}
