@@ -240,6 +240,30 @@ class TestRenderTools:
         flat = [{"name": "ping", "description": "Ping", "parameters": {"type": "object", "properties": {}}}]
         assert '"name": "ping"' in render([_USER], tools=flat)
 
+    @pytest.mark.parametrize(
+        "schema, python_type",
+        [
+            ({"type": "null"}, "None"),
+            ({"type": ["string", "null"]}, "Union[str,None]"),
+            ({"type": "any"}, "Any"),
+            ({"anyOf": [{"type": "string"}, {"type": "integer"}]}, "Any"),
+            ({}, "Any"),
+            ({"type": "array"}, "list[Any]"),
+        ],
+    )
+    def test_nullable_and_unknown_property_types_render(self, schema, python_type):
+        # A string-valued `type` that is not known used to recurse until RecursionError
+        # (HTTP 500) because a str is iterable.
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {"p": schema}},
+            },
+        }
+        assert f"f(p: {python_type}) - d" in render([_USER], tools=[tool])
+
     @pytest.mark.parametrize("add_generation_prompt", [True, False])
     def test_generation_prompt_is_honoured(self, add_generation_prompt):
         prompt = render([_USER], tools=TOOLS, add_generation_prompt=add_generation_prompt)

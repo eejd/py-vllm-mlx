@@ -21,7 +21,9 @@
       the newline off after `tool` and tool-calling assistant turns);
     * an assistant turn that has both content and `tool_calls` keeps its content
       (upstream drops it), a `tool_calls` value of null or [] means "no tool calls",
-      and a tool without `parameters` or `description` renders instead of failing;
+      and a tool without `parameters` or `description`, or with a nullable (`"type": ["string", "null"]`),
+      typeless or unknown-typed property, renders instead of failing (upstream recurses forever on a
+      string-valued `type` it does not know);
     * `json_to_python_type` follows the `items` key of an array schema (upstream applies
       Jinja's `items` filter to the whole schema and renders `list[Union[]]`), and the
       `Args:` entries of one tool are on separate lines (upstream runs them together);
@@ -48,7 +50,8 @@
     "string": "str",
     "number": "float",
     "integer": "int",
-    "boolean": "bool"
+    "boolean": "bool",
+    "null": "None"
 } %}
 
     {%- if basic_type_map[json_spec.type] is defined %}
@@ -61,7 +64,7 @@
         {%- else %}
             {{- "dict" }}
         {%- endif %}
-    {%- elif json_spec.type is iterable %}
+    {%- elif json_spec.type is defined and json_spec.type is not string and json_spec.type is iterable %}
         {{- "Union[" }}
         {%- for t in json_spec.type %}
             {{- json_to_python_type({"type": t}) }}

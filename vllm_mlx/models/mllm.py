@@ -416,6 +416,16 @@ def _serialize_tool_messages_gemma_native(messages: list[dict]) -> list[dict]:
             pending_outputs.append(_stringify_message_content(msg.get("content", "")))
             continue
 
+        if role == "user" and pending_outputs and isinstance(msg.get("content"), str):
+            # A tool result followed directly by the user's next message: one user turn.
+            # Two consecutive user turns are refused by Gemma's alternation check.
+            body = "\n".join(pending_outputs)
+            pending_outputs.clear()
+            out.append(
+                {**msg, "content": f"```tool_output\n{body}\n```\n\n{msg['content']}"}
+            )
+            continue
+
         _flush_outputs()
 
         tool_calls = msg.get("tool_calls")

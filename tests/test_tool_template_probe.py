@@ -243,6 +243,14 @@ class TestBatchedMultimodalToolTurns:
         assert "<start_of_turn>tool" not in prompt
         assert prompt.endswith("<start_of_turn>model")
 
+    def test_a_user_message_after_a_tool_result_stays_one_turn(self):
+        # Two consecutive user turns would be refused by the alternation check.
+        engine = _batched_mllm(GEMMA_LIKE)
+        prompt = engine._apply_chat_template(
+            [*TOOL_CONVERSATION, {"role": "user", "content": "And Rome?"}]
+        )
+        assert "```tool_output\nSunny, 21C\n```\n\nAnd Rome?<end_of_turn>" in prompt
+
     def test_a_template_with_tool_support_renders_the_turns_itself(self):
         template = (
             "{% for m in messages %}{{ m['role'] }}:"
