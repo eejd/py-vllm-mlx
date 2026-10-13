@@ -329,6 +329,42 @@ class MistralToolParser(ToolParser):
                 content=model_output,
             )
 
+    def _feed_call_text(self, text: str) -> list[dict[str, Any]]:
+        """Feed the text that follows a ``[TOOL_CALLS]`` marker of the current call.
+
+        The text may hold more calls (a delta of several tokens): each further marker
+        outside a JSON string closes the current call and starts the next index, so
+        the second call is never folded into the first one's arguments.
+        """
+        calls: list[dict[str, Any]] = []
+        while True:
+            tool_delta = self._parse_streaming_tool_delta(text)
+            rest: str | None = None
+            if tool_delta and "arguments" in tool_delta:
+                arguments = tool_delta["arguments"]
+                pos = self._scan_args_for_new_call(arguments)
+                if pos != -1:
+                    rest = arguments[pos + len(self.BOT_TOKEN) :]
+                    tool_delta = dict(tool_delta)
+                    if arguments[:pos]:
+                        tool_delta["arguments"] = arguments[:pos]
+                    else:
+                        del tool_delta["arguments"]
+            if tool_delta:
+                call: dict[str, Any] = {
+                    "index": self.current_tool_id,
+                    "type": "function",
+                    "function": tool_delta,
+                }
+                if not self._tool_call_id_emitted:
+                    call["id"] = self._current_tool_call_id
+                    self._tool_call_id_emitted = True
+                calls.append(call)
+            if rest is None:
+                return calls
+            self._start_new_tool_call()
+            text = rest
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -363,7 +399,7 @@ class MistralToolParser(ToolParser):
                     ]
                 }
             # A new call begins inside this delta: close the current call with
-            # the pre-marker text, then start the next one.
+            # the pre-marker text, then start the next one (or several).
             result: dict[str, Any] = {}
             pre = delta_text[:new_call_pos]
             if pre:
@@ -375,24 +411,28 @@ class MistralToolParser(ToolParser):
                     }
                 ]
             self._start_new_tool_call()
-            tool_delta = self._parse_streaming_tool_delta(
+            calls = self._feed_call_text(
                 delta_text[new_call_pos + len(self.BOT_TOKEN) :]
             )
-            if tool_delta:
-                tool_call: dict[str, Any] = {
-                    "index": self.current_tool_id,
-                    "type": "function",
-                    "function": tool_delta,
-                }
-                tool_call["id"] = self._current_tool_call_id
-                self._tool_call_id_emitted = True
-                result["tool_calls"] = (result.get("tool_calls") or []) + [tool_call]
+            if calls:
+                result["tool_calls"] = (result.get("tool_calls") or []) + calls
             return result if result else None
 
         # Check if tool call token is in current output
         if self.BOT_TOKEN not in current_text:
             # Not a tool call yet, return content delta
             return {"content": delta_text}
+
+        if (
+            self.BOT_TOKEN in delta_text
+            and self.current_tool_id >= 0
+            and not self._name_buffer_overflow
+        ):
+            # A call is open and its arguments have not started (the marker was a delta
+            # of its own): the text before this delta's marker is still that call's name
+            # and arguments, the marker outside a JSON string starts the next call.
+            calls = self._feed_call_text(delta_text)
+            return {"tool_calls": calls} if calls else None
 
         # Tool call detected
         if self.BOT_TOKEN in delta_text:
@@ -409,17 +449,9 @@ class MistralToolParser(ToolParser):
             self._start_new_tool_call()
 
             if tool_part:
-                # Try to parse the tool part
-                tool_delta = self._parse_streaming_tool_delta(tool_part)
-                if tool_delta:
-                    tool_call: dict[str, Any] = {
-                        "index": self.current_tool_id,
-                        "type": "function",
-                        "function": tool_delta,
-                    }
-                    tool_call["id"] = self._current_tool_call_id
-                    self._tool_call_id_emitted = True
-                    result["tool_calls"] = [tool_call]
+                calls = self._feed_call_text(tool_part)
+                if calls:
+                    result["tool_calls"] = calls
 
             return result if result else None
 

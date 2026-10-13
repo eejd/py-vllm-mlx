@@ -387,6 +387,10 @@ class LlamaToolParser(ToolParser):
         """Return content newly made visible by the current parser state."""
         if current.startswith(previous):
             return current[len(previous) :]
+        if previous.startswith(current):
+            # the visible text shrank (whitespace after a call that turned out to lead a
+            # separator): what was emitted cannot be taken back, nothing new is due
+            return ""
         return current
 
     @staticmethod
@@ -526,19 +530,17 @@ class LlamaToolParser(ToolParser):
     def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
         """Resolve an incomplete Llama prefix when generation has ended.
 
-        A tagged call that is still incomplete can no longer complete: its text, the
-        control token stripped, is released as content, as ``extract_tool_calls`` returns
-        it. While generation runs ``extract_tool_calls_streaming`` holds it back. Anything
-        else still held back (a dangling ``;`` after a complete call) is not a call and
-        stays hidden, as before.
+        Whatever a tagged chain still holds back can no longer become a call: its text,
+        the control token stripped, is released as content exactly as
+        ``extract_tool_calls`` returns it (a cut-off call, a partly written repeated tag
+        after a separator). While generation runs ``extract_tool_calls_streaming`` holds
+        it back. A dangling ``;`` after a complete call is not content in either path.
         """
         calls, visible, pending = self._stream_state(current_text)
         if not pending:
             return None
         _, python_spans, python_pending = self._extract_python_tag_data(current_text)
-        if python_pending is not None and self._is_cut_off_call(
-            current_text, python_pending
-        ):
+        if python_pending is not None:
             _, xml_spans, _ = self._extract_xml_data(current_text)
             final = self._final_text(current_text, python_spans + xml_spans)
             return {"content": self._visible_delta(visible, final)}

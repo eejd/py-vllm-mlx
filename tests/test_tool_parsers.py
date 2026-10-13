@@ -1023,12 +1023,14 @@ class TestLlamaToolParser:
         final = parser.finalize_streaming(text)
 
         shown = "".join(e.get("content", "") for e in events + [final or {}])
-        assert [c["function"]["name"] for e in events for c in e.get("tool_calls", [])] == [
-            "read"
-        ]
-        assert shown.strip() == (whole.content or "").strip() == after.replace(
-            "<|python_tag|>", ""
-        ).strip()
+        assert [
+            c["function"]["name"] for e in events for c in e.get("tool_calls", [])
+        ] == ["read"]
+        assert (
+            shown.strip()
+            == (whole.content or "").strip()
+            == after.replace("<|python_tag|>", "").strip()
+        )
         assert "<|python_tag|>" not in shown
 
     @pytest.mark.parametrize("size", [1, 4, 10_000])
