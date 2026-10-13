@@ -126,7 +126,9 @@ class TestToolLessRequestsKeepTheStockLayout:
         stock = _render(
             STOCK_TEMPLATE, messages, add_generation_prompt=add_generation_prompt
         )
-        shipped = render(messages, tools=tools, add_generation_prompt=add_generation_prompt)
+        shipped = render(
+            messages, tools=tools, add_generation_prompt=add_generation_prompt
+        )
         assert shipped == stock
         assert "<tools>" not in shipped
 
@@ -145,13 +147,31 @@ class TestRenderTools:
             add_generation_prompt=True,
         )
         head, _, rest = prompt.partition("<|im_end|>\n")
-        assert head.startswith("<|im_start|>system\nYou are a function calling AI model.")
+        assert head.startswith(
+            "<|im_start|>system\nYou are a function calling AI model."
+        )
         assert "<tools> " in head and " </tools>" in head
         assert '"name": "get_weather"' in head
-        assert "get_weather(city: str, days: int, tags: list[str]) - Current weather" in head
+        assert (
+            "get_weather(city: str, days: int, tags: list[str]) - Current weather"
+            in head
+        )
         # The caller's own system message is kept, as a second system turn.
         assert rest.startswith("<|im_start|>system\nBe brief.<|im_end|>\n")
-        assert prompt.endswith("<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n")
+        assert prompt.endswith(
+            "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n"
+        )
+
+    def test_args_entries_of_a_tool_are_listed_one_per_line_under_one_header(self):
+        # Upstream's template runs the entries together on one line.
+        head = render([_USER], tools=TOOLS).partition("<|im_end|>")[0]
+        assert head.count("Args:") == 1
+        assert (
+            "    Args:\n"
+            "        city(str): City name\n"
+            "        days(int): Forecast days\n"
+            "        tags(list[str]): Labels"
+        ) in head
 
     def test_no_bos_token_is_rendered(self):
         # vllm-mlx tokenizes the prompt with special tokens: the tokenizer adds BOS.
@@ -166,7 +186,9 @@ class TestRenderTools:
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [
-                        _tool_call("get_weather", {"city": "Zürich", "ok": True, "n": None})
+                        _tool_call(
+                            "get_weather", {"city": "Zürich", "ok": True, "n": None}
+                        )
                     ],
                 },
             ],
@@ -232,12 +254,20 @@ class TestRenderTools:
         assert prompt.count("<|im_start|>tool") == 1
 
     def test_tool_without_parameters_or_description_renders(self):
-        prompt = render([_USER], tools=[{"type": "function", "function": {"name": "ping"}}])
+        prompt = render(
+            [_USER], tools=[{"type": "function", "function": {"name": "ping"}}]
+        )
         assert '"name": "ping"' in prompt
         assert '"parameters": {}' in prompt
 
     def test_flat_tool_shape_renders(self):
-        flat = [{"name": "ping", "description": "Ping", "parameters": {"type": "object", "properties": {}}}]
+        flat = [
+            {
+                "name": "ping",
+                "description": "Ping",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
         assert '"name": "ping"' in render([_USER], tools=flat)
 
     @pytest.mark.parametrize(
@@ -266,7 +296,9 @@ class TestRenderTools:
 
     @pytest.mark.parametrize("add_generation_prompt", [True, False])
     def test_generation_prompt_is_honoured(self, add_generation_prompt):
-        prompt = render([_USER], tools=TOOLS, add_generation_prompt=add_generation_prompt)
+        prompt = render(
+            [_USER], tools=TOOLS, add_generation_prompt=add_generation_prompt
+        )
         assert prompt.endswith("<|im_start|>assistant\n") is add_generation_prompt
 
 
@@ -278,7 +310,13 @@ class TestParserReadsWhatTheTemplateTeachesTheModel:
 
         arguments = {"city": "Zürich", "days": 3, "tags": ["a", "b]"]}
         prompt = render(
-            [_USER, {"role": "assistant", "tool_calls": [_tool_call("get_weather", arguments)]}],
+            [
+                _USER,
+                {
+                    "role": "assistant",
+                    "tool_calls": [_tool_call("get_weather", arguments)],
+                },
+            ],
             tools=TOOLS,
         )
         turn = re.search(r"<\|im_start\|>assistant(.*?)<\|im_end\|>", prompt, re.DOTALL)
@@ -301,6 +339,86 @@ class TestParserReadsWhatTheTemplateTeachesTheModel:
             '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>'
         )
         assert parsed.tools_called and parsed.tool_calls[0]["name"] == "get_weather"
+
+
+class TestToolResultGivenAsTextParts:
+    """``content: [{"type": "text", ...}]`` on a tool message is valid OpenAI input.
+
+    The template concatenates ``message.content`` as a string, which raised
+    ``TypeError`` (HTTP 500) on a list. The server flattens the text parts first, as
+    vLLM does for string-format templates.
+    """
+
+    PARTS = [
+        {"type": "text", "text": "Sunny"},
+        {"type": "text", "text": "21C"},
+    ]
+
+    def _conversation(self, tool_content):
+        return [
+            _USER,
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_tool_call("get_weather", '{"city": "Paris"}')],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": tool_content},
+        ]
+
+    def test_text_parts_render_as_the_tool_response(self):
+        from vllm_mlx.api.utils import extract_multimodal_content
+
+        messages, *_ = extract_multimodal_content(
+            self._conversation(self.PARTS), preserve_native_format=True
+        )
+        prompt = render(messages, tools=TOOLS, add_generation_prompt=True)
+        assert "<tool_response>\nSunny\n21C\n</tool_response>" in prompt
+
+    def test_pydantic_content_parts_render_too(self):
+        from vllm_mlx.api.models import ContentPart, Message
+        from vllm_mlx.api.utils import extract_multimodal_content
+
+        conversation = self._conversation([ContentPart(type="text", text="Sunny")])
+        conversation = [
+            Message(**m) if m["role"] == "tool" else m for m in conversation
+        ]
+        messages, *_ = extract_multimodal_content(
+            conversation, preserve_native_format=True
+        )
+        assert messages[-1]["content"] == "Sunny"
+        assert "<tool_response>\nSunny\n</tool_response>" in render(
+            messages, tools=TOOLS
+        )
+
+    def test_non_text_parts_are_not_part_of_the_response(self):
+        from vllm_mlx.api.utils import extract_multimodal_content
+
+        parts = [
+            {"type": "text", "text": "Sunny"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]
+        messages, *_ = extract_multimodal_content(
+            self._conversation(parts), preserve_native_format=True
+        )
+        assert messages[-1]["content"] == "Sunny"
+
+    def test_a_template_less_model_gets_the_text_not_a_list_repr(self):
+        from vllm_mlx.api.utils import extract_multimodal_content
+
+        messages, *_ = extract_multimodal_content(self._conversation(self.PARTS))
+        assert messages[-1] == {
+            "role": "user",
+            "content": "[Tool Result (call_1)]: Sunny\n21C",
+        }
+
+    def test_string_and_empty_results_are_unchanged(self):
+        from vllm_mlx.api.utils import extract_multimodal_content
+
+        for content, expected in [("Sunny", "Sunny"), (None, ""), ("", "")]:
+            messages, *_ = extract_multimodal_content(
+                self._conversation(content), preserve_native_format=True
+            )
+            assert messages[-1]["content"] == expected
 
 
 def _hermes_tokenizer_dir():
@@ -330,7 +448,9 @@ class TestWithTheRealTokenizer:
         )
         assert "get_weather" not in prompt
 
-    def test_shipped_template_renders_tools_and_matches_stock_without_them(self, tokenizer):
+    def test_shipped_template_renders_tools_and_matches_stock_without_them(
+        self, tokenizer
+    ):
         stock = tokenizer.chat_template
         messages = [{"role": "system", "content": "Be brief."}, _USER]
         before = tokenizer.apply_chat_template(

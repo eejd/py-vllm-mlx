@@ -416,14 +416,27 @@ def _serialize_tool_messages_gemma_native(messages: list[dict]) -> list[dict]:
             pending_outputs.append(_stringify_message_content(msg.get("content", "")))
             continue
 
-        if role == "user" and pending_outputs and isinstance(msg.get("content"), str):
+        if (
+            role == "user"
+            and pending_outputs
+            and (msg.get("content") is None or isinstance(msg["content"], (str, list)))
+        ):
             # A tool result followed directly by the user's next message: one user turn.
-            # Two consecutive user turns are refused by Gemma's alternation check.
+            # Two consecutive user turns are refused by Gemma's alternation check. The
+            # message keeps its own shape: text gets the block prepended, a list of
+            # parts (images, video, audio) gets it as a leading text part, and a turn
+            # with no content becomes the block alone.
             body = "\n".join(pending_outputs)
             pending_outputs.clear()
-            out.append(
-                {**msg, "content": f"```tool_output\n{body}\n```\n\n{msg['content']}"}
-            )
+            block = f"```tool_output\n{body}\n```"
+            content = msg.get("content")
+            if isinstance(content, str):
+                merged: object = f"{block}\n\n{content}" if content else block
+            elif isinstance(content, list):
+                merged = [{"type": "text", "text": block}, *content]
+            else:
+                merged = block
+            out.append({**msg, "content": merged})
             continue
 
         _flush_outputs()

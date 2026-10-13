@@ -183,6 +183,93 @@ class TestStartupWarning:
         assert self._warnings(caplog) == []
 
 
+@pytest.mark.anyio
+class TestLifespanProbe:
+    """``lifespan`` runs the probe once at startup, for a single fixed engine only.
+
+    With a residency manager or a model registry the engine can change or not exist yet
+    when the server starts, so the probe is skipped there (documented in tool-calling.md).
+    """
+
+    @pytest.fixture
+    def serving(self, monkeypatch):
+        async def stop():
+            return None
+
+        engine = SimpleNamespace(
+            tokenizer=_tokenizer(IGNORES_TOOLS), _loaded=True, stop=stop
+        )
+        monkeypatch.setattr(server, "_engine", engine)
+        monkeypatch.setattr(server, "_residency_manager", None)
+        monkeypatch.setattr(server, "_model_manager", None)
+        monkeypatch.setattr(server, "_default_model_key", None)
+        monkeypatch.setattr(server, "_mcp_manager", None)
+        monkeypatch.setattr(server, "_lifecycle_task", None)
+        monkeypatch.setattr(server, "_lifespan_active", False)
+        monkeypatch.setattr(server, "_warm_prompts_path", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "hermes")
+        monkeypatch.delenv("VLLM_MLX_MCP_CONFIG", raising=False)
+        return engine
+
+    async def _start_and_stop(self):
+        lifespan = server.lifespan(server.app)
+        await lifespan.__anext__()
+        try:
+            await lifespan.__anext__()
+        except StopAsyncIteration:
+            pass
+
+    def _tool_warnings(self, caplog):
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "does not render the request's `tools`" in r.getMessage()
+        ]
+
+    async def test_a_fixed_engine_is_probed_at_startup(self, serving, caplog):
+        with caplog.at_level(logging.WARNING, logger=server.logger.name):
+            await self._start_and_stop()
+        assert len(self._tool_warnings(caplog)) == 1
+
+    async def test_a_template_that_renders_tools_starts_silently(self, serving, caplog):
+        serving.tokenizer = _tokenizer(RENDERS_TOOLS)
+        with caplog.at_level(logging.WARNING, logger=server.logger.name):
+            await self._start_and_stop()
+        assert self._tool_warnings(caplog) == []
+
+    async def test_a_model_registry_skips_the_probe(self, serving, monkeypatch, caplog):
+        async def done(*args):
+            return None
+
+        monkeypatch.setattr(
+            server,
+            "_model_manager",
+            SimpleNamespace(preload=done, idle_unload_seconds=0, shutdown=done),
+        )
+        with caplog.at_level(logging.WARNING, logger=server.logger.name):
+            await self._start_and_stop()
+        assert self._tool_warnings(caplog) == []
+
+    async def test_a_residency_manager_skips_the_probe(
+        self, serving, monkeypatch, caplog
+    ):
+        async def done(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(
+            server, "_residency_manager", SimpleNamespace(shutdown=done)
+        )
+        monkeypatch.setattr(server, "_default_model_key", "model")
+        monkeypatch.setattr(server, "_lazy_load_model", True)
+        monkeypatch.setattr(server, "_auto_unload_idle_seconds", 0.0)
+        monkeypatch.setattr(server, "_sync_engine_from_residency", lambda: serving)
+        with caplog.at_level(logging.WARNING, logger=server.logger.name):
+            await self._start_and_stop()
+        assert self._tool_warnings(caplog) == []
+
+
 # Gemma-3's template: user/model/system only, no tool turns, raises on any other order.
 GEMMA_LIKE = (
     "{{ bos_token }}{%- for message in messages -%}"
@@ -222,7 +309,9 @@ def _batched_mllm(template: str):
         tokenizer=tokenizer,
         chat_template=None,
         apply_chat_template=lambda *a, **k: (_ for _ in ()).throw(
-            ValueError("Cannot use apply_chat_template ... does not have a chat template.")
+            ValueError(
+                "Cannot use apply_chat_template ... does not have a chat template."
+            )
         ),
     )
     engine._is_mllm = True

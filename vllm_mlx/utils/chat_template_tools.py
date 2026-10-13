@@ -89,7 +89,9 @@ def engine_template_renderer(engine: Any) -> Callable[..., str] | None:
         if candidate is None or not getattr(candidate, "chat_template", None):
             continue
         if callable(getattr(candidate, "apply_chat_template", None)):
-            return lambda messages, tools=None, _tok=candidate: _tok.apply_chat_template(
-                messages, tools=tools, tokenize=False, add_generation_prompt=True
+            return (
+                lambda messages, tools=None, _tok=candidate: _tok.apply_chat_template(
+                    messages, tools=tools, tokenize=False, add_generation_prompt=True
+                )
             )
     return None
