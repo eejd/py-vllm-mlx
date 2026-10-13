@@ -440,3 +440,18 @@ class TestRawCompletionsStream:
         assert outputs[-1].completion_tokens == 3
         assert outputs[-1].finish_reason == "length"
         assert outputs[-1].text == "w0w1w2"
+
+    def test_a_pure_llm_engine_keeps_its_own_cap_rule(self, monkeypatch):
+        # Only the MLLM route reads mlx-vlm's flush chunk; an LLM stream whose chunks
+        # happen to carry a count still ends at ``max_tokens`` on the token chunk.
+        chunks = _flush_chunks(5, flush_text="LAST", flush_count=5, finish="length")
+        for i, chunk in enumerate(chunks[:-1]):
+            chunk.finish_reason = None
+        engine = _engine(_RawModel(chunks), monkeypatch)
+        engine._is_mllm = False
+
+        outputs = _drive_raw(engine, max_tokens=3)
+
+        assert outputs[-1].text == "t0 t1 t2 "
+        assert outputs[-1].completion_tokens == 3
+        assert outputs[-1].finish_reason == "length"
