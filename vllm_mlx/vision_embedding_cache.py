@@ -119,10 +119,15 @@ def compute_image_hash(image_path: str) -> str:
 
 
 def compute_images_hash(images: List[str]) -> str:
-    """Compute combined hash for multiple images."""
+    """Compute combined hash for multiple images.
+
+    Order matters: ``[A, B]`` and ``[B, A]`` are different requests (the
+    k-th image fills the k-th placeholder, so the pixels and the prompt tokens
+    differ), and must never share a cache entry.
+    """
     if not images:
         return "no_images"
-    hashes = sorted(compute_image_hash(img) for img in images)
+    hashes = [compute_image_hash(img) for img in images]
     return hashlib.sha256("_".join(hashes).encode()).hexdigest()[:16]
 
 

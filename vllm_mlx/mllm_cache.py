@@ -181,8 +181,10 @@ def compute_images_hash(images: list[str]) -> str:
     if not images:
         return "no_images"
 
+    # Order matters: the k-th image fills the k-th placeholder, so [A, B] and
+    # [B, A] are different requests and must not share a cache entry.
     hashes = [compute_image_hash(img) for img in images]
-    combined = "_".join(sorted(hashes))
+    combined = "_".join(hashes)
     return hashlib.sha256(combined.encode()).hexdigest()[:16]
 
 
