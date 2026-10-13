@@ -129,6 +129,20 @@ mistral-common itself accepts both (it emits the extra system prompt in place, o
 consecutive same-role messages with a blank line). Merge such messages in the client; the
 server does not rewrite them.
 
+**Default system prompt (Ministral 3).** When a request has no `system` message, the
+checkpoint's `chat_template.jinja` renders Mistral's long default system prompt (about 500
+tokens, with the placeholders `{today}` and `{yesterday}` left as they are in the
+template). mistral-common renders no system prompt at all, so the prompt differs from the
+reference rendering; with tools, the 3B model fills optional parameters the request did not
+give (`count: 0`, `flag: false`) under the template's prompt and passes exact-argument
+checks under either an explicit system message or mistral-common's rendering. Send your
+own `system` message to control the prompt.
+
+**Text after a call.** A `[TOOL_CALLS]name[ARGS]{...}` call has no terminator of its own,
+so a model may write prose after the closing brace. The call's arguments are the first
+complete JSON value; the text after it is dropped, streaming and not (as in vLLM,
+vllm-project/vllm#48975). The prose is not returned as content.
+
 ### Qwen
 
 ```bash
