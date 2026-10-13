@@ -1998,8 +1998,8 @@ class SimpleEngine(BaseEngine):
         Raises ``ChatTemplateRejected`` when the template refuses the messages, so
         a streaming request is answered 400 before its response starts. Follows the
         route ``_stream_chat_impl`` picks (mlx-lm TextModel, mlx-vlm, pure LLM) and
-        renders with that route's own renderer. A request that carries a video is
-        not pre-checked: its frames are extracted while the prompt is built.
+        renders with that route's own renderer. A video counts as one placeholder
+        frame: its frames are extracted only while the real prompt is built.
         """
         if not self._loaded:
             await self.start()

@@ -196,9 +196,9 @@ template saying the *request* is malformed for this model, and the server answer
 HTTP 400 with the template's own message, on `/v1/chat/completions`, `/v1/responses` and
 `/v1/messages`, streaming and non-streaming alike (a stream is pre-checked before its response starts,
 so it is a 400 rather than an empty 200). A template that does not compile, or any other failure while
-building the prompt, is still a server error (500). On a multimodal model on the simple engine the
-rejection is no longer answered by dropping the conversation and prompting with the last user message
-alone.
+building the prompt, is still a server error (500). The simple engine's
+multimodal route no longer answers with a prompt built from the last user message alone when the chat
+template fails to render the conversation: the failure is the 400 or 500 above.
 
 ### Models
 

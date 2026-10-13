@@ -29,7 +29,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-import jinja2
 import numpy as np
 import requests
 
@@ -2536,29 +2535,6 @@ class MLXMultimodalLM:
                 enable_thinking=enable_thinking,
                 **template_extra_kwargs,
             )
-        except jinja2.TemplateError:
-            # The template refused the conversation (or does not compile). Answering
-            # a different conversation -- the last user message alone -- would hide
-            # that from the client; let the engine turn it into a 400 / a 500.
-            raise
-        except Exception as e:
-            logger.warning(
-                f"Failed to apply chat template: {e}, using last user message"
-            )
-            # Fallback to last user message if template fails
-            last_user_msg = ""
-            for m in reversed(chat_messages):
-                if m["role"] == "user":
-                    content = m.get("content", "")
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                last_user_msg = item.get("text", "")
-                                break
-                    else:
-                        last_user_msg = content
-                    break
-            return last_user_msg
 
     def render_chat_prompt(
         self,
@@ -2567,13 +2543,12 @@ class MLXMultimodalLM:
         tools: list[dict] | None = None,
         chat_template_kwargs: dict | None = None,
         enable_thinking: bool | None = None,
-    ) -> str | None:
+    ) -> str:
         """Render the prompt ``chat`` / ``stream_chat`` would build, without media work.
 
         Same message preparation and renderer as the request path, with no image,
-        audio or video fetched, so a template that refuses the conversation raises
-        before any generation starts. Returns ``None`` (nothing rendered) when the
-        messages carry a video: frames are extracted while its prompt is built.
+        audio or video fetched (a video counts as one placeholder frame), so a
+        template that refuses the conversation raises before any generation starts.
         """
         if not self._loaded:
             self.load()
@@ -2586,10 +2561,14 @@ class MLXMultimodalLM:
             enable_thinking = ctk.pop("enable_thinking")
         if not _template_supports_tool_role(self.processor, self.config):
             messages = _serialize_tool_messages_gemma_native(messages)
-        if self._collect_video_inputs(messages):
-            return None
+        # Frames are not extracted: one placeholder frame per video is enough for a
+        # template to accept or refuse the conversation's shape.
+        video_frame_counts = {
+            msg_idx: len(inputs)
+            for msg_idx, inputs in self._collect_video_inputs(messages).items()
+        }
         chat_messages = _build_mllm_chat_messages(
-            messages, all_image_urls=[], video_frame_counts={}
+            messages, all_image_urls=[], video_frame_counts=video_frame_counts
         )
         return self._format_chat_prompt(chat_messages, tools, ctk, enable_thinking)
 

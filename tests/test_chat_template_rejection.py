@@ -180,6 +180,72 @@ class TestSimpleEngine:
                 pass
 
 
+@pytest.mark.anyio
+class TestSimpleEngineRoutes:
+    """``validate_chat_template`` follows the route ``stream_chat`` takes."""
+
+    @pytest.fixture
+    def mllm_engine(self):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine("org/gemma-like-vlm", force_mllm=True)
+        engine._loaded = True
+        engine._is_mllm = True
+        return engine
+
+    def _model(self):
+        from vllm_mlx.models.mllm import MLXMultimodalLM
+
+        tok = _tokenizer()
+        lm = MLXMultimodalLM.__new__(MLXMultimodalLM)
+        lm.processor = SimpleNamespace(
+            tokenizer=tok, chat_template=GEMMA_TEMPLATE, apply_chat_template=tok.apply_chat_template
+        )
+        lm.config = SimpleNamespace(model_type="gemma3")
+        lm._loaded = True
+        return lm
+
+    async def test_text_model_route_uses_the_text_tokenizer(self, mllm_engine):
+        mllm_engine._text_model = object()
+        mllm_engine._text_tokenizer = _tokenizer()
+        mllm_engine._model = SimpleNamespace()  # reaching it would be an AttributeError
+        await mllm_engine.validate_chat_template(VALID)
+        with pytest.raises(ChatTemplateRejected, match="must alternate"):
+            await mllm_engine.validate_chat_template(REJECTED)
+
+    async def test_mllm_route_renders_through_the_processor(self, mllm_engine):
+        mllm_engine._text_model = None
+        mllm_engine._model = self._model()
+        await mllm_engine.validate_chat_template(VALID)
+        with pytest.raises(ChatTemplateRejected, match="must alternate"):
+            await mllm_engine.validate_chat_template(REJECTED)
+
+    async def test_media_requests_are_pre_checked_too(self, mllm_engine):
+        mllm_engine._text_model = None
+        mllm_engine._model = self._model()
+        video = {"type": "video_url", "video_url": {"url": "file:///x.mp4"}}
+        image = {"type": "image_url", "image_url": {"url": "file:///x.png"}}
+        for part in (video, image):
+            messages = [
+                {"role": "assistant", "content": [part, {"type": "text", "text": "hi"}]},
+                {"role": "user", "content": "hello?"},
+            ]
+            with pytest.raises(ChatTemplateRejected, match="must alternate"):
+                await mllm_engine.validate_chat_template(messages)
+
+
+    async def test_a_video_only_turn_still_counts_as_a_turn(self, mllm_engine):
+        # Dropping the turn (no frames, no text) would hide the bad order.
+        mllm_engine._text_model = None
+        mllm_engine._model = self._model()
+        messages = [
+            {"role": "assistant", "content": [{"type": "video_url", "video_url": {"url": "file:///x.mp4"}}]},
+            {"role": "user", "content": "hello?"},
+        ]
+        with pytest.raises(ChatTemplateRejected, match="must alternate"):
+            await mllm_engine.validate_chat_template(messages)
+
+
 class TestMultimodalFormatter:
     def _model(self, processor):
         from vllm_mlx.models.mllm import MLXMultimodalLM
@@ -198,6 +264,25 @@ class TestMultimodalFormatter:
         lm = self._model(processor)
         with pytest.raises(jinja2.TemplateError, match="must alternate"):
             lm._format_chat_prompt(REJECTED, None, {}, True)
+
+    def test_a_failure_that_is_not_a_template_rejection_is_not_hidden(self):
+        # The conversation must never be answered by prompting with its last user
+        # message alone: a processor that fails for any reason fails the request.
+        class BrokenProcessor:
+            chat_template = "x"
+            tokenizer = None
+
+            def apply_chat_template(self, *args, **kwargs):
+                raise KeyError("processor bug")
+
+        lm = self._model(BrokenProcessor())
+        with pytest.raises(KeyError, match="processor bug"):
+            lm._format_chat_prompt(
+                [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
+                None,
+                {},
+                True,
+            )
 
     def test_pre_check_runs_the_requests_message_preparation(self):
         tok = _tokenizer()
