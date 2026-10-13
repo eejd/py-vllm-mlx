@@ -3783,6 +3783,64 @@ def _strip_harmony_analysis_blocks(text: str) -> str:
     return _HARMONY_ANALYSIS_BLOCK_RE.sub("", text)
 
 
+def _reasoning_has_tool_markup(text: str, tool_parser=None) -> bool:
+    """True when ``text`` holds a complete tool-call opener for the active parser.
+
+    The complete markers only: unlike ``_streaming_tool_markup_possible`` the partial
+    forms (a trailing ``[name(``, a bare JSON start) are not enough, since this
+    decides whether to tell an operator that a call was written in the thinking.
+    """
+    parser_markers = getattr(tool_parser, "STREAMING_MARKERS", ())
+    return (
+        any(marker in text for marker in _STREAMING_TOOL_MARKERS)
+        or any(marker in text for marker in parser_markers)
+        or _STREAMING_BARE_BRACKET_MARKER.search(text) is not None
+    )
+
+
+def _warn_call_only_in_reasoning(reasoning_chars: int) -> None:
+    """Say why a response has no tool call although the model wrote one.
+
+    Calls are parsed from the content part only, so a call that exists only inside
+    the thinking is dropped; without this line an agent loop that stalls on it
+    leaves nothing in the log. Sizes only: the text can hold arguments.
+    """
+    logger.warning(
+        "Tool-call markup found in the reasoning (%d chars) but the content has no "
+        "tool call: the thinking is never parsed for calls, so this response has none "
+        "(the model wrote its call inside <think>, or was cut off before closing it)",
+        reasoning_chars,
+    )
+
+
+class _ReasoningMarkupWatch:
+    """Streaming counterpart of the check in ``_extract_reasoning_and_tool_calls``.
+
+    Fed every reasoning delta; keeps only the last few hundred characters so a marker
+    split across deltas is still seen and the scan cost does not grow with the output.
+    """
+
+    def __init__(self, tool_parser) -> None:
+        self._tool_parser = tool_parser
+        self._tail = ""
+        self.seen = False
+        self._reasoning_chars = 0
+
+    def feed(self, reasoning: str | None) -> None:
+        if not reasoning or self._tool_parser is None:
+            return
+        self._reasoning_chars += len(reasoning)
+        if self.seen:
+            return
+        window = self._tail + reasoning
+        self.seen = _reasoning_has_tool_markup(window, self._tool_parser)
+        self._tail = window[-_STREAMING_TOOL_MARKUP_SCAN_CHARS:]
+
+    def warn_if_no_call(self, has_call: bool) -> None:
+        if self.seen and not has_call:
+            _warn_call_only_in_reasoning(self._reasoning_chars)
+
+
 def _extract_reasoning_and_tool_calls(
     output_text: str,
     request: ChatCompletionRequest | None = None,
@@ -3812,6 +3870,7 @@ def _extract_reasoning_and_tool_calls(
     a thinking cut off rather than a plain reply.
     """
     reasoning_text = None
+    thinking_text = None  # the reasoning as parsed, even if the response drops it
     text_for_tool_parse = output_text
 
     suppress_reasoning = not allow_reasoning
@@ -3861,6 +3920,7 @@ def _extract_reasoning_and_tool_calls(
                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""
+        thinking_text = reasoning_text
         if suppress_reasoning:
             # Keep the cleaned answer, but do not expose thoughts emitted
             # despite enable_thinking=False.
@@ -3884,6 +3944,16 @@ def _extract_reasoning_and_tool_calls(
             )
     else:
         cleaned_text, tool_calls = text_for_tool_parse, None
+
+    if (
+        thinking_text
+        and not tool_calls
+        and request is not None
+        and getattr(request, "tools", None)
+        and _reasoning_has_tool_markup(thinking_text, _tool_parser_instance)
+        and not _tool_choice_disabled(request)
+    ):
+        _warn_call_only_in_reasoning(len(thinking_text))
 
     return reasoning_text, cleaned_text, tool_calls
 
@@ -7262,6 +7332,7 @@ async def _stream_anthropic_messages(
     # as text_delta events. Mirrors the OpenAI streaming path logic.
     tool_accumulated_text = ""
     tool_parser = _get_streaming_tool_parser(openai_request, engine)
+    reasoning_watch = _ReasoningMarkupWatch(tool_parser if reasoning_parser else None)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
     tool_request_context = openai_request.model_dump()
 
@@ -7373,6 +7444,7 @@ async def _stream_anthropic_messages(
                 else:
                     continue
 
+            reasoning_watch.feed(delta_msg.reasoning)
             if delta_msg.reasoning and not thinking_off:
                 if not thinking_block_started:
                     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
@@ -7453,6 +7525,7 @@ async def _stream_anthropic_messages(
             openai_request,
             engine=engine,
         )
+        reasoning_watch.warn_if_no_call(bool(tool_calls))
 
         # Close text block
         if text_block_started:
@@ -7687,6 +7760,7 @@ async def stream_chat_completion(
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_parser = _get_streaming_tool_parser(request, engine)
+    reasoning_watch = _ReasoningMarkupWatch(tool_parser if reasoning_parser else None)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
     buffer_typed_tool_calls = request.tool_argument_recovery == "buffered"
     buffered_tool_calls: dict[int, dict] = {}
@@ -7753,6 +7827,7 @@ async def stream_chat_completion(
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
+                reasoning_watch.feed(reasoning)
                 content, reasoning = _promote_streaming_response_format_delta(
                     content, reasoning, request
                 )
@@ -8125,6 +8200,7 @@ async def stream_chat_completion(
         # (e.g., </tool_call> never arrived, <function= block still incomplete,
         # or a harmony commentary block ended at EOS without <|call|>). Parse
         # the raw accumulation so the closing commentary block yields its call.
+        fallback_call_emitted = False
         if (
             tool_parser
             and tool_accumulated_text
@@ -8165,6 +8241,9 @@ async def stream_chat_completion(
                 attach_terminal_metadata(tool_chunk, last_output)
                 yield f"data: {tool_chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = True
+                fallback_call_emitted = True
+
+        reasoning_watch.warn_if_no_call(tool_calls_detected or fallback_call_emitted)
 
         # Terminal-chunk guard: if the engine's finished output was swallowed
         # by a parser `continue` above (e.g. a bare end-of-turn token arriving

@@ -20,6 +20,7 @@ for real here, with the real parsers and a fake engine.
 """
 
 import json
+import logging
 import re
 
 import pytest
@@ -583,3 +584,121 @@ def test_the_chat_endpoint_streams_one_call_for_a_draft_then_call_and_none_for_a
     ]
     indexes = {tc["index"] for d in deltas for tc in d.get("tool_calls") or []}
     assert len(indexes) == expected_calls
+
+
+# --- the operator is told when a call was written only inside the thinking ------------
+
+WARNING_TEXT = "Tool-call markup found in the reasoning"
+
+
+def _call_in_thinking_warnings(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and WARNING_TEXT in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "warned"),
+    [
+        # the model's only call is in the thinking, or it was cut off in it: no call
+        # goes out, and the log is the only trace of why
+        ("draft-only", 1),
+        ("cut-off-in-thinking", 1),
+        ("cut-off-in-draft", 1),
+        # a real call follows, or there is no call-shaped markup at all: nothing to say
+        ("draft-then-call", 0),
+        ("call-only", 0),
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["non-stream", "stream"])
+@pytest.mark.parametrize("site", SITES)
+@pytest.mark.anyio
+async def test_a_call_that_exists_only_in_the_thinking_is_logged_once_without_its_text(
+    monkeypatch, caplog, tool_config, site, stream, scenario, warned
+):
+    if site == "anthropic" and not stream:
+        pytest.skip("covered through /v1/messages below")
+    raw, _ = _scenarios(tool_config)[scenario]
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        await _run(site, monkeypatch, raw, "tokens", stream=stream)
+
+    messages = _call_in_thinking_warnings(caplog)
+    assert len(messages) == warned
+    for message in messages:
+        # sizes only: the reasoning and its arguments are not written to the log
+        assert "if a < b" not in message and "echo_args" not in message
+
+
+@pytest.mark.parametrize("path", list(ENDPOINT_BODIES))
+def test_endpoints_log_a_call_that_exists_only_in_the_thinking_once(
+    monkeypatch, caplog, tool_config, path
+):
+    raw, _ = _scenarios(tool_config)["draft-only"]
+    monkeypatch.setattr(srv, "_engine", _engine(raw, "tokens"))
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        response = TestClient(srv.app).post(path, json=ENDPOINT_BODIES[path]())
+
+    assert response.status_code == 200
+    assert len(_call_in_thinking_warnings(caplog)) == 1
+
+
+@pytest.mark.anyio
+async def test_no_warning_without_tools_or_for_plain_thinking(
+    monkeypatch, caplog, tool_config
+):
+    plain = "Just thinking.\n</think>\n\nDone."
+    markup_without_tools = _scenarios(tool_config)["draft-only"][0]
+    request = _request(False)
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        srv._extract_reasoning_and_tool_calls(
+            plain, request, engine=_engine(plain), chat_kwargs={}
+        )
+        no_tools = request.model_copy(update={"tools": None})
+        srv._extract_reasoning_and_tool_calls(
+            markup_without_tools, no_tools, engine=_engine(plain), chat_kwargs={}
+        )
+        refused = request.model_copy(update={"tool_choice": "none"})
+        srv._extract_reasoning_and_tool_calls(
+            markup_without_tools, refused, engine=_engine(plain), chat_kwargs={}
+        )
+
+    assert _call_in_thinking_warnings(caplog) == []
+
+
+@pytest.mark.parametrize("marker", ["<tool_call>", "<function=echo_args>"])
+def test_the_streaming_watch_sees_a_marker_split_across_deltas_and_warns_once(
+    caplog, marker
+):
+    watch = srv._ReasoningMarkupWatch(
+        ToolParserManager.get_tool_parser("qwen3_coder")()
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        for char in "I will call it: " + marker + " now":
+            watch.feed(char)
+        watch.warn_if_no_call(False)
+
+    assert watch.seen
+    assert len(_call_in_thinking_warnings(caplog)) == 1
+
+
+def test_the_streaming_watch_is_silent_with_a_call_or_without_markup(caplog):
+    quiet = srv._ReasoningMarkupWatch(None)
+    plain = srv._ReasoningMarkupWatch(ToolParserManager.get_tool_parser("hermes")())
+    called = srv._ReasoningMarkupWatch(ToolParserManager.get_tool_parser("hermes")())
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        quiet.feed(_xml_call())  # no tool parser: tools were not declared
+        quiet.warn_if_no_call(False)
+        plain.feed("a < b and c > d, so call_it(x) is fine")
+        plain.warn_if_no_call(False)
+        called.feed(_xml_call())
+        called.warn_if_no_call(True)
+
+    assert _call_in_thinking_warnings(caplog) == []

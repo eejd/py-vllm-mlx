@@ -3730,6 +3730,113 @@ class TestStreamChatCompletion:
         assert [c["finish_reason"] for c in choices if c["finish_reason"]] == ["stop"]
 
     @pytest.mark.anyio
+    async def test_reasoning_stream_gemma4_call_after_a_closed_channel_is_a_call(
+        self, monkeypatch
+    ):
+        """The other half of the unclosed-channel test: once the thought channel is
+        closed, the call after it is content and is returned, streaming and not."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import get_parser
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        from vllm_mlx.tool_parsers import ToolParserManager
+        import vllm_mlx.server as server
+
+        call = '<|tool_call>call:read_file{path:<|"|>/tmp/a.py<|"|>}<tool_call|>'
+        pieces = ["<|channel>thought\n", "Let me read it. ", "<channel|>", call]
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                for i, piece in enumerate(pieces):
+                    last = i == len(pieces) - 1
+                    yield GenerationOutput(
+                        text="",
+                        new_text=piece,
+                        finished=last,
+                        finish_reason="stop" if last else None,
+                        prompt_tokens=11,
+                        completion_tokens=i + 1,
+                    )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", get_parser("gemma4")())
+        monkeypatch.setattr(server, "_reasoning_parser_name", "gemma4")
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "gemma4")
+        monkeypatch.setattr(
+            server,
+            "_tool_parser_instance",
+            ToolParserManager.get_tool_parser("gemma4")(),
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+        request = ChatCompletionRequest(
+            model="request-model",
+            messages=[Message(role="user", content="hi")],
+            tools=tools,
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        choices = [p["choices"][0] for p in payloads if p["choices"]]
+        streamed_calls = [
+            tc
+            for c in choices
+            for tc in c["delta"].get("tool_calls") or []
+            if tc["function"].get("name")
+        ]
+
+        assert [tc["function"]["name"] for tc in streamed_calls] == ["read_file"]
+        assert "Let me read it." in "".join(
+            c["delta"].get("reasoning") or c["delta"].get("reasoning_content") or ""
+            for c in choices
+        )
+        assert call not in "".join(c["delta"].get("content") or "" for c in choices)
+        assert [c["finish_reason"] for c in choices if c["finish_reason"]] == [
+            "tool_calls"
+        ]
+
+        # non-streaming reads the same output the same way
+        reasoning, content, calls = server._extract_reasoning_and_tool_calls(
+            "".join(pieces),
+            ChatCompletionRequest(
+                model="request-model",
+                messages=[Message(role="user", content="hi")],
+                tools=tools,
+            ),
+        )
+        assert [c.function.name for c in calls] == ["read_file"]
+        assert "Let me read it." in reasoning
+        assert not content
+
+    @pytest.mark.anyio
     async def test_reasoning_stream_skips_tool_parser_until_markup_appears(
         self, monkeypatch
     ):
