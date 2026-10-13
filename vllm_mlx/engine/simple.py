@@ -57,6 +57,20 @@ from ..mlx_streams import (
 logger = logging.getLogger(__name__)
 
 
+def _mllm_completion_tokens(chunk: Any, previous: int) -> int:
+    """Cumulative ``completion_tokens`` carried by an MLLM stream chunk.
+
+    The MLLM stream ends with a chunk that holds no new token (it flushes the
+    detokenizer and carries the finish reason), so counting chunks overstates
+    the generation by one. Chunks report the running token count themselves
+    (mlx-vlm's ``generation_tokens``, which includes the stop token, as vLLM's
+    ``len(token_ids)`` does); a chunk that does not falls back to one more than
+    before.
+    """
+    count = getattr(chunk, "completion_tokens", None)
+    return count if isinstance(count, int) else previous + 1
+
+
 def _reject_ignore_eos_on_mlx_vlm(kwargs: dict[str, Any]) -> None:
     """Refuse ``ignore_eos`` on a route that decodes through mlx-vlm.
 
@@ -2050,7 +2064,7 @@ class SimpleEngine(BaseEngine):
                             if chunk is _STREAM_DONE:
                                 break
 
-                            token_count += 1
+                            token_count = _mllm_completion_tokens(chunk, token_count)
                             new_text = (
                                 chunk.text if hasattr(chunk, "text") else str(chunk)
                             )
@@ -2106,7 +2120,7 @@ class SimpleEngine(BaseEngine):
                 request_id=request_id,
             )
             for chunk in chunks:
-                token_count += 1
+                token_count = _mllm_completion_tokens(chunk, token_count)
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
                 finished = chunk.finish_reason is not None

@@ -508,6 +508,20 @@ def _until_stop_sequence(chunks, stop: list[str] | None):
             break
 
 
+def _generation_tokens(chunk, previous: int) -> int:
+    """Tokens generated so far, as mlx_vlm counts them.
+
+    ``stream_generate`` yields one chunk per decoded token plus a final chunk
+    that only flushes the detokenizer, so the number of chunks is not the
+    number of tokens (it is one too many at a length stop). ``generation_tokens``
+    is the model's own count: it includes the token that ended the generation,
+    which is how vLLM counts ``len(token_ids)``. A chunk without it (a custom
+    ``stream_generate``) falls back to one more than before.
+    """
+    count = getattr(chunk, "generation_tokens", None)
+    return count if isinstance(count, int) else previous + 1
+
+
 def _stream_mllm_generated_outputs(
     *,
     stream_generate_fn,
@@ -540,7 +554,7 @@ def _stream_mllm_generated_outputs(
     )
     for chunk in _until_stop_sequence(chunks, stop):
         last_chunk = chunk
-        token_count += 1
+        token_count = _generation_tokens(chunk, token_count)
         yield MLLMOutput(
             text=_chunk_text(chunk),
             finish_reason=None,
