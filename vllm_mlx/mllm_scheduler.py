@@ -682,6 +682,20 @@ class MLLMScheduler:
                 request.specprefill_outcome = response.specprefill_outcome
 
             generator = getattr(self, "batch_generator", None)
+            pop_prompt_tokens = getattr(generator, "pop_prompt_tokens", None)
+            if callable(pop_prompt_tokens):
+                # A media prompt only reaches its real length in the processor
+                # (one placeholder becomes hundreds of image tokens); the
+                # tokenizer estimate made at admission is a lower bound.
+                actual = pop_prompt_tokens(request_id)
+                if (
+                    isinstance(actual, int)
+                    and actual > 0
+                    and actual != request.num_prompt_tokens
+                ):
+                    self.total_prompt_tokens += actual - request.num_prompt_tokens
+                    request.num_prompt_tokens = actual
+
             if request.cached_tokens is None and generator is not None:
                 reused = generator.pop_cached_tokens(request_id)
                 if reused is not None:

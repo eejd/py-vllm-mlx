@@ -250,7 +250,9 @@ class VisionEmbeddingCache:
             input_ids=input_ids,
             attention_mask=attention_mask,
             image_grid_thw=image_grid_thw,
-            extra_kwargs=extra_kwargs or {},
+            # Own the dict: the request that produced it clears its own
+            # extra_kwargs after prefill, which must not empty this entry.
+            extra_kwargs=dict(extra_kwargs) if extra_kwargs else {},
             processing_time=processing_time,
         )
         self._pixel_cache[key] = entry

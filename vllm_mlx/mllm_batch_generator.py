@@ -929,6 +929,34 @@ class MLLMBatchGenerator:
         """Prompt tokens the prefix cache supplied; None if it was not consulted."""
         return self._reuse_table().pop(request_id, None)
 
+    def _record_prompt_tokens(self, req: Any) -> None:
+        """Remember the processed prompt length of a media request.
+
+        The processor expands each image/audio placeholder into the model's
+        real number of media tokens, so the scheduler's tokenizer estimate
+        under-counts. Text-only prompts are tokenized the same way by both and
+        are left to the estimate.
+        """
+        input_ids = getattr(req, "input_ids", None)
+        if getattr(req, "is_text_only", True) or input_ids is None:
+            return
+        table = self.__dict__.get("_prompt_token_counts")
+        if table is None:
+            table = self._prompt_token_counts = {}
+        table[req.request_id] = int(input_ids.shape[-1])
+        try:
+            while len(table) > 4096:
+                table.pop(next(iter(table)), None)
+        except (RuntimeError, StopIteration):
+            pass
+
+    def pop_prompt_tokens(self, request_id: str) -> Optional[int]:
+        """Processed prompt length of a media request; None for text-only."""
+        table = self.__dict__.get("_prompt_token_counts")
+        if table is None:
+            return None
+        return table.pop(request_id, None)
+
     def abort_prefill(self, request_id: str) -> None:
         """Signal that a request's prefill should be aborted.
 
@@ -940,6 +968,7 @@ class MLLMBatchGenerator:
         the request and may remain reusable after a later disconnect.
         """
         self._reuse_table().pop(request_id, None)
+        self.pop_prompt_tokens(request_id)
         with self._prefix_checkpoint_lock:
             self._aborted_request_ids.add(request_id)
             state = self._request_prefix_checkpoints.pop(request_id, None)
@@ -1693,36 +1722,59 @@ class MLLMBatchGenerator:
         """
         Run the initial VLM forward pass to encode vision and get first logits.
 
-        This runs the full VLM model (vision + language) on the prompt,
-        which encodes the images and fills the provided KV cache.
+        This follows mlx-vlm's own prefill (``mlx_vlm.generate.ar``):
+        ``model.get_input_embeddings(input_ids, pixel_values, mask=mask,
+        **processor_kwargs)`` fuses the image features into the token
+        embeddings, then the language model runs on those embeddings with the
+        embedding step's extra outputs (``position_ids``, ``rope_deltas``,
+        ``visual_pos_masks``, ``per_layer_inputs`` ...) and the processor's
+        remaining outputs (``image_grid_thw``, ``image_sizes`` ...).
+
+        The model's own ``__call__`` is deliberately not used: its signature
+        and its use of the attention mask differ per family (Gemma-3 builds
+        an all-ones 4D mask there that makes the prompt attend bidirectionally,
+        Mistral-3 requires ``mask`` positionally, Qwen-VL ignores it), whereas
+        ``get_input_embeddings`` takes the processor's mask as ``mask=`` for
+        every family.
 
         Args:
             request: Preprocessed request with input_ids and pixel_values
-            cache: KV cache list for the language model. If provided, the
-                   language model writes its KV state directly into this cache
-                   during the forward pass.
+            cache: KV cache list for the language model. The language model
+                   writes its KV state directly into this cache.
 
         Returns:
             Logits from the forward pass
         """
-        # Build model call kwargs
-        kwargs = dict(request.extra_kwargs)
-
-        if request.pixel_values is not None:
-            kwargs["pixel_values"] = request.pixel_values
-        if request.attention_mask is not None:
-            kwargs["attention_mask"] = request.attention_mask
+        # Processor outputs other than input_ids/pixel_values/attention_mask
+        # reach both the embedding step and the language model, as in mlx-vlm.
+        data_kwargs = dict(request.extra_kwargs)
         if request.image_grid_thw is not None:
-            kwargs["image_grid_thw"] = request.image_grid_thw
+            data_kwargs["image_grid_thw"] = request.image_grid_thw
 
-        # Run full VLM forward pass with cache.
-        # The VLM passes cache= through to self.language_model(),
-        # so the language model writes KV state directly into our cache.
         input_ids = request.input_ids
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
+        mask = request.attention_mask
+        if mask is not None and mask.ndim == 1:
+            mask = mask[None, :]
 
-        output = self.model(input_ids, cache=cache, **kwargs)
+        embedding = self.model.get_input_embeddings(
+            input_ids, request.pixel_values, mask=mask, **data_kwargs
+        )
+        language_kwargs = {
+            **data_kwargs,
+            **{
+                key: value
+                for key, value in embedding.to_dict().items()
+                if key != "inputs_embeds" and value is not None
+            },
+        }
+        output = self.language_model(
+            input_ids,
+            inputs_embeds=embedding.inputs_embeds,
+            cache=cache,
+            **language_kwargs,
+        )
         request.vision_encoded = True
 
         # Release preprocessed vision inputs now that they have been encoded
@@ -1954,6 +2006,7 @@ class MLLMBatchGenerator:
             try:
                 self._preprocess_request(req)
                 req.rope_deltas = self._derive_request_rope_deltas(req)
+                self._record_prompt_tokens(req)
             except Exception as e:
                 logger.error(
                     f"Failed to preprocess request {req.request_id}: "
