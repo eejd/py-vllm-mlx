@@ -54,7 +54,7 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--default-temperature` | Default temperature when not specified in request | None |
 | `--default-top-p` | Default top_p when not specified in request | None |
 | `--default-chat-template-kwargs` | Default chat template kwargs applied when request `chat_template_kwargs` is omitted (JSON object) | None |
-| `--chat-template` | Replace the model's chat template: path to a Jinja file, or the template on one line. Not supported with `--models-config` | None |
+| `--chat-template` | Replace the model's chat template: path to a Jinja file, or the template on one line. The package ships tool templates for Phi-4-mini and Hermes-3 (`vllm_mlx.templates`). Not supported with `--models-config` | None |
 | `--max-audio-upload-mb` | Maximum uploaded audio size for `/v1/audio/transcriptions` | 25 |
 | `--max-tts-input-chars` | Maximum text length accepted by `/v1/audio/speech` | 4096 |
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
