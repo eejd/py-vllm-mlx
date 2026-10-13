@@ -3799,16 +3799,18 @@ def _reasoning_has_tool_markup(text: str, tool_parser=None) -> bool:
 
 
 def _warn_call_only_in_reasoning(reasoning_chars: int) -> None:
-    """Say why a response has no tool call although the model wrote one.
+    """Say why a response has no tool call although the reasoning looks like one.
 
     Calls are parsed from the content part only, so a call that exists only inside
     the thinking is dropped; without this line an agent loop that stalls on it
-    leaves nothing in the log. Sizes only: the text can hold arguments.
+    leaves nothing in the log. The markup is only evidence, not proof: it may as
+    well be text the model discussed. Sizes only: the text can hold arguments.
     """
     logger.warning(
         "Tool-call markup found in the reasoning (%d chars) but the content has no "
         "tool call: the thinking is never parsed for calls, so this response has none "
-        "(the model wrote its call inside <think>, or was cut off before closing it)",
+        "(the markup may be a call written inside <think>, text the model discussed, "
+        "or a call cut off before the thinking closed)",
         reasoning_chars,
     )
 

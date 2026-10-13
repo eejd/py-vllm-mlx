@@ -702,3 +702,19 @@ def test_the_streaming_watch_is_silent_with_a_call_or_without_markup(caplog):
         called.warn_if_no_call(True)
 
     assert _call_in_thinking_warnings(caplog) == []
+
+
+def test_the_streaming_watch_remembers_a_marker_after_the_tail_has_moved_past_it(
+    caplog,
+):
+    watch = srv._ReasoningMarkupWatch(
+        ToolParserManager.get_tool_parser("qwen3_coder")()
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        watch.feed("a draft: " + _xml_call())
+        for _ in range(20):  # far more than the retained tail
+            watch.feed("and then it kept thinking about something else entirely. ")
+        watch.warn_if_no_call(False)
+
+    assert len(_call_in_thinking_warnings(caplog)) == 1
