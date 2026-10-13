@@ -24,6 +24,35 @@ FALLBACK_MODELS = [
 ]
 
 
+def prompt_adds_special_tokens(tokenizer, prompt: str) -> bool:
+    """Whether ``tokenizer.encode(prompt)`` should add its own special tokens.
+
+    A prompt that was already rendered by the chat template carries the BOS
+    as literal text (Llama-3 ``<|begin_of_text|>``, Gemma ``<bos>``, ...).
+    Tokenizing it with the tokenizer's default ``add_special_tokens=True``
+    prepends a *second* BOS the template never asked for -- the model then sees
+    ``[BOS, BOS, ...]`` instead of the ``[BOS, ...]`` that
+    ``apply_chat_template(tokenize=True)`` (and upstream vLLM, whose chat
+    tokenization uses ``add_special_tokens=False``) produce.
+
+    This is the same rule ``mlx_lm.generate.stream_generate`` and the Simple
+    engine apply to string prompts: skip the tokenizer's special tokens iff the
+    prompt already starts with the BOS text.  A raw completion prompt without a
+    leading BOS text still gets one from the tokenizer.
+    """
+    bos_token = getattr(tokenizer, "bos_token", None)
+    return not (
+        isinstance(bos_token, str) and bos_token and prompt.startswith(bos_token)
+    )
+
+
+def encode_prompt(tokenizer, prompt: str) -> list[int]:
+    """Tokenize ``prompt`` without duplicating a BOS the prompt already carries."""
+    return tokenizer.encode(
+        prompt, add_special_tokens=prompt_adds_special_tokens(tokenizer, prompt)
+    )
+
+
 def _needs_tokenizer_fallback(model_name: str) -> bool:
     """Check if model needs tokenizer fallback."""
     model_lower = model_name.lower()

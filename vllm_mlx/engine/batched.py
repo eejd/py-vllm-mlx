@@ -25,6 +25,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..utils.tokenizer import encode_prompt
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -1171,8 +1172,8 @@ class BatchedEngine(BaseEngine):
             if hasattr(tokenizer, "tokenizer"):
                 tokenizer = tokenizer.tokenizer
 
-            real_tokens = tokenizer.encode(real_prompt)
-            dummy_tokens = tokenizer.encode(dummy_prompt)
+            real_tokens = encode_prompt(tokenizer, real_prompt)
+            dummy_tokens = encode_prompt(tokenizer, dummy_prompt)
 
             # Find LCP — the point where the two diverge is the boundary
             lcp = 0
