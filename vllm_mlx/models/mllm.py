@@ -2292,6 +2292,7 @@ class MLXMultimodalLM:
         video_fps: float = DEFAULT_FPS,
         video_max_frames: int = MAX_FRAMES,
         use_cache: bool = True,
+        add_special_tokens: bool | None = None,
         **kwargs,
     ) -> MLLMOutput:
         """
@@ -2362,7 +2363,10 @@ class MLXMultimodalLM:
         if audio:
             all_audio.extend(self._prepare_audio(audio))
 
-        # Apply chat template if needed
+        # Apply chat template if needed.  mlx-vlm's own rendering is not the
+        # caller's chat template, so it follows the raw-prompt rule (BOS unless it
+        # has one); an untouched prompt is tokenized as the caller's request kind.
+        prompt_kind = add_special_tokens
         if (all_images or all_audio) and hasattr(self.processor, "apply_chat_template"):
             try:
                 formatted_prompt = apply_chat_template(
@@ -2372,6 +2376,7 @@ class MLXMultimodalLM:
                     num_images=len(all_images),
                     num_audios=len(all_audio),
                 )
+                prompt_kind = None
             except Exception:
                 formatted_prompt = prompt
         else:
@@ -2416,7 +2421,7 @@ class MLXMultimodalLM:
             verbose=False,
             prompt_cache=prompt_cache,
             **self._prepared_inputs(
-                formatted_prompt, all_images, all_audio, add_special_tokens=None
+                formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
             ),
             **self._draft_generation_kwargs(kwargs),
             **kwargs,
@@ -2462,6 +2467,7 @@ class MLXMultimodalLM:
         max_tokens: int = 256,
         temperature: float = 0.7,
         video_fps: float = DEFAULT_FPS,
+        add_special_tokens: bool | None = None,
         **kwargs,
     ) -> Iterator[str]:
         """
@@ -2496,6 +2502,7 @@ class MLXMultimodalLM:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 video_fps=video_fps,
+                add_special_tokens=add_special_tokens,
                 **kwargs,
             )
             yield output.text
@@ -2516,7 +2523,10 @@ class MLXMultimodalLM:
         if audio:
             all_audio.extend(self._prepare_audio(audio))
 
-        # Apply chat template
+        # Apply chat template.  mlx-vlm's own rendering is not the caller's chat
+        # template, so it follows the raw-prompt rule (BOS unless it has one);
+        # an untouched prompt is tokenized as the caller's request kind says.
+        prompt_kind = add_special_tokens
         if all_images or all_audio:
             try:
                 formatted_prompt = apply_chat_template(
@@ -2526,6 +2536,7 @@ class MLXMultimodalLM:
                     num_images=len(all_images),
                     num_audios=len(all_audio),
                 )
+                prompt_kind = None
             except Exception:
                 formatted_prompt = prompt
         else:
@@ -2540,7 +2551,7 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temperature=temperature,
             **self._prepared_inputs(
-                formatted_prompt, all_images, all_audio, add_special_tokens=None
+                formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
             ),
             **self._draft_generation_kwargs(kwargs),
             **kwargs,

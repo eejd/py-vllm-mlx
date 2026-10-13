@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
-from ..utils.tokenizer import eos_ignoring_tokenizer
+from ..utils.tokenizer import encode_prompt, eos_ignoring_tokenizer
 
 if TYPE_CHECKING:
     import mlx.core as mx
@@ -152,6 +152,25 @@ class MLXLanguageModel:
         )
         return processors if processors else None
 
+    def _prompt_ids(
+        self,
+        prompt: Union[str, "mx.array", list[int]],
+        add_special_tokens: bool | None,
+    ):
+        """The token ids to hand mlx-lm for ``prompt``.
+
+        A string prompt is tokenized here, by request kind (see
+        ``utils.tokenizer.encode_prompt``), instead of leaving it to mlx-lm: its
+        ``stream_generate`` applies its own BOS rule to strings, which keeps the
+        tokenizer's BOS on a chat prompt whose template renders none (Hermes-3's
+        ChatML) -- the model then sees a token vLLM never feeds it, and the count
+        the route reports would not be the count the model got.  Token ids pass
+        through untouched.
+        """
+        if isinstance(prompt, str):
+            return encode_prompt(self.tokenizer, prompt, add_special_tokens)
+        return prompt
+
     def generate(
         self,
         prompt: str,
@@ -165,6 +184,7 @@ class MLXLanguageModel:
         stop: list[str] | None = None,
         logits_processors: list | None = None,
         ignore_eos: bool = False,
+        add_special_tokens: bool | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -185,6 +205,9 @@ class MLXLanguageModel:
                 penalty processors.
             ignore_eos: Keep generating past EOS tokens until ``max_tokens``.
                 EOS tokens are counted but not rendered in the text.
+            add_special_tokens: Request kind for a string ``prompt``: False when
+                the chat template rendered it (it owns the BOS), None for a raw
+                completion prompt (the tokenizer's BOS, never doubled).
 
         Returns:
             GenerationOutput with generated text and tokens
@@ -193,6 +216,8 @@ class MLXLanguageModel:
             self.load()
 
         from mlx_lm import generate
+
+        prompt_ids = self._prompt_ids(prompt, add_special_tokens)
 
         # Create sampler and logits processors with full Unsloth params
         sampler = self._create_sampler(temperature, top_p, top_k, min_p)
@@ -211,7 +236,7 @@ class MLXLanguageModel:
         output_text = generate(
             self.model,
             tokenizer,
-            prompt=prompt,
+            prompt=prompt_ids,
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=all_processors if all_processors else None,
@@ -246,6 +271,7 @@ class MLXLanguageModel:
         logits_processors: list | None = None,
         prompt_cache=None,
         ignore_eos: bool = False,
+        add_special_tokens: bool | None = None,
         **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
@@ -264,6 +290,9 @@ class MLXLanguageModel:
             prompt_cache: Pre-populated KV cache (e.g. from SpecPrefill)
             ignore_eos: Keep generating past EOS tokens until ``max_tokens``.
                 EOS tokens are counted but not rendered in the text.
+            add_special_tokens: Request kind for a string ``prompt``: False when
+                the chat template rendered it (it owns the BOS), None for a raw
+                completion prompt (the tokenizer's BOS, never doubled).
 
         Yields:
             StreamingOutput for each generated token
@@ -283,11 +312,10 @@ class MLXLanguageModel:
         if penalty_processors or logits_processors:
             all_processors = (logits_processors or []) + (penalty_processors or [])
 
-        # Count prompt tokens once upfront
-        if isinstance(prompt, str):
-            num_prompt_tokens = len(self.tokenizer.encode(prompt))
-        else:
-            num_prompt_tokens = len(prompt)
+        # Count prompt tokens once upfront, and hand mlx-lm the very ids counted:
+        # a string prompt would be tokenized again by mlx-lm's own BOS rule.
+        prompt_ids = self._prompt_ids(prompt, add_special_tokens)
+        num_prompt_tokens = len(prompt_ids)
 
         stop_list = stop or []
         max_stop_len = max((len(s) for s in stop_list), default=0)
@@ -307,7 +335,7 @@ class MLXLanguageModel:
             stream_generate(
                 self.model,
                 tokenizer,
-                prompt=prompt,
+                prompt=prompt_ids,
                 max_tokens=max_tokens,
                 sampler=sampler,
                 logits_processors=all_processors,
@@ -373,7 +401,8 @@ class MLXLanguageModel:
             self.load()
 
         # Apply chat template
-        if hasattr(self.tokenizer, "apply_chat_template"):
+        rendered_by_template = hasattr(self.tokenizer, "apply_chat_template")
+        if rendered_by_template:
             # Build kwargs for apply_chat_template
             template_kwargs = {
                 "tokenize": False,
@@ -405,11 +434,15 @@ class MLXLanguageModel:
             prompt = "\n".join(f"{msg['role']}: {msg['content']}" for msg in messages)
             prompt += "\nassistant:"
 
+        # The chat template rendered ``prompt`` and owns its BOS (vLLM tokenizes
+        # chat prompts with ``add_special_tokens=False``); the plain-text fallback
+        # is not a template rendering, so it follows the raw-prompt rule.
         return self.generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            add_special_tokens=False if rendered_by_template else None,
             **kwargs,
         )
 

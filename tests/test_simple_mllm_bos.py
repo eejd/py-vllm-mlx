@@ -290,3 +290,55 @@ class TestProcessorsThatDropTheFlag:
         )
         assert seen["add_special_tokens"] is False
         assert type(seen["processor"]).__name__ == "_SpecialTokensForwarder"
+
+
+@pytest.mark.parametrize("route", ["generate", "stream_generate"])
+def test_raw_prompt_flagged_as_rendered_gets_no_bos(boundary, route):
+    # What prompt warm-up sends: a rendered prefix, tokenized like a chat prompt.
+    wrapper, seen = boundary
+    _drain(getattr(wrapper, route)(prompt=RAW, max_tokens=4, add_special_tokens=False))
+    (call,) = seen["prepare_inputs"]
+    assert call["add_special_tokens"] is False
+    # the kind is the wrapper's, not an mlx-vlm generation option
+    assert "add_special_tokens" not in seen["generate"][0]
+
+
+@pytest.mark.parametrize("route", ["generate", "stream_generate"])
+def test_mlx_vlm_rendering_follows_the_raw_prompt_rule_not_the_caller_kind(
+    boundary, route
+):
+    # With images the prompt is rendered by mlx-vlm, not by the caller's chat
+    # template: it carries no promise about the BOS, so the rule decides.
+    wrapper, seen = boundary
+    sys.modules["mlx_vlm.prompt_utils"].apply_chat_template = lambda *a, **k: "[INST]x"
+    wrapper.processor.apply_chat_template = lambda *a, **k: "[INST]x"
+    _drain(
+        getattr(wrapper, route)(
+            prompt=RAW, images=["img"], max_tokens=4, add_special_tokens=False
+        )
+    )
+    (call,) = seen["prepare_inputs"]
+    assert call["prompts"] == "[INST]x"
+    assert call["add_special_tokens"] is True
+
+
+@pytest.mark.anyio
+async def test_simple_engine_forwards_the_request_kind_to_the_mllm_model():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    calls = []
+
+    def stream_generate(**kwargs):
+        calls.append(kwargs)
+        yield "ok"
+
+    engine = SimpleEngine("test-model", force_mllm=True)
+    engine._loaded = True
+    engine._model = SimpleNamespace(
+        stream_generate=stream_generate, tokenizer=FakeTokenizer()
+    )
+    async for _ in engine.stream_generate(RAW, max_tokens=4, add_special_tokens=False):
+        pass
+    async for _ in engine.stream_generate(RAW, max_tokens=4):
+        pass
+    assert [call["add_special_tokens"] for call in calls] == [False, None]
