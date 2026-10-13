@@ -159,6 +159,8 @@ When a reasoning parser and a tool parser are both configured, the reasoning is 
 
 Gemma 4 follows the same rule: a `<|tool_call>` inside an unclosed thought channel is reasoning, not a call.
 
+GPT-OSS (`--reasoning-parser gpt_oss` or `harmony` with `--tool-call-parser harmony` / `gpt-oss`) is the one exception to "content part only": its calls live in the Harmony commentary channel, which a reasoning parser keeps out of its content. The harmony tool parser reads the channels itself (the analysis channel is never content or a call), so it is handed the raw output, control tokens intact, and the reasoning parser supplies the `reasoning`. A call before a final message, a call that ends the generation (the closing `<|call|>` is a stop token and is usually missing from the text) and a call mentioned only in the analysis (not a call) all behave as above, on every endpoint, streaming or not, for deltas of any size.
+
 ## How It Works
 
 The reasoning parser uses text-based detection to identify thinking tags in the model output. During streaming, it tracks the current position in the output to correctly route each token to either `reasoning` or `content`.

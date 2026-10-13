@@ -433,12 +433,13 @@ class TestHarmonyReasoningParser:
         assert r6.reasoning is None
 
     def test_streaming_reset(self, parser):
-        """Reset clears internal state."""
-        parser._current_channel = "analysis"
-        parser._in_message = True
+        """Reset drops a half-read message: the next stream starts from scratch."""
+        parser.extract_reasoning_streaming(
+            "", "<|channel|>analysis<|message|>half", "<|channel|>analysis<|message|>half"
+        )
         parser.reset_state()
-        assert parser._current_channel is None
-        assert parser._in_message is False
+        # text that follows only a half-read analysis message is not reasoning
+        assert parser.extract_reasoning_streaming("", "stray", "stray") is None
 
     def test_streaming_commentary_suppressed(self, parser):
         """Streaming: commentary channel output is suppressed."""

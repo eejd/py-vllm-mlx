@@ -15,21 +15,62 @@ The analysis channel contains reasoning, and the final channel
 contains the user-facing response.
 """
 
-import re
-
 from .base import DeltaMessage, ReasoningParser
+from .harmony_channels import Body, HarmonyScanner, Open, Plain, parse_messages
 
-# Analysis channel blocks: <|channel|>analysis<|message|>...<|end|>
-_ANALYSIS_PATTERN = re.compile(
-    r"<\|channel\|>analysis\s*<\|message\|>(.*?)<\|end\|>",
-    re.DOTALL,
-)
 
-# Final channel content: <|channel|>final<|message|>...<|return|>
-_FINAL_PATTERN = re.compile(
-    r"<\|channel\|>final\s*<\|message\|>(.*?)<\|return\|>",
-    re.DOTALL,
-)
+class HarmonyStreamingReader:
+    """Routes the bodies of a Harmony stream: analysis is reasoning, final is content.
+
+    Shared by the Harmony reasoning parsers. Commentary (tool calls, preambles) and
+    every other channel is not routed: the tool parser reads it from the raw stream.
+    Several analysis (or final) messages are joined with a newline, as the whole-text
+    extraction does. ``plain_text_is_content`` says what text outside any message is:
+    content for a parser whose whole-text extraction returns an untagged output as
+    content, dropped otherwise.
+    """
+
+    def __init__(self, plain_text_is_content: bool) -> None:
+        self._plain_text_is_content = plain_text_is_content
+        self._scanner = HarmonyScanner()
+        self.reset()
+
+    def reset(self) -> None:
+        self._scanner.reset()
+        self._emitted = {"analysis": False, "final": False}
+        self._message_started = False
+
+    def feed(self, delta: str, *, final: bool = False) -> DeltaMessage | None:
+        events = self._scanner.feed(delta)
+        if final:
+            events += self._scanner.finish()
+        reasoning: list[str] = []
+        content: list[str] = []
+        for event in events:
+            if isinstance(event, Open):
+                self._message_started = False
+            elif isinstance(event, Body):
+                if event.channel not in self._emitted:
+                    continue
+                text = event.text
+                if not self._message_started:
+                    text = text.lstrip()
+                    if not text:
+                        continue
+                    self._message_started = True
+                    if self._emitted[event.channel]:
+                        text = "\n" + text
+                self._emitted[event.channel] = True
+                (reasoning if event.channel == "analysis" else content).append(text)
+            elif (
+                isinstance(event, Plain) and event.leading and self._plain_text_is_content
+            ):
+                content.append(event.text)
+        if not reasoning and not content:
+            return None
+        return DeltaMessage(
+            reasoning="".join(reasoning) or None, content="".join(content) or None
+        )
 
 
 class HarmonyReasoningParser(ReasoningParser):
@@ -44,12 +85,15 @@ class HarmonyReasoningParser(ReasoningParser):
         Input: "<|channel|>analysis<|message|>Thinking...<|end|>
                 <|channel|>final<|message|>Result.<|return|>"
         Output: reasoning="Thinking...", content="Result."
+
+    ``<|end|>``, ``<|return|>`` and ``<|call|>`` are stop tokens, which a generation
+    stops on without decoding them, so the text often ends without one: a message that
+    runs to the end of the text is read like a terminated one.
     """
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
-        self._current_channel: str | None = None
-        self._in_message: bool = False
+        self._reader = HarmonyStreamingReader(plain_text_is_content=False)
 
     def extract_reasoning(
         self,
@@ -58,8 +102,8 @@ class HarmonyReasoningParser(ReasoningParser):
         """
         Extract reasoning from complete Harmony output.
 
-        Collects all analysis channel blocks as reasoning and the
-        final channel block as content.
+        Collects all analysis channel messages as reasoning and the
+        final channel messages as content.
 
         Args:
             model_output: Complete model output text.
@@ -67,91 +111,34 @@ class HarmonyReasoningParser(ReasoningParser):
         Returns:
             (reasoning, content) tuple. Either may be None.
         """
-        # Collect all analysis blocks
-        analysis_blocks = _ANALYSIS_PATTERN.findall(model_output)
-        reasoning = "\n".join(block.strip() for block in analysis_blocks) or None
-
-        # Extract final channel content
-        final_match = _FINAL_PATTERN.search(model_output)
-        content = final_match.group(1).strip() if final_match else None
-
-        return reasoning, content
+        messages, _ = parse_messages(model_output)
+        reasoning = "\n".join(
+            m.body.strip() for m in messages if m.channel == "analysis" and m.body.strip()
+        )
+        content = "\n".join(
+            m.body.strip() for m in messages if m.channel == "final" and m.body.strip()
+        )
+        return reasoning or None, content or None
 
     def extract_reasoning_streaming(
         self,
-        previous_text: str,
-        current_text: str,
+        previous_text: str,  # noqa: ARG002
+        current_text: str,  # noqa: ARG002
         delta_text: str,
     ) -> DeltaMessage | None:
         """
         Extract reasoning from streaming Harmony output.
 
-        Tracks the current channel and emits reasoning deltas for
-        analysis channel content and content deltas for final channel.
-
-        Args:
-            previous_text: Accumulated text before this delta.
-            current_text: Accumulated text including this delta.
-            delta_text: The new text in this streaming chunk.
-
-        Returns:
-            DeltaMessage with reasoning and/or content, or None.
+        Reads ``delta_text`` only, whatever its size: a delta may hold several
+        tokens, a control token and text after it, or the end of one message and the
+        start of the next.
         """
-        # Detect channel switches in the delta
-        if "<|channel|>" in delta_text:
-            if "analysis" in delta_text:
-                self._current_channel = "analysis"
-                self._in_message = False
-                return None
-            elif "final" in delta_text:
-                self._current_channel = "final"
-                self._in_message = False
-                return None
-            elif "commentary" in delta_text:
-                self._current_channel = "commentary"
-                self._in_message = False
-                return None
+        return self._reader.feed(delta_text)
 
-        # Detect channel from full context if not yet determined
-        if self._current_channel is None and "<|channel|>" in current_text:
-            last_channel = current_text.rfind("<|channel|>")
-            after = current_text[last_channel + len("<|channel|>") :]
-            if after.startswith("analysis"):
-                self._current_channel = "analysis"
-            elif after.startswith("final"):
-                self._current_channel = "final"
-            elif after.startswith("commentary"):
-                self._current_channel = "commentary"
-
-        # Handle message start
-        if "<|message|>" in delta_text:
-            self._in_message = True
-            # Don't emit the token itself
-            return None
-
-        # Handle channel/message end tokens
-        if any(
-            token in delta_text
-            for token in ("<|end|>", "<|return|>", "<|call|>", "<|start|>")
-        ):
-            self._in_message = False
-            return None
-
-        # Skip control tokens
-        if delta_text.strip().startswith("<|") and delta_text.strip().endswith("|>"):
-            return None
-
-        # Emit content based on current channel
-        if self._in_message and self._current_channel == "analysis":
-            return DeltaMessage(reasoning=delta_text)
-
-        if self._in_message and self._current_channel == "final":
-            return DeltaMessage(content=delta_text)
-
-        # In commentary or unknown channel, suppress
-        return None
+    def finalize_stream(self) -> DeltaMessage | None:
+        """Release a trailing partial token that never completed."""
+        return self._reader.feed("", final=True)
 
     def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
         """Reset streaming state for a new request."""
-        self._current_channel = None
-        self._in_message = False
+        self._reader.reset()
