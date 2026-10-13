@@ -38,7 +38,7 @@ from vllm_mlx.mlx_cache_compat import clone_layer
 from vllm_mlx.utils.chat_template_override import apply_chat_template_override
 from vllm_mlx.utils.mistral_tokenizer import (
     adopt_fast_tokenizer,
-    is_mistral_common_tokenizer,
+    holds_mistral_common_tokenizer,
 )
 
 logger = logging.getLogger(__name__)
@@ -1696,10 +1696,10 @@ class MLXMultimodalLM:
             self.model, self.processor = load(self.model_name)
             # Mistral tekken checkpoints come with a tokenizer that cannot read a
             # rendered prompt string (see utils/mistral_tokenizer.py).
-            if is_mistral_common_tokenizer(getattr(self.processor, "tokenizer", None)):
+            if holds_mistral_common_tokenizer(self.processor):
                 from mlx_vlm.utils import get_model_path
 
-                adopt_fast_tokenizer(
+                self.processor = adopt_fast_tokenizer(
                     self.processor,
                     get_model_path(self.model_name),
                     eos_token_ids=getattr(self.model.config, "eos_token_id", None),

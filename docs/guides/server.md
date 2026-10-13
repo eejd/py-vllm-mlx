@@ -119,6 +119,14 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="")
 ```
 
+**Security note: control-token text in message content.** The chat template renders the
+conversation to a string and the string is tokenized afterwards, as in other
+Hugging Face-based servers. Text a user types that spells a control token of the model's
+tokenizer (`<|im_start|>`, `[INST]`, `[TOOL_CALLS]`, `<s>`, ...) is therefore encoded as
+that control token, not as literal characters, and can open or close turns or fake tool
+calls in the prompt. There is no opt-out. Treat user content as untrusted at the
+application layer (strip or reject such strings) when that matters.
+
 ### Completions
 
 ```bash

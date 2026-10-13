@@ -23,7 +23,8 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 ship `tekken.json`) need the `tokenizer.json` in the same directory. It is used in place of
 the mistral-common tokenizer after a load-time check that both are the same tokenizer; without
 it the server logs a warning and these models see `[INST]`, `<s>` and the other control tokens
-of the prompt as plain text.
+of the prompt as plain text. Their template is stricter about message order than
+mistral-common's renderer (see [Tool Calling](../guides/tool-calling.md#mistral--devstral)).
 
 ### Recommended Models
 
