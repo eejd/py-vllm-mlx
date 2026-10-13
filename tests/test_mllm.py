@@ -272,6 +272,12 @@ class TestMLLMMediaAndHelperFunctions:
         monkeypatch.setitem(sys.modules, "mlx_vlm.prompt_utils", fake_prompt_utils)
         monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
         monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
+        fake_utils = ModuleType("mlx_vlm.utils")
+        fake_utils.prepare_inputs = lambda *a, **k: {
+            "input_ids": [[1, 2, 3]],
+            "attention_mask": [[1, 1, 1]],
+        }
+        monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_utils)
 
         chunks = list(
             model.stream_chat(
