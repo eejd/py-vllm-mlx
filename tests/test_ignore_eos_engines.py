@@ -12,7 +12,6 @@ the real mlx-lm ``BatchGenerator`` / ``stream_generate``, so they exercise the
 actual stop logic, not a mock of it.
 """
 
-import asyncio
 import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
