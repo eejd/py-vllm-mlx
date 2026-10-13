@@ -2010,7 +2010,9 @@ class SimpleEngine(BaseEngine):
         await self._ensure_text_model_for_request(mllm_draft_requested=draft)
 
         with chat_template_rejections():
-            if self._uses_text_model_route(has_media=has_media, mllm_draft_requested=draft):
+            if self._uses_text_model_route(
+                has_media=has_media, mllm_draft_requested=draft
+            ):
                 self._render_text_route_prompt(
                     messages, template_tools, ctk, enable_thinking
                 )
@@ -2913,7 +2915,6 @@ class SimpleEngine(BaseEngine):
         system prompt restore the snapshot and only prefill the suffix tokens.
         """
         import hashlib
-        import os
 
         import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate

@@ -37,7 +37,9 @@ def chat_template_rejections() -> Iterator[None]:
         raise ChatTemplateRejected(str(exc)) from exc
 
 
-def reject_template_errors(method: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+def reject_template_errors(
+    method: Callable[..., Awaitable[T]],
+) -> Callable[..., Awaitable[T]]:
     """Run an async engine method under ``chat_template_rejections``."""
 
     @functools.wraps(method)

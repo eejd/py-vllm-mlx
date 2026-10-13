@@ -199,7 +199,9 @@ class TestSimpleEngineRoutes:
         tok = _tokenizer()
         lm = MLXMultimodalLM.__new__(MLXMultimodalLM)
         lm.processor = SimpleNamespace(
-            tokenizer=tok, chat_template=GEMMA_TEMPLATE, apply_chat_template=tok.apply_chat_template
+            tokenizer=tok,
+            chat_template=GEMMA_TEMPLATE,
+            apply_chat_template=tok.apply_chat_template,
         )
         lm.config = SimpleNamespace(model_type="gemma3")
         lm._loaded = True
@@ -227,19 +229,26 @@ class TestSimpleEngineRoutes:
         image = {"type": "image_url", "image_url": {"url": "file:///x.png"}}
         for part in (video, image):
             messages = [
-                {"role": "assistant", "content": [part, {"type": "text", "text": "hi"}]},
+                {
+                    "role": "assistant",
+                    "content": [part, {"type": "text", "text": "hi"}],
+                },
                 {"role": "user", "content": "hello?"},
             ]
             with pytest.raises(ChatTemplateRejected, match="must alternate"):
                 await mllm_engine.validate_chat_template(messages)
-
 
     async def test_a_video_only_turn_still_counts_as_a_turn(self, mllm_engine):
         # Dropping the turn (no frames, no text) would hide the bad order.
         mllm_engine._text_model = None
         mllm_engine._model = self._model()
         messages = [
-            {"role": "assistant", "content": [{"type": "video_url", "video_url": {"url": "file:///x.mp4"}}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": "file:///x.mp4"}}
+                ],
+            },
             {"role": "user", "content": "hello?"},
         ]
         with pytest.raises(ChatTemplateRejected, match="must alternate"):
@@ -258,7 +267,8 @@ class TestMultimodalFormatter:
 
     def test_template_rejection_is_not_answered_with_the_last_user_message(self):
         processor = SimpleNamespace(
-            tokenizer=_tokenizer(), chat_template=GEMMA_TEMPLATE,
+            tokenizer=_tokenizer(),
+            chat_template=GEMMA_TEMPLATE,
             apply_chat_template=_tokenizer().apply_chat_template,
         )
         lm = self._model(processor)
@@ -287,7 +297,8 @@ class TestMultimodalFormatter:
     def test_pre_check_runs_the_requests_message_preparation(self):
         tok = _tokenizer()
         processor = SimpleNamespace(
-            tokenizer=tok, chat_template=GEMMA_TEMPLATE,
+            tokenizer=tok,
+            chat_template=GEMMA_TEMPLATE,
             apply_chat_template=tok.apply_chat_template,
         )
         lm = self._model(processor)
@@ -388,3 +399,148 @@ class _FakeRequest:
 
     async def json(self):
         return self._body
+
+
+# A template that refuses a request carrying tools, naming the first tool: the
+# pre-check rejects it only if it hands the template the request's converted tools.
+TOOLS_TEMPLATE = (
+    "{%- if tools -%}"
+    "{{ raise_exception('template refuses tool ' ~ tools[0]['function']['name']) }}"
+    "{%- endif -%}"
+    "{{ messages[0]['content'] }}"
+)
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {"name": "get_weather", "parameters": {"type": "object"}},
+}
+
+
+@pytest.mark.anyio
+class TestPreCheckSeesTheRequestInputs:
+    """The pre-check must render with the tools / thinking flags the request uses."""
+
+    async def _expect_tools_reach_the_template(self, engine):
+        await engine.validate_chat_template(VALID)
+        with pytest.raises(ChatTemplateRejected, match="refuses tool get_weather"):
+            await engine.validate_chat_template(VALID, tools=[WEATHER_TOOL])
+
+    async def test_batched_engine(self, batched_engine):
+        batched_engine._tokenizer = _tokenizer(TOOLS_TEMPLATE)
+        await self._expect_tools_reach_the_template(batched_engine)
+
+    async def test_simple_engine_llm_route(self, simple_engine):
+        simple_engine._model = SimpleNamespace(tokenizer=_tokenizer(TOOLS_TEMPLATE))
+        await self._expect_tools_reach_the_template(simple_engine)
+
+    async def test_simple_engine_text_model_route(self):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine("org/gemma-like-vlm", force_mllm=True)
+        engine._loaded = True
+        engine._is_mllm = True
+        engine._text_model = object()
+        engine._text_tokenizer = _tokenizer(TOOLS_TEMPLATE)
+        engine._model = SimpleNamespace()  # reaching it would be an AttributeError
+        await self._expect_tools_reach_the_template(engine)
+
+    async def test_simple_engine_mllm_route(self):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine("org/gemma-like-vlm", force_mllm=True)
+        engine._loaded = True
+        engine._is_mllm = True
+        engine._text_model = None
+        engine._model = _mllm_model(TOOLS_TEMPLATE, model_type="qwen2_vl")
+        await self._expect_tools_reach_the_template(engine)
+
+
+def _mllm_model(template: str, model_type: str = "gemma3"):
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    tok = _tokenizer(template)
+    lm = MLXMultimodalLM.__new__(MLXMultimodalLM)
+    lm.processor = SimpleNamespace(
+        tokenizer=tok,
+        chat_template=template,
+        apply_chat_template=tok.apply_chat_template,
+    )
+    lm.config = SimpleNamespace(model_type=model_type)
+    lm._loaded = True
+    return lm
+
+
+class TestMultimodalPreCheckPreparation:
+    """``render_chat_prompt`` prepares messages and flags exactly like ``chat``."""
+
+    def test_tool_turns_are_serialized_for_a_template_without_a_tool_role(self):
+        # Gemma's template knows no ``tool`` role. ``chat`` rewrites tool turns to
+        # user text first; a pre-check that skipped this would 400 a request that
+        # is in fact served.
+        lm = _mllm_model(GEMMA_TEMPLATE)
+        conversation = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        ]
+        prompt = lm.render_chat_prompt(conversation)
+        assert "get_weather()" in prompt
+        assert "tool_output" in prompt and "sunny" in prompt
+
+    @pytest.mark.parametrize("enable_thinking", [None, True, False])
+    def test_enable_thinking_nested_in_chat_template_kwargs_wins(self, enable_thinking):
+        lm = _mllm_model("{{ messages[0]['content'] }}|thinking={{ enable_thinking }}")
+        render = lm.render_chat_prompt
+        assert render(VALID).endswith("|thinking=True")  # chat's default
+        assert render(VALID, enable_thinking=False).endswith("|thinking=False")
+        nested = {"enable_thinking": False}
+        assert render(
+            VALID, enable_thinking=enable_thinking, chat_template_kwargs=nested
+        ).endswith("|thinking=False")
+        assert nested == {"enable_thinking": False}  # the caller's dict is not consumed
+
+
+@pytest.mark.anyio
+class TestPreCheckBusyEngine:
+    """An engine that is busy initialising its text route answers 503, not 500."""
+
+    @pytest.mark.parametrize("stream_endpoint", ["chat", "responses", "anthropic"])
+    async def test_busy_engine_is_a_retryable_503(
+        self, served, monkeypatch, stream_endpoint
+    ):
+        from vllm_mlx.engine.base import EngineBusy
+
+        async def busy(*args, **kwargs):
+            raise EngineBusy("text route is busy")
+
+        monkeypatch.setattr(served, "validate_chat_template", busy)
+        with pytest.raises(server.HTTPException) as exc_info:
+            if stream_endpoint == "chat":
+                request = ChatCompletionRequest(
+                    model="served",
+                    messages=[Message(role="user", content="hi")],
+                    stream=True,
+                )
+                await server.create_chat_completion(request, raw_request=None)
+            elif stream_endpoint == "responses":
+                request = ResponsesRequest(model="served", input="hi", stream=True)
+                await server.create_response(request, raw_request=None)
+            else:
+                body = {
+                    "model": "served",
+                    "max_tokens": 16,
+                    "messages": VALID,
+                    "stream": True,
+                }
+                await server.create_anthropic_message(_FakeRequest(body))
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail["error"] == "text_generation_busy"
