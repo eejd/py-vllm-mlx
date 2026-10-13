@@ -175,6 +175,11 @@ from .cli_arg_types import (
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .utils.chat_template_override import CHAT_TEMPLATE_HELP, chat_template_arg
+from .utils.chat_template_tools import (
+    engine_template_renderer,
+    template_renders_tools,
+    tools_ignored_warning,
+)
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
     resolve_stt_model_name,
@@ -2021,6 +2026,10 @@ async def lifespan(app: FastAPI):
             and hasattr(_engine, "load_cache_from_disk")
         ):
             await _load_prefix_cache_from_disk()
+
+        # A template that never reads `tools` leaves tool calling silently dead.
+        if _residency_manager is None and _model_manager is None:
+            _warn_if_template_ignores_tools(_engine)
 
         # Warm up prefix cache with user-provided prompts (AFTER disk cache load,
         # so any already-persisted entries are preserved and warm-up only fills
@@ -3990,6 +3999,26 @@ def _detect_native_tool_support() -> bool:
             _sanitize_log_text(e, limit=500),
         )
         return False
+
+
+def _warn_if_template_ignores_tools(engine: BaseEngine | None) -> None:
+    """Warn at startup when tool calling is on but the chat template drops ``tools``.
+
+    The parser only reads what the model writes; the template is what tells the model
+    which tools exist. With a template that never reads ``tools`` every request ends
+    in prose and nothing in the log says why (Phi-4-mini, Hermes-3-3B, Gemma-3 as
+    converted). Probed once with a throwaway message; never fails startup.
+    """
+    if engine is None or not _enable_auto_tool_choice or not _tool_call_parser:
+        return
+    # Harmony renders its own prompt; it does not go through a Jinja template.
+    if getattr(engine, "use_harmony_rendering", False):
+        return
+    render = engine_template_renderer(engine)
+    if render is None:
+        return
+    if template_renders_tools(render) is False:
+        logger.warning(tools_ignored_warning(_tool_call_parser))
 
 
 def _detect_harmony_rendering() -> bool:
