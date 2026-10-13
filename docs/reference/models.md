@@ -19,6 +19,13 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 | Granite 3.x, 4.x | Various | 4-bit |
 | Nemotron | 3 Nano 30B | 6-bit |
 
+**Mistral `tekken` checkpoints** (Ministral 3, Devstral Small 2, Mistral Small 3.x, Nemo; they
+ship `tekken.json`) need the `tokenizer.json` in the same directory. It is used in place of
+the mistral-common tokenizer after a load-time check that both are the same tokenizer; without
+it the server logs a warning and these models see `[INST]`, `<s>` and the other control tokens
+of the prompt as plain text. Their template is stricter about message order than
+mistral-common's renderer (see [Tool Calling](../guides/tool-calling.md#mistral--devstral)).
+
 ### Recommended Models
 
 | Use Case | Model | Memory |

@@ -107,6 +107,28 @@ vllm-mlx serve mlx-community/Mistral-7B-Instruct-v0.3-4bit \
   --enable-auto-tool-choice --tool-call-parser mistral
 ```
 
+**Tokenizer (tekken checkpoints).** Checkpoints that ship `tekken.json` (Ministral 3,
+Devstral Small 2, Mistral Small 3.x, Nemo) are served with their `tokenizer.json` fast
+tokenizer, checked at load time to be identical to the mistral-common one (every token id
+maps to the same bytes, same control-token names, same BOS/EOS, same encoding of a battery
+of probe texts), so `[INST]`, `[TOOL_CALLS]` and the other control tokens of the rendered
+prompt are encoded as the control tokens the model was trained on. Without a
+`tokenizer.json`, or if it differs, the server logs a warning and these models are
+prompted with the control tokens spelled out as plain text.
+
+**Chat roles (tekken checkpoints).** The prompt is rendered by the model's own
+`chat_template.jinja`, which is stricter than mistral-common's renderer. Requests the
+template rejects fail with the template's message:
+
+| Messages | Message |
+|----------|---------|
+| a second `system` message, or `system` after the first message | `Only user, assistant and tool roles are supported, got system.` |
+| `user, user` or `assistant, assistant` (without tool calls) in a row | `After the optional system message, conversation roles must alternate user and assistant roles except for tool calls and results.` |
+
+mistral-common itself accepts both (it emits the extra system prompt in place, or joins
+consecutive same-role messages with a blank line). Merge such messages in the client; the
+server does not rewrite them.
+
 ### Qwen
 
 ```bash
