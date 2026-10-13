@@ -781,6 +781,56 @@ class TestDetachCacheForStorage:
         detached = _detach_cache_for_storage([layer])
         assert detached[0] is layer
 
+    def test_detach_leaves_no_unreachable_array_holders(self):
+        """Detaching must not build reference cycles around the snapshot's arrays.
+
+        A cycle is only reclaimed by the cyclic GC, which MLX array allocations
+        do not trigger, so anything it holds outlives the cache entry (see
+        TestStoreFailClosedAndEviction.test_evicted_entries_are_freed_without_a_gc_pass).
+        Covers every branch: KVCache, CacheList recursion, ArraysCache and dict
+        state.
+        """
+        import gc
+
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        from vllm_mlx.memory_cache import _detach_cache_for_storage
+
+        def build():
+            kv = KVCache()
+            kv.keys = mx.ones((1, 2, 4, 3))
+            kv.values = mx.ones((1, 2, 4, 3))
+            kv.offset = 4
+            inner = KVCache()
+            inner.keys = mx.ones((1, 2, 4, 3))
+            inner.values = mx.ones((1, 2, 4, 3))
+            inner.offset = 4
+            ssm = ArraysCache(size=1)
+            ssm[0] = mx.ones((1, 8))
+            mx.eval(kv.keys, kv.values, inner.keys, inner.values, ssm[0])
+            return [kv, CacheList(inner), ssm, {"state": (mx.ones((2,)), mx.ones((2,)))}]
+
+        gc.collect()
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            _detach_cache_for_storage(build())
+            gc.set_debug(gc.DEBUG_SAVEALL)
+            try:
+                gc.collect()
+                held = [o for o in gc.garbage if isinstance(o, mx.array)]
+            finally:
+                gc.set_debug(0)
+                gc.garbage.clear()
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+        assert not held, (
+            f"{len(held)} MLX arrays were only reachable through a reference cycle"
+        )
+
 
 class TestStoreFailClosedAndEviction:
     """store()-level tests requested in review: fail-closed rejection,
@@ -848,6 +898,48 @@ class TestStoreFailClosedAndEviction:
         got, remaining = cache.fetch([3])
         assert got is not None
         assert remaining == []
+
+    def test_evicted_entries_are_freed_without_a_gc_pass(self):
+        """An evicted entry's buffers must be released by reference counting alone.
+
+        MLX arrays do not count towards Python's GC allocation thresholds, so a
+        reference cycle that holds a snapshot's arrays can outlive its eviction by
+        an unbounded time.  In production (64k-token context, 30B model, 6.4 GB per
+        entry) this made active memory grow by one full entry per request until
+        Metal ran out of memory.  Run with the cyclic collector off so any such
+        cycle stays alive, evict well past the cap, and check that resident memory
+        is cap-sized rather than store-count-sized.
+        """
+        import gc
+
+        import mlx.core as mx
+
+        entry_bytes = 4 * 2 * (8 * 2048 * 64 * 4)  # 4 layers x (keys + values)
+        cache = self._make_cache(max_memory_mb=40)  # holds exactly one entry
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            mx.eval(mx.zeros((1,)))
+            mx.synchronize()
+            base = mx.get_active_memory()
+            for i in range(8):
+                layers = [self._kv_layer(2048) for _ in range(4)]
+                assert cache.store([i, i + 1, i + 2], layers)
+                del layers
+            mx.synchronize()
+            mx.eval(mx.zeros((1,)))
+            retained = mx.get_active_memory() - base
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+        assert cache.get_stats()["evictions"] == 7
+        assert retained < entry_bytes * 2.5, (
+            f"{retained / 1e6:.0f}MB resident after 8 stores into a 1-entry cache "
+            f"(one entry is {entry_bytes / 1e6:.0f}MB): evicted snapshots are being "
+            f"kept alive by something reference counting cannot free"
+        )
 
     def test_store_real_extracted_batch_slice_cuts_batch_retention(self):
         """Drive store() with what the MLLM path actually produces —
