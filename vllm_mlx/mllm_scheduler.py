@@ -739,7 +739,8 @@ class MLLMScheduler:
                 detok = NaiveStreamingDetokenizer(tokenizer)
                 self._detokenizer_pool[request_id] = detok
             if response.finish_reason == "stop" or (
-                request.sampling_params.ignore_eos and response.token in self.stop_tokens
+                request.sampling_params.ignore_eos
+                and response.token in self.stop_tokens
             ):
                 new_text = ""
             else:
