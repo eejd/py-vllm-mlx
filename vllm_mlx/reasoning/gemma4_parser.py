@@ -38,9 +38,12 @@ from .think_parser import BaseThinkingReasoningParser
 # Channel names that follow <|channel> — stripped from output
 _CHANNEL_NAMES = ("thought", "response")
 _RESPONSE_MARKER = "<|channel>response"
+# "<|channel>response" is the marker only when no letter follows: "<|channel>responses"
+# is "<|channel>" and the word "responses".
+_RESPONSE_RE = re.compile(r"<\|channel>response(?!\w)")
 # Everything the scanner recognises, longest first so the response marker wins
 # over the bare start marker it begins with.
-_MARKER_RE = re.compile(r"<\|channel>response|<\|channel>|<channel\|>")
+_MARKER_RE = re.compile(r"<\|channel>response(?!\w)|<\|channel>|<channel\|>")
 # Markers whose proper prefixes are withheld at a delta boundary. A complete
 # "<|channel>" is withheld too: it may still become "<|channel>response".
 _PARTIAL_MARKERS = (_RESPONSE_MARKER, "<channel|>", "<|channel>")
@@ -211,11 +214,13 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         # (e.g. "<|channel>" that might become "<|channel>response" next delta).
         self._pending: str = ""
         self._filter = _SegmentFilter()
+        self._seen_start = False  # a "<|channel>" has opened a channel in this stream
 
     def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
         super().reset_state()
         self._pending = ""
         self._filter.reset()
+        self._seen_start = False
 
     @staticmethod
     def _trailing_partial_marker_len(text: str) -> int:
@@ -226,7 +231,8 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         Only counts PROPER prefixes: a marker that is already complete in
         `text` needs no buffering. Returns 0 if no partial match.
         """
-        max_len = 0
+        # a complete "<|channel>response" may still continue into a word
+        max_len = len(_RESPONSE_MARKER) if text.endswith(_RESPONSE_MARKER) else 0
         for marker in _PARTIAL_MARKERS:
             for i in range(min(len(marker) - 1, len(text)), max_len, -1):
                 if text.endswith(marker[:i]):
@@ -280,11 +286,12 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
 
         # Alternative format: <|channel>thought...<|channel>response...
         # Use rfind for the LAST <|channel>response marker
-        if text.count(self.start_token) >= 2 and _RESPONSE_MARKER in text:
+        responses = list(_RESPONSE_RE.finditer(text))
+        if text.count(self.start_token) >= 2 and responses:
             _, _, after_start = text.partition(self.start_token)
-            last_resp = after_start.rfind(_RESPONSE_MARKER)
-            reasoning = after_start[:last_resp]
-            content = after_start[last_resp + len(_RESPONSE_MARKER) :]
+            last_resp = list(_RESPONSE_RE.finditer(after_start))[-1]
+            reasoning = after_start[: last_resp.start()]
+            content = after_start[last_resp.end() :]
             reasoning = _strip_channel_tokens(reasoning)
             content = _strip_channel_tokens(content)
             return reasoning or None, content or None
@@ -356,7 +363,18 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             self._route(self._filter.flush(), reasoning, content)
             pos = marker.end()
             token = marker.group()
-            self._phase = "thinking" if token == self.start_token else "content"
+            if token == self.start_token:
+                self._seen_start = True
+                self._phase = "thinking"
+            elif token == "<channel|>" or self._seen_start:
+                self._phase = "content"
+            else:
+                # a lone "<|channel>response" is the start of a channel like any other,
+                # as extract_reasoning() reads it; it is the switch to the answer only
+                # after a channel was opened (<|channel>thought...<|channel>response)
+                self._seen_start = True
+                self._phase = "thinking"
+                self._segment("response", reasoning, content)
         self._segment(text[pos:], reasoning, content)
 
     def _segment(self, text: str, reasoning: list[str], content: list[str]) -> None:

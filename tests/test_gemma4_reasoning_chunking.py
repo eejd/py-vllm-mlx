@@ -109,6 +109,17 @@ RAW = {
         "A\n\nB",
         "C\n\n\nD",
     ),
+    # "<|channel>response" is the switch to the answer only after a channel was opened;
+    # on its own it opens a channel like any other, as extract_reasoning() reads it
+    "lone-response-channel": ("<|channel>response\na<channel|>", "a", None),
+    "lone-response-channel-no-end": ("<|channel>response a", "a", None),
+    "lone-response-then-text": ("<|channel>response\nAnswer.", "Answer.", None),
+    # a letter after the name: not the marker, a channel and the word "responses"
+    "response-marker-with-letters": (
+        "<|channel>thought\nA<|channel>responses vary",
+        "Aresponses vary",
+        None,
+    ),
     # the stream ends in the middle of a marker or a channel name
     "cut-after-start-marker": ("<|channel>thought\nabc<|channel>", "abc", None),
     "cut-in-response-marker": (
@@ -299,10 +310,14 @@ def test_random_single_cycle_outputs_stream_like_extract_reasoning():
             raw = raw[: rng.randint(1, len(raw))]
         starts = raw.count("<|channel>")
         if (
-            raw.startswith("<|channel>response")
-            or starts - (1 if "<|channel>response" in raw[1:] else 0) > 1
+            False
+            or starts - (1 if re.search(r"<\|channel>response(?!\w)", raw[1:]) else 0)
+            > 1
             or raw.count("<channel|>") > 1
-            or ("<|channel>" in raw[1:] and "<|channel>response" not in raw[1:])
+            or (
+                "<|channel>" in raw[1:]
+                and not re.search(r"<\|channel>response(?!\w)", raw[1:])
+            )
             or len(raw) < 2
         ):
             continue
@@ -314,3 +329,31 @@ def test_random_single_cycle_outputs_stream_like_extract_reasoning():
         assert _stream(chunks) == (reasoning or "", content or ""), (raw, chunks)
         checked += 1
     assert checked > 2000
+
+
+def test_reset_state_forgets_an_aborted_stream():
+    """A stream that stops mid-way (client gone) leaves held text (a line that could
+    still be a channel name), a held partial marker and the 'channel opened' flag behind;
+    the next request must start clean."""
+    parser = get_parser("gemma4")()
+    parser.reset_state()
+    for delta in ("<|channel>thought\nabc\nthou", "<|chan"):
+        parser.extract_reasoning_streaming("", "", delta)  # never finalized
+
+    parser.reset_state()
+    reasoning, content = [], []
+    for delta in ("Hi <|channel>thought\nplan", "<channel|>done"):
+        msg = parser.extract_reasoning_streaming("", "", delta)
+        if msg:
+            reasoning.append(msg.reasoning or "")
+            content.append(msg.content or "")
+    tail = parser.finalize_stream()
+    if tail:
+        reasoning.append(tail.reasoning or "")
+        content.append(tail.content or "")
+
+    assert ("".join(reasoning), "".join(content)) == ("plan", "Hi done")
+    parser.reset_state()
+    lone = parser.extract_reasoning_streaming("", "", "<|channel>response\nA")
+    tail = parser.finalize_stream()
+    assert (lone.reasoning if lone else "") + (tail.reasoning if tail else "") == "A"
