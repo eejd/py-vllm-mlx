@@ -1512,6 +1512,51 @@ class TestNoReferenceCycles:
             **cfg,
         )
 
+    @staticmethod
+    def _rotating(tokens=4):
+        import mlx.core as mx
+        from mlx_lm.models.cache import RotatingKVCache
+
+        layer = RotatingKVCache(max_size=tokens)
+        layer.update_and_fetch(mx.ones((1, 2, tokens, 64)), mx.ones((1, 2, tokens, 64)))
+        mx.eval(layer.keys, layer.values)
+        return layer
+
+    def test_dequantize_cache_copying_a_layer_that_is_not_quantized(self):
+        """``_dequantize_cache`` copies every layer it does not dequantize (a
+        sliding-window layer stays as it is when the rest is quantized): the
+        second branch is its own allocation path."""
+        from vllm_mlx.memory_cache import _dequantize_cache, _quantize_cache
+
+        mixed = _quantize_cache([self._kv(), self._rotating()])
+
+        assert not _array_holders_left_by(lambda: _dequantize_cache(mixed))
+
+    @pytest.mark.parametrize(
+        "match,tokens,remaining",
+        [("exact", [1, 2, 3], []), ("prefix", [1, 2, 3, 4, 5], [4, 5])],
+    )
+    def test_kv_quantize_fetch_of_an_entry_with_a_sliding_window_layer(
+        self, match, tokens, remaining
+    ):
+        cache = self._quantizing_cache()
+        assert cache.store([1, 2, 3], [self._kv(), self._rotating()])
+
+        def fetch():
+            got, left = cache.fetch(tokens)
+            assert got is not None and left == remaining
+
+        assert not _array_holders_left_by(fetch)
+        assert cache._last_match_type == match
+
+    def test_kv_quantize_store_of_an_entry_with_a_sliding_window_layer(self):
+        cache = self._quantizing_cache()
+
+        def store():
+            assert cache.store([1, 2, 3], [self._kv(), self._rotating()])
+
+        assert not _array_holders_left_by(store)
+
     def test_quantize_cache(self):
         from vllm_mlx.memory_cache import _quantize_cache
 
