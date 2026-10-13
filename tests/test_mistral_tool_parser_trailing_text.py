@@ -155,7 +155,7 @@ class TestCompleteResponse:
 PARITY_OUTPUTS = {
     "call": CALL,
     "call_then_prose": CALL + PROSE,
-    "two_calls_newline": CALL + "\n" + CALL.replace("count\": 0", 'count": 1'),
+    "two_calls_newline": CALL + "\n" + CALL.replace('count": 0', 'count": 1'),
     "prose_between_calls": (
         '[TOOL_CALLS]a[ARGS]{"x": 1} He said "hold on.\n[TOOL_CALLS]b[ARGS]{"y": 2}'
     ),
@@ -203,9 +203,7 @@ def test_streamed_calls_equal_complete_calls(name, size):
     for seed in range(8 if size else 1):
         streamed, content = _stream(_deltas(text, size, seed))
 
-        assert [c["name"] for c in streamed] == [
-            c["name"] for c in expected.tool_calls
-        ]
+        assert [c["name"] for c in streamed] == [c["name"] for c in expected.tool_calls]
         assert [c["arguments"] for c in streamed] == [
             c["arguments"] for c in expected.tool_calls
         ]
@@ -218,9 +216,7 @@ def test_streamed_calls_equal_complete_calls(name, size):
 def test_two_calls_in_the_delta_that_opens_the_first():
     """The first call's boundary and a second call arriving in one delta: the second
     call needs its own index, not a place in the first call's arguments."""
-    streamed, _ = _stream(
-        ['[TOOL_CALLS]a[ARGS]{"x": 1}[TOOL_CALLS]b[ARGS]{"y": 2}']
-    )
+    streamed, _ = _stream(['[TOOL_CALLS]a[ARGS]{"x": 1}[TOOL_CALLS]b[ARGS]{"y": 2}'])
 
     assert [(c["name"], c["arguments"]) for c in streamed] == [
         ("a", '{"x": 1}'),
@@ -262,9 +258,7 @@ def test_a_marker_after_an_unfinished_name_starts_a_new_call():
 
 
 def test_text_before_a_marker_in_an_unfinished_name_is_not_content():
-    streamed, content = _stream(
-        ["[TOOL_CALLS]", "a", 'b[TOOL_CALLS]c[ARGS]{"x": 1}']
-    )
+    streamed, content = _stream(["[TOOL_CALLS]", "a", 'b[TOOL_CALLS]c[ARGS]{"x": 1}'])
 
     assert [(c["name"], c["arguments"]) for c in streamed] == [("c", '{"x": 1}')]
     assert content == ""
@@ -284,7 +278,9 @@ def test_the_first_arguments_text_is_scanned_for_strings():
 
 def test_a_call_that_is_not_sent_leaves_no_gap_in_the_indices():
     parser = MistralToolParser()
-    text = '[TOOL_CALLS]bad name[ARGS]{}[TOOL_CALLS]a[ARGS]{"x": 1}[TOOL_CALLS]b[ARGS]{}'
+    text = (
+        '[TOOL_CALLS]bad name[ARGS]{}[TOOL_CALLS]a[ARGS]{"x": 1}[TOOL_CALLS]b[ARGS]{}'
+    )
     indices = []
     current = ""
     for delta in _deltas(text, 3):
@@ -343,7 +339,9 @@ def test_random_generations_stream_as_they_parse():
     for _ in range(4000):
         text = _random_generation(rng)
         expected = _complete(text)
-        streamed, content = _stream(_deltas(text, rng.choice([1, 2, 5, 12]), rng.random()))
+        streamed, content = _stream(
+            _deltas(text, rng.choice([1, 2, 5, 12]), rng.random())
+        )
 
         assert [(c["name"], c["arguments"]) for c in streamed] == [
             (c["name"], c["arguments"]) for c in expected.tool_calls
