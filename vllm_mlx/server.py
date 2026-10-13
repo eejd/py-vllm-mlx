@@ -3482,6 +3482,16 @@ async def _stream_responses_request(
 
             content = delta_msg.content or ""
             if tool_parser and (content or (output_finished and tool_markup_possible)):
+                # This branch feeds every delta to the parser, so the other branches'
+                # "markup seen" latch is set here too: without it the empty output that
+                # ends the stream never reaches the parser or its end-of-stream hook, and
+                # a call still pending at the end is dropped.
+                if not tool_markup_possible and (
+                    _streaming_tool_markup_possible_after_delta(
+                        tool_accumulated_text, content, tool_parser
+                    )
+                ):
+                    tool_markup_possible = True
                 tool_accumulated_text, tool_result = _extract_streaming_tool_delta(
                     tool_parser,
                     tool_accumulated_text,

@@ -11,6 +11,8 @@ end-of-stream decision, so all of them are driven for real here.
 import json
 import logging
 
+from types import SimpleNamespace
+
 import pytest
 
 import vllm_mlx.server as srv
@@ -38,12 +40,24 @@ TOOLS = [
 SITES = ["chat", "anthropic", "responses"]
 
 
-@pytest.fixture(autouse=True)
-def _llama_server(monkeypatch):
+class _PassThroughReasoning:
+    """A reasoning parser that finds no reasoning: every site takes its reasoning branch."""
+
+    def extract_reasoning_streaming(self, previous, current, delta):
+        return SimpleNamespace(reasoning=None, content=delta)
+
+    def reset_state(self, *args, **kwargs):
+        pass
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["plain", "reasoning-branch"])
+def _llama_server(monkeypatch, request):
     monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
     monkeypatch.setattr(srv, "_tool_call_parser", "llama")
     monkeypatch.setattr(srv, "_tool_parser_instance", LlamaToolParser())
-    monkeypatch.setattr(srv, "_reasoning_parser", None)
+    monkeypatch.setattr(
+        srv, "_reasoning_parser", _PassThroughReasoning() if request.param else None
+    )
     monkeypatch.setattr(srv, "_reasoning_parser_name", None)
 
 
@@ -279,3 +293,75 @@ async def test_the_finishing_delta_may_both_emit_text_and_open_the_cut_off_call(
 
     assert "".join(texts) == "Let me check. " + CUT_OFF
     assert calls == []
+
+
+FINISH_ON = [False, True]
+
+
+@pytest.mark.parametrize("site", SITES)
+@pytest.mark.parametrize("finish_on_last_delta", FINISH_ON)
+@pytest.mark.parametrize(
+    "tail",
+    [
+        '; {"name": "echo_args", "parame',
+        "; " + TAG + '{"name": "echo_args", "parame',
+    ],
+    ids=["bare-tail", "tagged-tail"],
+)
+@pytest.mark.anyio
+async def test_a_complete_call_then_an_unterminated_one_keeps_the_call_and_releases_the_tail(
+    monkeypatch, caplog, site, finish_on_last_delta, tail
+):
+    engine = _engine(
+        [TAG, COMPLETE, tail[:6], tail[6:]],
+        "length",
+        finish_on_last_delta=finish_on_last_delta,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.tool_parsers"):
+        texts, calls, _ = await _run(site, monkeypatch, engine)
+
+    assert calls == ["echo_args"]
+    assert "".join(texts) == '; {"name": "echo_args", "parame'
+    assert TAG not in "".join(texts)
+    # the chat stream re-parses only when no call went out, so it logs nothing here
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == (0 if site == "chat" else 1)
+
+
+@pytest.mark.parametrize("site", SITES)
+@pytest.mark.parametrize("finish_on_last_delta", FINISH_ON)
+@pytest.mark.parametrize("dangling", [";", "; ", ";\n", "; " + TAG])
+@pytest.mark.anyio
+async def test_a_separator_left_dangling_after_a_complete_call_is_not_content(
+    monkeypatch, caplog, site, finish_on_last_delta, dangling
+):
+    engine = _engine(
+        [TAG, COMPLETE, dangling], "stop", finish_on_last_delta=finish_on_last_delta
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.tool_parsers"):
+        texts, calls, _ = await _run(site, monkeypatch, engine)
+
+    assert calls == ["echo_args"]
+    assert texts == []  # not an unterminated call: nothing to release, nothing to warn
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.parametrize("site", SITES)
+@pytest.mark.parametrize("finish_on_last_delta", FINISH_ON)
+@pytest.mark.anyio
+async def test_a_tag_repeated_after_the_separator_is_another_call(
+    monkeypatch, site, finish_on_last_delta
+):
+    second = COMPLETE.replace("hello", "again")
+    engine = _engine(
+        [TAG, COMPLETE, "; ", TAG, second],
+        "stop",
+        finish_on_last_delta=finish_on_last_delta,
+    )
+
+    texts, calls, _ = await _run(site, monkeypatch, engine)
+
+    assert calls == ["echo_args", "echo_args"]
+    assert texts == []

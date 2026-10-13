@@ -953,22 +953,81 @@ class TestLlamaToolParser:
         assert shown.strip() == result.content
         assert "parame" in shown  # released, not hidden
 
-    def test_the_incomplete_call_is_logged_with_its_raw_text(self, parser, caplog):
-        text = "<|python_tag|>" + self.ONE_B_PAYLOAD
+    def test_the_incomplete_call_is_logged_with_sizes_and_a_short_prefix_only(
+        self, parser, caplog
+    ):
+        secret = "s3cr3t-" * 40
+        call = '<|python_tag|>{"name": "f", "parameters": {"a": 1}}'
 
         with caplog.at_level(
             "WARNING", logger="vllm_mlx.tool_parsers.llama_tool_parser"
         ):
-            parser.extract_tool_calls(text)
-            parser.extract_tool_calls('<|python_tag|>{"a": "' + "x" * 5000)
-            parser.extract_tool_calls('<|python_tag|>{"name": "f", "parameters": {}}')
-            parser.extract_tool_calls("<|python_tag|>import os")
+            parser.extract_tool_calls("<|python_tag|>" + self.ONE_B_PAYLOAD)
+            parser.extract_tool_calls('<|python_tag|>{"a": "' + secret)
+            parser.extract_tool_calls(call + '; {"name": "g", "parameters": {"k": "v')
+            parser.extract_tool_calls(call)  # complete: nothing to log
+            parser.extract_tool_calls(call + ";")  # dangling separator: not a call
+            parser.extract_tool_calls("<|python_tag|>import os")  # not a call at all
 
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 2  # a complete call and plain code log nothing
-        assert "end of generation" in warnings[0].getMessage()
-        assert "echo_args" in warnings[0].getMessage()
-        assert len(warnings[1].getMessage()) < 800  # raw text is truncated
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(messages) == 3
+        assert all("end of generation" in m for m in messages)
+        assert "echo_args" in messages[0] and "0 complete call(s)" in messages[0]
+        assert secret not in messages[1] and "s3cr3t-" in messages[1]  # short prefix
+        assert max(len(m) for m in messages) < 400
+        # a complete call before the unterminated one is reported, not hidden
+        assert "1 complete call(s)" in messages[2]
+
+    @pytest.mark.parametrize("dangling", [";", "; ", ";\n  "])
+    def test_a_separator_left_dangling_after_a_complete_call_is_dropped_in_both_modes(
+        self, parser, dangling
+    ):
+        call = '<|python_tag|>{"name": "read", "parameters": {}}'
+        text = call + dangling
+
+        result = parser.extract_tool_calls(text)
+        assert [c["name"] for c in result.tool_calls] == ["read"]
+        assert result.content is None
+
+        events = self._stream(parser, [call, dangling])
+        final = parser.finalize_streaming(text)
+        assert [
+            c["function"]["name"] for e in events for c in e.get("tool_calls", [])
+        ] == ["read"]
+        # held back while it might still become another call, and not content at the end
+        shown = "".join(e.get("content", "") for e in events + [final or {}])
+        assert shown == ""
+
+    def test_the_end_of_generation_release_is_limited_to_a_cut_off_call(self, parser):
+        # Scope guard (#67 is about an unterminated call): text after a call's separator
+        # that is not a call at all is released neither earlier nor later than before.
+        call = '<|python_tag|>{"name": "read", "parameters": {}}'
+        text = call + "; and then some prose"
+
+        events = self._stream(parser, [call, text[len(call) :]])
+
+        assert parser.finalize_streaming(text) == {"content": ""}
+        assert "".join(e.get("content", "") for e in events) == ""
+
+    @pytest.mark.parametrize("size", [1, 4, 10_000])
+    def test_a_tag_repeated_after_the_separator_is_another_call(self, parser, size):
+        first = '{"name": "a", "parameters": {}}'
+        second = '{"name": "b", "parameters": {"x": 1}}'
+        text = "<|python_tag|>" + first + "; <|python_tag|>" + second
+
+        result = parser.extract_tool_calls(text)
+        assert [c["name"] for c in result.tool_calls] == ["a", "b"]
+        assert result.content is None
+
+        chunks = ["<|python_tag|>"] + [
+            text[i : i + size] for i in range(len("<|python_tag|>"), len(text), size)
+        ]
+        events = self._stream(parser, chunks)
+        assert [
+            c["function"]["name"] for e in events for c in e.get("tool_calls", [])
+        ] == ["a", "b"]
+        assert "".join(e.get("content", "") for e in events) == ""
+        assert parser.finalize_streaming(text) is None
 
     def test_the_finalizer_hook_is_a_no_op_for_other_parsers(self):
         from vllm_mlx import server
