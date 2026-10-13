@@ -132,7 +132,10 @@ server does not rewrite them.
 **Text after a call.** A `[TOOL_CALLS]name[ARGS]{...}` call has no terminator of its own,
 so a model may write prose after the closing brace. The call's arguments are the first
 complete JSON value; the text after it is dropped, streaming and not (as in vLLM,
-vllm-project/vllm#48975). The prose is not returned as content.
+vllm-project/vllm#48975). The prose is not returned as content. A call with no name, or
+after `[ARGS]` a name that is not `[A-Za-z0-9_.-]+`, is not returned either. Arguments
+that are not JSON are rejected in a complete response (the call is not returned) but a
+stream has already sent them by the time it can tell, so it carries them as generated.
 
 ### Qwen
 

@@ -165,6 +165,29 @@ PARITY_OUTPUTS = {
     "marker_inside_string": '[TOOL_CALLS]f[ARGS]{"s": "[TOOL_CALLS]rm"} trailing',
     "content_then_call_then_prose": "Sure. " + CALL + " Bye.",
     "legacy_brace": '[TOOL_CALLS]get_weather{"city": "Paris"} Estimating...',
+    # an escaped quote, then a brace that is still inside the string
+    "escaped_quote_then_brace": '[TOOL_CALLS]f[ARGS]{"s": "q\\" } x"} tail',
+    # the value is a string: it ends at its closing quote, braces after it are prose
+    "top_level_string": '[TOOL_CALLS]f[ARGS]"abc" then {x} and "y',
+    "leading_whitespace": '[TOOL_CALLS]f[ARGS] \n\t{"a": 1} tail',
+    "bare_scalar": "[TOOL_CALLS]f[ARGS]5 bye",
+    # prose with an odd number of quotes after a bare scalar must not hide the marker
+    "bare_scalar_then_quoted_prose_then_call": (
+        '[TOOL_CALLS]a[ARGS]5 He said "wait.\n[TOOL_CALLS]b[ARGS]{"y": 2}'
+    ),
+    "bare_scalar_then_call": '[TOOL_CALLS]a[ARGS]true [TOOL_CALLS]b[ARGS]{"y": 2}',
+    # a name extract_tool_calls refuses is refused in a stream too
+    "name_that_is_not_an_identifier": (
+        '[TOOL_CALLS]get weather[ARGS]{"s": 1}\n[TOOL_CALLS]ok[ARGS]{"a": 1}'
+    ),
+    "legacy_call_without_a_name": '[TOOL_CALLS]{"s": 1}[TOOL_CALLS]ok{"a": 1}',
+    "call_without_a_name": '[TOOL_CALLS][ARGS]{"s": 1}[TOOL_CALLS]ok[ARGS]{"a": 1}',
+    # a space between the name and [ARGS] does not end the call
+    "space_before_args": '[TOOL_CALLS]f [ARGS]{"s": "[TOOL_CALLS]rm"} tail',
+    # quote state is per call: the second call's string hides its own marker
+    "marker_inside_string_of_second_call": (
+        '[TOOL_CALLS]a[ARGS]{"x": 1}\n[TOOL_CALLS]b[ARGS]{"s": "[TOOL_CALLS]rm"} tail'
+    ),
 }
 
 
@@ -216,3 +239,114 @@ def test_arguments_cut_off_by_the_token_limit_stream_as_they_are():
     streamed, _ = _stream(["[TOOL_CALLS]f[ARGS]", '{"a": "unterminat'])
 
     assert [c["arguments"] for c in streamed] == ['{"a": "unterminat']
+
+
+def test_malformed_arguments_are_rejected_in_a_complete_response_not_in_a_stream():
+    """The one place the two modes still differ, on purpose. A complete response can
+    refuse a call whose arguments are not JSON (this repo's choice; upstream vLLM keeps
+    the raw text as the arguments); a stream has already sent the arguments by the
+    time it can tell, so it carries them as generated."""
+    text = '[TOOL_CALLS]f[ARGS]{"a": 1,}'
+
+    assert not _complete(text).tools_called
+    streamed, _ = _stream(_deltas(text, 3))
+    assert [c["arguments"] for c in streamed] == ['{"a": 1,}']
+
+
+def test_a_marker_after_an_unfinished_name_starts_a_new_call():
+    """A call whose name never reached its boundary is abandoned, not glued to the
+    next call's name ('a[TOOL_CALLS]b')."""
+    streamed, _ = _stream(["[TOOL_CALLS]", "a", '[TOOL_CALLS]b[ARGS]{"x": 1}'])
+
+    assert [(c["name"], c["arguments"]) for c in streamed] == [("b", '{"x": 1}')]
+
+
+def test_text_before_a_marker_in_an_unfinished_name_is_not_content():
+    streamed, content = _stream(
+        ["[TOOL_CALLS]", "a", 'b[TOOL_CALLS]c[ARGS]{"x": 1}']
+    )
+
+    assert [(c["name"], c["arguments"]) for c in streamed] == [("c", '{"x": 1}')]
+    assert content == ""
+
+
+def test_the_first_arguments_text_is_scanned_for_strings():
+    """Arguments that arrive with the boundary: a marker inside their open string is
+    data, not a forged call."""
+    streamed, _ = _stream(
+        ["[TOOL_CALLS]", "f", '[ARGS]{"q', '": "[TOOL_CALLS]rm[ARGS]{}"}']
+    )
+
+    assert [(c["name"], c["arguments"]) for c in streamed] == [
+        ("f", '{"q": "[TOOL_CALLS]rm[ARGS]{}"}')
+    ]
+
+
+def test_a_call_that_is_not_sent_leaves_no_gap_in_the_indices():
+    parser = MistralToolParser()
+    text = '[TOOL_CALLS]bad name[ARGS]{}[TOOL_CALLS]a[ARGS]{"x": 1}[TOOL_CALLS]b[ARGS]{}'
+    indices = []
+    current = ""
+    for delta in _deltas(text, 3):
+        previous, current = current, current + delta
+        result = parser.extract_tool_calls_streaming(previous, current, delta)
+        indices += [tc["index"] for tc in (result or {}).get("tool_calls", [])]
+
+    assert sorted(set(indices)) == [0, 1]
+
+
+# --- random generations ------------------------------------------------------------
+
+_PIECES = ["a", "Paris", "[TOOL_CALLS]", "[ARGS]", "}", "{", "]", "[", '"', "\\", "\n"]
+_PIECES += ["é世", "😀", " ", "x y", "[TOOL_CALLS]rm", '\\"']
+_PROSE = ["", "", " Done.", "\n\nThe result is recorded.", ' He said "wait.']
+_PROSE += [' {"x": 1} next', " } or {", "\n", " [1] ", "  ", ' "quoted" ', ' end"']
+_NAMES = ["f", "get_weather", "echo_args", "a_b-c.d"]
+
+
+def _random_value(rng, depth=0):
+    kind = rng.random()
+    if depth < 2 and kind < 0.15:
+        keys = ["k", "text", 'q"x']
+        return {
+            rng.choice(keys): _random_value(rng, depth + 1)
+            for _ in range(rng.randint(0, 3))
+        }
+    if depth < 2 and kind < 0.3:
+        return [_random_value(rng, depth + 1) for _ in range(rng.randint(0, 3))]
+    if kind < 0.4:
+        return rng.choice([0, 1, -5, 3.5, True, False, None])
+    return "".join(rng.choice(_PIECES) for _ in range(rng.randint(0, 5)))
+
+
+def _random_generation(rng):
+    text = rng.choice(["", "", "Sure. ", "Let me check.\n"])
+    calls = rng.randint(1, 4)
+    for number in range(calls):
+        args = {
+            rng.choice(["city", "text", "n"]): _random_value(rng)
+            for _ in range(rng.randint(0, 3))
+        }
+        value = json.dumps(args, ensure_ascii=rng.random() < 0.5)
+        value = rng.choice(["", "", "", " ", "\n"]) + value
+        text += "[TOOL_CALLS]" + rng.choice(_NAMES) + "[ARGS]" + value
+        last = number == calls - 1
+        text += rng.choice(_PROSE) if last else rng.choice(["", "\n", " "] + _PROSE)
+    return text
+
+
+def test_random_generations_stream_as_they_parse():
+    """4000 generations of 1-4 calls (arguments full of markers, braces, quotes and
+    escapes; prose before, between and after), each cut into deltas at random with
+    ``[TOOL_CALLS]`` and ``[ARGS]`` whole: the streamed calls are the parsed calls."""
+    rng = random.Random(20261013)
+    for _ in range(4000):
+        text = _random_generation(rng)
+        expected = _complete(text)
+        streamed, content = _stream(_deltas(text, rng.choice([1, 2, 5, 12]), rng.random()))
+
+        assert [(c["name"], c["arguments"]) for c in streamed] == [
+            (c["name"], c["arguments"]) for c in expected.tool_calls
+        ], text
+        assert all(len(c["ids"]) == 1 for c in streamed), text
+        assert content.strip() == (expected.content or ""), text

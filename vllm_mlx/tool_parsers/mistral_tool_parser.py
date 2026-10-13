@@ -76,8 +76,12 @@ class _ArgsScanner:
     - a ``[TOOL_CALLS]`` marker inside a quoted string is argument data, not a new
       call (untrusted model output must not forge a second dispatchable call);
     - the arguments end where the outermost object/array (or a top-level string)
-      closes; any other top-level value (a number, ``true``) has no end to find and
-      runs to the next marker;
+      closes. A bare scalar (a number, ``true``: not valid arguments, but what a model
+      may write) ends at the first whitespace, as with ``raw_decode``. That is known
+      once the arguments start: from the start of the text when ``scalars`` is set
+      (the stream, which sees the arguments alone), after the ``[ARGS]`` separator
+      otherwise (the splitter, which also sees the tool name, and in the legacy
+      ``name{...}`` format the value is an object anyway);
     - once the value has ended, quotes in whatever the model wrote next are prose, not
       JSON, so they cannot hide the next call's marker.
 
@@ -85,16 +89,18 @@ class _ArgsScanner:
     rather than counted as an array.
     """
 
-    __slots__ = ("in_string", "escaped", "depth", "done")
+    __slots__ = ("in_string", "escaped", "depth", "done", "scalars", "in_scalar")
 
     BOT_TOKEN = "[TOOL_CALLS]"
     ARGS_TOKEN = "[ARGS]"
 
-    def __init__(self) -> None:
+    def __init__(self, scalars: bool = False) -> None:
         self.in_string = False
         self.escaped = False
         self.depth = 0
         self.done = False
+        self.scalars = scalars
+        self.in_scalar = False
 
     def scan(self, text: str, i: int = 0) -> tuple[int, int]:
         """Scan ``text`` from ``i``; return ``(args_end, marker)``.
@@ -123,6 +129,7 @@ class _ArgsScanner:
                 return i, i
             elif self.depth == 0 and text.startswith(self.ARGS_TOKEN, i):
                 i += len(self.ARGS_TOKEN)
+                self.scalars = True
                 continue
             elif ch in "{[":
                 self.depth += 1
@@ -130,6 +137,12 @@ class _ArgsScanner:
                 if self.depth > 0:
                     self.depth -= 1
                     self.done = self.depth == 0
+            elif self.scalars and self.depth == 0:
+                if not ch.isspace():
+                    self.in_scalar = True
+                elif self.in_scalar:
+                    self.done = True
+                    continue
             i += 1
         return n, -1
 
@@ -163,7 +176,7 @@ class MistralToolParser(ToolParser):
         # Where the current call's JSON arguments end, carried across deltas so
         # text the model adds after them is not streamed as arguments and a
         # [TOOL_CALLS] marker inside a JSON string stays argument data.
-        self._scanner = _ArgsScanner()
+        self._scanner = _ArgsScanner(scalars=True)
         self._name_buffer: str = ""
         # Set when the boundary marker never arrives and the withheld text
         # was flushed as content; subsequent deltas pass through as content.
@@ -175,19 +188,28 @@ class MistralToolParser(ToolParser):
         # [ARGS]/`{` boundary. See _append_call_delta.
         self._current_tool_call_id: str | None = None
         self._tool_call_id_emitted: bool = False
+        # A call extract_tool_calls would not dispatch (see _feed_name) is read
+        # through and never sent. The index a call is sent under counts the calls
+        # sent so far, so a skipped call leaves no gap.
+        self._call_dropped: bool = False
+        self._call_index: int | None = None
+        self._calls_sent: int = 0
 
     def reset(self) -> None:
         super().reset()
         self._reset_call_state()
         self._current_tool_call_id = None
+        self._calls_sent = 0
 
     def _reset_call_state(self) -> None:
         """Forget the name/arguments/id state of the current streaming call."""
         self._args_started = False
-        self._scanner = _ArgsScanner()
+        self._scanner = _ArgsScanner(scalars=True)
         self._name_buffer = ""
         self._name_buffer_overflow = False
         self._tool_call_id_emitted = False
+        self._call_dropped = False
+        self._call_index = None
 
     def _start_new_tool_call(self) -> None:
         """Begin a new streaming tool call: bump the index and reset the
@@ -406,6 +428,13 @@ class MistralToolParser(ToolParser):
             # Not a tool call yet, return content delta
             return {"content": delta_text}
 
+        # A call still waiting for its name/arguments boundary takes the whole delta:
+        # a marker in it ends that call and opens the next (see _feed_name), and the
+        # text before the marker belongs to the abandoned name, not to the content.
+        if self.current_tool_id >= 0 and not self._name_buffer_overflow:
+            self._feed_call(delta_text, result)
+            return result or None
+
         # Tool call detected
         if self.BOT_TOKEN in delta_text:
             # This delta contains the start of tool calls
@@ -416,7 +445,7 @@ class MistralToolParser(ToolParser):
             self._feed_call(tool_part, result)
             return result or None
 
-        # We're in the middle of a tool call
+        # The boundary never arrived (see _feed_name): everything is plain text now
         if self.current_tool_id >= 0:
             self._feed_call(delta_text, result)
             return result or None
@@ -469,6 +498,17 @@ class MistralToolParser(ToolParser):
         elif brace_idx != -1:
             name_end = args_start = brace_idx
         else:
+            name_end = args_start = -1
+
+        # A [TOOL_CALLS] marker before the boundary ends this call: its name never
+        # got a boundary, so nothing of it was sent, and the text after the marker
+        # is the next call (a name is never part of another call's name).
+        marker = buffer.find(self.BOT_TOKEN)
+        if marker != -1 and (name_end == -1 or marker < name_end):
+            self._start_new_tool_call()
+            return buffer[marker + len(self.BOT_TOKEN) :]
+
+        if name_end == -1:
             # Marker not seen yet — withhold rather than guess. If it never
             # arrives (truncation, or the model deviating into prose), flush
             # the withheld text as content so the response is not silently
@@ -482,18 +522,31 @@ class MistralToolParser(ToolParser):
         self._name_buffer = ""
         self._args_started = True
         name = buffer[:name_end].strip()
-        if name:
+        # extract_tool_calls dispatches no call without a name, nor, after [ARGS],
+        # one whose name is not a plain identifier: such a call is read through (its
+        # end still matters) and never sent.
+        after_args_marker = args_start != name_end
+        self._call_dropped = not name or (
+            after_args_marker and not _is_plain_tool_name(name)
+        )
+        if not self._call_dropped:
             self._append_call_delta(result, {"name": name})
         return buffer[args_start:]
 
     def _feed_args(self, text: str, result: dict[str, Any]) -> str:
         """Feed argument text of the current call.
 
-        Returns the text of the next call when a [TOOL_CALLS] marker opens one
-        (that call is started), else "".
+        Whitespace ahead of the value is not arguments text (extract_tool_calls strips
+        it too). Returns the text of the next call when a [TOOL_CALLS] marker opens
+        one (that call is started), else "".
         """
-        args_end, marker = self._scanner.scan(text)
-        if args_end:
+        scanner = self._scanner
+        if scanner.depth == 0 and not (
+            scanner.in_string or scanner.in_scalar or scanner.done
+        ):
+            text = text.lstrip()
+        args_end, marker = scanner.scan(text)
+        if args_end and not self._call_dropped:
             self._append_call_delta(result, {"arguments": text[:args_end]})
         if marker == -1:
             return ""
@@ -511,14 +564,17 @@ class MistralToolParser(ToolParser):
         the BOT_TOKEN delta arrived, so that need not be the BOT_TOKEN delta),
         exactly once.
         """
+        if self._call_index is None:
+            self._call_index = self._calls_sent
+            self._calls_sent += 1
         calls = result.setdefault("tool_calls", [])
-        if calls and calls[-1]["index"] == self.current_tool_id:
+        if calls and calls[-1]["index"] == self._call_index:
             merged = calls[-1]["function"]
             for key, value in function.items():
                 merged[key] = merged.get(key, "") + value
             return
         call: dict[str, Any] = {
-            "index": self.current_tool_id,
+            "index": self._call_index,
             "type": "function",
             "function": dict(function),
         }
