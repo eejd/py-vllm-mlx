@@ -38,7 +38,9 @@ from vllm_mlx.mlx_cache_compat import clone_layer
 from vllm_mlx.utils.chat_template_override import apply_chat_template_override
 from vllm_mlx.utils.mistral_tokenizer import (
     adopt_fast_tokenizer,
+    drop_default_system_prompt,
     holds_mistral_common_tokenizer,
+    mentions_default_system_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -1703,6 +1705,14 @@ class MLXMultimodalLM:
                     self.processor,
                     get_model_path(self.model_name),
                     eos_token_ids=getattr(self.model.config, "eos_token_id", None),
+                )
+            # ... and whose template's default system prompt mistral-common does not
+            # render (see drop_default_system_prompt).
+            if mentions_default_system_message(self.processor):
+                from mlx_vlm.utils import get_model_path
+
+                drop_default_system_prompt(
+                    self.processor, get_model_path(self.model_name)
                 )
             apply_chat_template_override(self.processor, self._chat_template)
             self.config = load_config(self.model_name)

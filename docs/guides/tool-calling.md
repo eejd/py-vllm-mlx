@@ -129,6 +129,20 @@ mistral-common itself accepts both (it emits the extra system prompt in place, o
 consecutive same-role messages with a blank line). Merge such messages in the client; the
 server does not rewrite them.
 
+**System prompt (tekken checkpoints).** A request without a `system` message is prompted
+without one, exactly as mistral-common (and vLLM's `mistral` tokenizer mode, and mlx-lm)
+builds it. Some templates would insert a default system prompt of their own: Ministral 3
+Instruct's is Mistral's `SYSTEM_PROMPT.txt` with the model name filled in and the literal
+text `The current date is {today}.` (and `{yesterday}`) in about 500 tokens, and the
+official Devstral Small 2 template carries a Mistral Vibe prompt. The server empties that
+default at load (the log says `dropped the chat template's default system prompt`), so
+such a request renders as `<s>[INST]...[/INST]`. A request's own `system` message is
+rendered as before. To use Mistral's default prompt, send it yourself as the `system`
+message (fill `{name}`, `{today}`, `{yesterday}` as the model card's `load_system_prompt`
+does), or pass a template with `--chat-template`. Ministral-3-3B at temperature 0 padded
+optional tool arguments (`count: 0, flag: false`) under the template's default prompt and
+did not under mistral-common's.
+
 ### Qwen
 
 ```bash

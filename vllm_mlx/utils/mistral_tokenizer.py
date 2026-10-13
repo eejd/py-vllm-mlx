@@ -15,12 +15,24 @@ is prompted with a malformed chat and answers in kind.
 The ``tokenizer.json`` of those checkpoints is the same tokenizer in the Hugging
 Face fast format: control tokens are added tokens, so the rendered string encodes to
 the very ids mistral-common would produce, and ``chat_template.jinja`` renders the
-same prompt. ``equivalent_fast_tokenizer`` loads it and only returns it once it is
-shown identical to the tekken tokenizer it replaces: every id maps to the same bytes
-(read from ``tekken.json`` itself, so ids that are only partial UTF-8 are covered),
-the control tokens carry the same names, BOS/EOS agree, and a battery of plain-text
-probes encodes to the same ids as mistral-common's. A fast tokenizer is also what
-constrained decoding needs.
+same prompt, with one exception (below). ``equivalent_fast_tokenizer`` loads it and
+only returns it once it is shown identical to the tekken tokenizer it replaces: every
+id maps to the same bytes (read from ``tekken.json`` itself, so ids that are only
+partial UTF-8 are covered), the control tokens carry the same names, BOS/EOS agree,
+and a battery of plain-text probes encodes to the same ids as mistral-common's. A
+fast tokenizer is also what constrained decoding needs.
+
+The exception: some of these templates (Ministral 3 Instruct, official Devstral Small
+2) open with ``{% set default_system_message = '...' %}`` and render it as a system
+prompt whenever the request has none. mistral-common renders no system prompt then,
+and neither does ``transformers``' ``MistralCommonBackend``, mlx-lm, or vLLM in its
+``mistral`` tokenizer mode (the recommended one for these checkpoints). Ministral 3's
+default is Mistral's ``SYSTEM_PROMPT.txt`` pasted in with ``{name}`` filled and
+``{today}``/``{yesterday}`` left as literal text, so every prompt carried about 500
+tokens saying "The current date is {today}." (Ministral-3-3B then padded optional tool
+arguments with ``count: 0, flag: false`` that mistral-common's prompt did not provoke).
+``drop_default_system_prompt`` empties that default so the prompt is the one
+mistral-common builds; a request's own ``system`` message is rendered as before.
 """
 
 from __future__ import annotations
@@ -28,6 +40,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +101,87 @@ def holds_mistral_common_tokenizer(processor: Any) -> bool:
     return is_mistral_common_tokenizer(processor) or is_mistral_common_tokenizer(
         getattr(processor, "tokenizer", None)
     )
+
+
+def mentions_default_system_message(target: Any) -> bool:
+    """Whether the chat template on ``target`` (or its inner tokenizer) has a
+    ``default_system_message``; a cheap test, so callers can skip locating the
+    checkpoint's files for every other model."""
+    inner = getattr(target, "tokenizer", None)
+    return any(
+        isinstance(template, str) and "default_system_message" in template
+        for template in (
+            getattr(holder, "chat_template", None)
+            for holder in (target, inner)
+            if holder is not None
+        )
+    )
+
+
+# ``{%- set default_system_message = '...' %}``: the string literal (either quote, with
+# backslash escapes, possibly spanning lines) is group 2.
+_DEFAULT_SYSTEM_MESSAGE = re.compile(
+    r"(\{%-?\s*set\s+default_system_message\s*=\s*)"
+    r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")"""
+    r"(\s*-?%\})",
+    re.DOTALL,
+)
+
+
+def template_without_default_system_message(template: str) -> tuple[str, int]:
+    """``template`` with its default system message emptied, and that message's length.
+
+    The length is 0, and the template returned as it is, when there is nothing to
+    drop: no ``default_system_message``, one that is already empty, or one that is not
+    a string literal this can find (then a warning says so: the default stays).
+    """
+    if "default_system_message" not in template:
+        return template, 0
+    match = _DEFAULT_SYSTEM_MESSAGE.search(template)
+    if match is None:
+        logger.warning(
+            "the chat template mentions default_system_message but not as a string "
+            "literal this server can empty: its default system prompt stays"
+        )
+        return template, 0
+    length = len(match.group(2)) - 2
+    if length == 0:
+        return template, 0
+    emptied = template[: match.start(2)] + "''" + template[match.end(2) :]
+    return emptied, length
+
+
+def drop_default_system_prompt(target: Any, model_path: str | Path) -> bool:
+    """Make a tekken checkpoint's prompt the one mistral-common builds.
+
+    mistral-common renders no system prompt for a request that has none, but a
+    ``default_system_message`` in the checkpoint's chat template is rendered as one.
+    This empties it on ``target`` (a tokenizer or a processor) and on the tokenizer
+    inside a processor. Only ``tekken.json`` checkpoints, the ones mistral-common
+    serves, are touched; a request's own ``system`` message is rendered as before.
+    ``--chat-template`` replaces the template afterwards and so overrides this.
+    Returns whether a default was dropped.
+    """
+    if not (Path(model_path) / "tekken.json").is_file():
+        return False
+    inner = getattr(target, "tokenizer", None)
+    dropped = 0
+    for holder in (target, inner) if inner is not None else (target,):
+        template = getattr(holder, "chat_template", None)
+        if not isinstance(template, str):
+            continue
+        emptied, length = template_without_default_system_message(template)
+        if length:
+            holder.chat_template = emptied
+            dropped = max(dropped, length)
+    if dropped:
+        logger.info(
+            "Mistral tekken checkpoint: dropped the chat template's default system "
+            "prompt (%d characters) as mistral-common builds no system prompt for a "
+            "request without one; send a system message to set one",
+            dropped,
+        )
+    return bool(dropped)
 
 
 def _unicode_to_byte() -> dict[str, int]:

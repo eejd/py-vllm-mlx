@@ -206,6 +206,22 @@ def _prefer_fast_mistral_tokenizer(model_name: str, tokenizer_config: dict | Non
     return fast_tokenizer_config(model_path, tokenizer_config)
 
 
+def _drop_mistral_default_system_prompt(model_name: str, tokenizer) -> None:
+    """Render Mistral tekken checkpoints' prompts as mistral-common does.
+
+    See ``mistral_tokenizer.drop_default_system_prompt``.
+    """
+    from mlx_lm.utils import _download
+
+    from .mistral_tokenizer import drop_default_system_prompt
+
+    try:
+        model_path = _download(model_name)
+    except Exception:
+        return  # the load that follows reports the real error
+    drop_default_system_prompt(tokenizer, model_path)
+
+
 def load_model_with_fallback(
     model_name: str,
     tokenizer_config: dict = None,
@@ -226,6 +242,7 @@ def load_model_with_fallback(
     tokenizer_config = _prefer_fast_mistral_tokenizer(model_name, tokenizer_config)
     model, tokenizer = _load_model_with_fallback(model_name, tokenizer_config)
     tokenizer = _install_custom_chat_template(model_name, tokenizer)
+    _drop_mistral_default_system_prompt(model_name, tokenizer)
     apply_chat_template_override(tokenizer, chat_template)
     return model, tokenizer
 
