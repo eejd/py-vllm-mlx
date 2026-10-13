@@ -286,10 +286,12 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
 
         # Alternative format: <|channel>thought...<|channel>response...
         # Use rfind for the LAST <|channel>response marker
-        responses = list(_RESPONSE_RE.finditer(text))
-        if text.count(self.start_token) >= 2 and responses:
-            _, _, after_start = text.partition(self.start_token)
-            last_resp = list(_RESPONSE_RE.finditer(after_start))[-1]
+        # The first "<|channel>" opens a channel whatever its name is, so only a
+        # response marker after it is the switch to the answer.
+        _, _, after_start = text.partition(self.start_token)
+        switches = list(_RESPONSE_RE.finditer(after_start))
+        if switches:
+            last_resp = switches[-1]
             reasoning = after_start[: last_resp.start()]
             content = after_start[last_resp.end() :]
             reasoning = _strip_channel_tokens(reasoning)

@@ -120,6 +120,19 @@ RAW = {
         "Aresponses vary",
         None,
     ),
+    # a lone "<|channel>response" opens a channel; with no switch after it, a second
+    # "<|channel>" is just another channel (extract_reasoning raised IndexError here)
+    "lone-response-then-another-channel": (
+        "<|channel>response a<|channel>x",
+        "ax",
+        None,
+    ),
+    "lone-response-then-bare-channel": ("<|channel>response<|channel>", None, None),
+    "lone-response-then-a-switch": (
+        "<|channel>response a<|channel>response b",
+        "a",
+        "b",
+    ),
     # the stream ends in the middle of a marker or a channel name
     "cut-after-start-marker": ("<|channel>thought\nabc<|channel>", "abc", None),
     "cut-in-response-marker": (
@@ -357,3 +370,100 @@ def test_reset_state_forgets_an_aborted_stream():
     lone = parser.extract_reasoning_streaming("", "", "<|channel>response\nA")
     tail = parser.finalize_stream()
     assert (lone.reasoning if lone else "") + (tail.reasoning if tail else "") == "A"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "<|channel>response a<|channel>x",
+        "<|channel>response<|channel>",
+        "<|channel>response<|channel>response",
+        "<|channel>thought<|channel>responses",
+    ],
+)
+def test_no_shape_of_channel_markers_makes_extract_reasoning_raise(raw):
+    # it was an IndexError, i.e. an HTTP 500 from the server, which calls it unguarded
+    reasoning, content = get_parser("gemma4")().extract_reasoning(raw)
+
+    assert isinstance(reasoning, (str, type(None)))
+    assert isinstance(content, (str, type(None)))
+
+
+def test_random_marker_soup_never_raises_and_single_cycles_match_the_stream():
+    """Seeded fuzz over arbitrary shapes of markers and words: whole-text extraction
+    never raises (all shapes, streamed pieces too) and a single cycle (one channel, at
+    most one switch or end marker) streams exactly what it returns."""
+    import random
+
+    words = [
+        "thought",
+        "response",
+        "thoughtful",
+        "responses",
+        "x",
+        "Ok",
+        " ",
+        "\n",
+        ".",
+        "<",
+        "|>",
+        "<|",
+    ]
+    markers = ["<|channel>", "<|channel>response", "<|channel>thought", "<channel|>"]
+    rng = random.Random(11)
+    single = 0
+    for _ in range(8000):
+        raw = "".join(
+            rng.choice(markers if rng.random() < 0.3 else words)
+            for _ in range(rng.randint(0, 9))
+        )
+        reasoning, content = get_parser("gemma4")().extract_reasoning(raw)  # no raise
+        cuts = (
+            sorted(rng.sample(range(1, len(raw)), min(len(raw) - 1, rng.randint(0, 4))))
+            if len(raw) > 1
+            else []
+        )
+        chunks = [raw[i:j] for i, j in zip([0, *cuts], [*cuts, len(raw)])]
+        _stream(chunks)  # no raise
+
+    for _ in range(8000):
+
+        def body():
+            return "".join(rng.choice(words) for _ in range(rng.randint(0, 6)))
+
+        raw = (
+            "<|channel>"
+            + rng.choice(["", "thought\n", "response ", "response\n"])
+            + body()
+        )
+        pick = rng.random()
+        if pick < 0.4:
+            raw += "<|channel>response" + rng.choice([" ", "\n"]) + body()
+        elif pick < 0.8:
+            raw += "<channel|>" + body()
+        if rng.random() < 0.2:
+            raw = raw[: rng.randint(1, len(raw))]
+        starts = len(re.findall(r"<\|channel>", raw))
+        switches = len(re.findall(r"<\|channel>response(?!\w)", raw[1:]))
+        if starts - switches > 1 or switches > 1 or (switches and "<channel|>" in raw):
+            continue
+        reasoning, content = get_parser("gemma4")().extract_reasoning(raw)
+        cuts = (
+            sorted(rng.sample(range(1, len(raw)), min(len(raw) - 1, rng.randint(0, 4))))
+            if len(raw) > 1
+            else []
+        )
+        chunks = [raw[i:j] for i, j in zip([0, *cuts], [*cuts, len(raw)])]
+        assert _stream(chunks) == (reasoning or "", content or ""), (raw, chunks)
+        single += 1
+    assert single > 3000
+
+
+def test_the_last_response_switch_splits_degenerate_cycling():
+    raw = "<|channel>thought\nA<|channel>response\nB<|channel>response\nC"
+
+    reasoning, content = get_parser("gemma4")().extract_reasoning(raw)
+
+    # the earlier channels, markers stripped, are reasoning; the text after the last
+    # switch is the answer
+    assert (reasoning, content) == ("Aresponse\nB", "C")
