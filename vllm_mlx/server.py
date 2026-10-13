@@ -3906,7 +3906,11 @@ def _extract_reasoning_and_tool_calls(
             cleaned_reasoning_text = None
         if cleaned_reasoning_text is not None:
             text_for_tool_parse = cleaned_reasoning_text
-        elif reasoning_text is not None:
+        elif reasoning_text is not None or (
+            _reasoning_parser_reads_control_tokens(_reasoning_parser)
+            and "<|channel|>" in output_text
+        ):
+            # (a harmony output with nothing to separate, only calls, lands here too)
             # Reasoning extracted but no final content channel - gpt-oss
             # jumped from <|channel|>analysis straight into
             # <|channel|>commentary to=functions.*. Hand the tool parser the
@@ -7489,8 +7493,6 @@ async def _stream_anthropic_messages(
                         if not content_to_emit:
                             continue
 
-                if not content_to_emit:
-                    continue
                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
                 continue
 
@@ -7588,8 +7590,6 @@ async def _stream_anthropic_messages(
                         if not content_to_emit:
                             continue
 
-                if not content_to_emit:
-                    continue
                 if thinking_block_started and not text_block_started:
                     # Close thinking block, open text block
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
@@ -7940,7 +7940,7 @@ async def stream_chat_completion(
                     # The request disabled thinking — surface only parsed
                     # content; drop reasoning the model emitted anyway.
                     reasoning = None
-                    if not content and not tool_input:
+                    if not content:
                         continue
 
                 # Tool call parsing on content portion

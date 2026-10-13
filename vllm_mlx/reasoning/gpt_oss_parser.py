@@ -29,7 +29,8 @@ class GptOssReasoningParser(ReasoningParser):
     Also handles extended format with constrain token:
         <|channel|>final <|constrain|>JSON<|message|>[content]<|return|>
 
-    An output with no channel at all is plain content. The closing token of a
+    An output with no channel at all is plain content; so is text before the first
+    control token when streaming (a real generation starts with a control token). The closing token of a
     message is usually missing from the text (it is a stop token); a message that
     runs to the end of the text is read like a terminated one.
     """
@@ -57,13 +58,9 @@ class GptOssReasoningParser(ReasoningParser):
         if not model_output or "<|channel|>" not in model_output:
             return None, model_output if model_output else None
 
-        reasoning, content = split_messages(model_output)
-
-        # If no channels found, return as plain content
-        if reasoning is None and content is None:
-            return None, model_output
-
-        return reasoning, content
+        # Channels with nothing to separate (only calls, an empty final) are nothing:
+        # the raw control tokens are never content, and a stream gives the same.
+        return split_messages(model_output)
 
     def extract_reasoning_streaming(
         self,

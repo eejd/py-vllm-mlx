@@ -155,8 +155,8 @@ def test_reasoning_parsers_read_the_rendered_messages(parser_name, name, at_eos)
     whole = get_parser(parser_name)().extract_reasoning(text)
 
     if parser_name == "gpt_oss" and not reasoning and not content:
-        # nothing to separate (only calls): gpt_oss hands the output on as it is
-        assert whole == (None, text)
+        # nothing to separate (only calls): nothing, never the raw control tokens
+        assert whole == (None, None)
     else:
         assert (whole[0] or "", whole[1] or "") == (reasoning.strip(), content.strip())
     for label, chunks in _chunkings(text):

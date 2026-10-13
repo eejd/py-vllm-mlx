@@ -238,11 +238,10 @@ class BodyTrimmer:
 
 
 def function_name(recipient: str | None) -> str | None:
-    """``name`` for a recipient ``functions.name``, else None."""
+    """``name`` for a recipient ``functions.name``, else None. Any non-empty name is
+    one (vLLM checks only the prefix; a hyphen is valid in a function name)."""
     if recipient and recipient.startswith("functions."):
-        name = recipient[len("functions.") :]
-        if name.isidentifier():
-            return name
+        return recipient[len("functions.") :] or None
     return None
 
 

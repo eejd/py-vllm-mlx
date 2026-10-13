@@ -329,3 +329,48 @@ def test_message_bodies_are_stripped_the_same_way_streaming_and_whole(body):
             assert _stream_reasoning(get_parser(name)(), chunks) == want, label
     for label, chunks in _chunkings(text):
         assert _stream_tool_parser(chunks)[2] == body.strip(), label
+
+
+@pytest.mark.parametrize("channel", ["analysis", "commentary"])
+@pytest.mark.parametrize("name", ["a-b", "get.weather", "x"])
+def test_any_name_after_functions_is_a_call(channel, name):
+    """vLLM checks only the prefix: a hyphen is valid in a function name."""
+    text = (
+        f"<|channel|>{channel} to=functions.{name} <|constrain|>json"
+        '<|message|>{"q": 1}<|call|>'
+    )
+
+    whole = HarmonyToolParser().extract_tool_calls(text)
+
+    assert [c["name"] for c in whole.tool_calls] == [name]
+    assert get_parser("harmony")().extract_reasoning(text) == (None, None)
+    assert get_parser("gpt_oss")().extract_reasoning(text) == (None, None)
+    assert _stream_tool_parser(_tokens(text))[0] == [(name, {"q": 1})]
+    for parser_name in ("gpt_oss", "harmony"):
+        assert _stream_reasoning(get_parser(parser_name)(), _tokens(text)) == ("", "")
+
+
+def test_only_calls_is_nothing_to_separate_for_the_reasoning_parsers():
+    text = '<|channel|>commentary to=functions.f<|message|>{"a":'
+
+    assert get_parser("gpt_oss")().extract_reasoning(text) == (None, None)
+    assert _stream_reasoning(get_parser("gpt_oss")(), _tokens(text)) == ("", "")
+
+
+def test_the_analysis_messages_come_out_whole_and_nothing_else_does():
+    from vllm_mlx.reasoning.harmony_channels import strip_reasoning_messages
+
+    call = '<|start|>assistant to=functions.f<|channel|>commentary json<|message|>{"a":1}<|call|>'
+    text = (
+        "<|channel|>analysis<|message|>one<|end|>"
+        "<|start|>assistant<|channel|>analysis<|message|>two<|end|>"
+        + call
+        + "<|start|>assistant<|channel|>analysis<|message|>cut off"
+    )
+
+    # each analysis message leaves with its role header and terminator; the call keeps
+    # its own role header
+    assert strip_reasoning_messages(text) == call
+    assert strip_reasoning_messages("plain <|channel|>final<|message|>x") == (
+        "plain <|channel|>final<|message|>x"
+    )

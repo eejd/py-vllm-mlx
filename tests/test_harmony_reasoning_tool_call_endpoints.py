@@ -391,3 +391,98 @@ async def test_messages_stream_feeds_a_harmony_reasoning_parser_the_control_toke
     )
 
     assert (seen.reasoning.strip(), seen.content.strip()) == (analysis, final)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["whole", "stream"])
+@pytest.mark.parametrize("name", ["analysis-call-final", "analysis-into-call-at-eos"])
+def test_thinking_disabled_still_returns_the_call_and_no_analysis(
+    monkeypatch, harmony_parsers, name, stream
+):
+    """enable_thinking=false skips the reasoning parser; the tool parser alone reads the
+    channels, so the call and the answer come through and the analysis stays out."""
+    raw, _analysis_text, final, calls = RAW[name]
+    monkeypatch.setattr(
+        srv, "_engine", _engine(raw, "tokens", thinking_open_in_prompt=False)
+    )
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+    body = {
+        **ENDPOINT_BODIES["/v1/chat/completions"](),
+        "stream": stream,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    response = TestClient(srv.app).post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    if stream:
+        payloads = [
+            p for p in _sse_payloads(response.text.splitlines(True)) if p.get("choices")
+        ]
+        deltas = [p["choices"][0]["delta"] for p in payloads]
+        content = "".join(d.get("content") or "" for d in deltas)
+        indexes = {t["index"] for d in deltas for t in d.get("tool_calls") or []}
+        finish = [
+            p["choices"][0]["finish_reason"]
+            for p in payloads
+            if p["choices"][0]["finish_reason"]
+        ]
+    else:
+        choice = response.json()["choices"][0]
+        content = choice["message"].get("content") or ""
+        indexes = set(range(len(choice["message"].get("tool_calls") or [])))
+        finish = [choice["finish_reason"]]
+    assert content.strip() == final
+    assert len(indexes) == calls
+    assert finish == ["tool_calls"]
+
+
+@pytest.mark.parametrize(
+    "name", ["call-only", "analysis-into-call-at-eos", "call-in-the-analysis-channel"]
+)
+def test_a_call_with_no_tools_declared_is_never_content(
+    monkeypatch, harmony_parsers, name
+):
+    """No tools in the request (or tool_choice none): the model's call is not a call and
+    not text either; the control tokens never reach the client."""
+    raw, analysis, _final, _calls = RAW[name]
+    monkeypatch.setattr(
+        srv, "_engine", _engine(raw, "whole", thinking_open_in_prompt=False)
+    )
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+    body = {
+        k: v
+        for k, v in ENDPOINT_BODIES["/v1/chat/completions"]().items()
+        if k != "tools"
+    }
+
+    response = TestClient(srv.app).post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    message = response.json()["choices"][0]["message"]
+    assert not message.get("tool_calls")
+    assert "<|" not in (message.get("content") or "")
+    assert "to=functions" not in (message.get("content") or "")
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_a_call_only_output_leaves_no_control_tokens_in_the_cleaned_content(
+    harmony_parsers, with_tools
+):
+    """The shared extraction (responses, messages, chat): nothing to separate."""
+    raw, *_ = RAW["call-only"]
+    request = _request_with_or_without_tools(with_tools)
+
+    reasoning, content, calls = srv._extract_reasoning_and_tool_calls(
+        raw, request, engine=_engine(raw, "whole"), chat_kwargs={}
+    )
+
+    assert not reasoning
+    assert len(calls or []) == (1 if with_tools else 0)
+    assert "<|" not in (content or "") and "to=functions" not in (content or "")
+
+
+def _request_with_or_without_tools(with_tools):
+    from tests.test_reasoning_tool_call_contract import _request
+
+    request = _request(False)
+    return request if with_tools else request.model_copy(update={"tools": None})

@@ -227,8 +227,9 @@ class HarmonyToolParser(ToolParser):
         several tokens, a control token with text after it, or the end of a message
         and the start of the next. A commentary message addressed to a function
         becomes a tool call when it ends (an explicit terminator, or the start of the
-        next message); the final channel is emitted as content and everything else
-        (analysis, preambles) is suppressed. A call still open when the stream ends is
+        next message); the final channel and commentary addressed to no one (a preamble)
+        are emitted as content and everything else (analysis, other channels) is
+        suppressed. A call still open when the stream ends is
         resolved by ``finalize_streaming``.
         """
         # The text before this delta, taken from the accumulated text: that is the
