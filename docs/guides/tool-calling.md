@@ -331,6 +331,8 @@ Models that produce `<think>...</think>` reasoning tags (like DeepSeek-R1, Qwen3
 
 This works even when `<think>` was injected in the prompt (implicit think tags with only a closing `</think>`).
 
+Tool calls are parsed from the content part only. With `--reasoning-parser` the reasoning is separated first and never reaches the tool parser; call-shaped markup the model drafts while thinking stays in `reasoning`, and a call that exists only inside the thinking is not a call. See [Reasoning and Tool Calls](reasoning.md#reasoning-and-tool-calls).
+
 ## CLI Reference
 
 | Option | Description |

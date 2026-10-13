@@ -46,6 +46,9 @@ class _PassThroughReasoning:
     def extract_reasoning_streaming(self, previous, current, delta):
         return SimpleNamespace(reasoning=None, content=delta)
 
+    def extract_reasoning(self, model_output):
+        return None, model_output
+
     def reset_state(self, *args, **kwargs):
         pass
 

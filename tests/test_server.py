@@ -3643,77 +3643,49 @@ class TestStreamChatCompletion:
         }
 
     @pytest.mark.anyio
-    async def test_reasoning_stream_redirects_gemma4_tool_marker(self, monkeypatch):
-        """Gemma 4 tool markup inside reasoning should reach the tool parser."""
+    async def test_reasoning_stream_keeps_gemma4_tool_marker_in_the_thinking(
+        self, monkeypatch
+    ):
+        """A call inside the thought channel stays reasoning: tool calls come from the
+        content part only, exactly as in the non-streaming path."""
         from vllm_mlx.engine.base import GenerationOutput
-        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.reasoning import get_parser
         from vllm_mlx.server import (
             ChatCompletionRequest,
             Message,
             stream_chat_completion,
         )
+        from vllm_mlx.tool_parsers import ToolParserManager
         import vllm_mlx.server as server
+
+        call = '<|tool_call>call:read_file{path:<|"|>/tmp/a.py<|"|>}<tool_call|>'
 
         class FakeEngine:
             model_name = "fake-engine"
 
             async def stream_chat(self, messages, **kwargs):
-                chunks = [
-                    GenerationOutput(text="", new_text="<|tool_call>", finished=False),
-                    GenerationOutput(
+                pieces = ["<|channel>thought\n", "Let me read it. ", call]
+                for i, piece in enumerate(pieces):
+                    last = i == len(pieces) - 1
+                    yield GenerationOutput(
                         text="",
-                        new_text='call:read_file{path:<|"|>/tmp/a.py<|"|>}',
-                        finished=False,
-                    ),
-                    GenerationOutput(
-                        text="",
-                        new_text="<tool_call|>",
-                        finished=True,
-                        finish_reason="stop",
+                        new_text=piece,
+                        finished=last,
+                        finish_reason="stop" if last else None,
                         prompt_tokens=11,
-                        completion_tokens=5,
-                    ),
-                ]
-                for chunk in chunks:
-                    yield chunk
-
-        class FakeReasoningParser:
-            def reset_state(self, implicit_mode: bool = False):
-                pass
-
-            def extract_reasoning_streaming(
-                self, previous_text, current_text, delta_text
-            ):
-                return DeltaMessage(reasoning=delta_text)
-
-        class FakeToolParser:
-            def reset(self):
-                pass
-
-            def extract_tool_calls_streaming(
-                self, previous_text, current_text, delta_text, request=None
-            ):
-                if "<tool_call|>" not in current_text:
-                    return None
-                return {
-                    "tool_calls": [
-                        {
-                            "index": 0,
-                            "id": "call_gemma4",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": '{"path":"/tmp/a.py"}',
-                            },
-                        }
-                    ]
-                }
+                        completion_tokens=i + 1,
+                    )
 
         monkeypatch.setattr(server, "_model_name", "served-model")
-        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(server, "_reasoning_parser", get_parser("gemma4")())
+        monkeypatch.setattr(server, "_reasoning_parser_name", "gemma4")
         monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
-        monkeypatch.setattr(server, "_tool_call_parser", "fake")
-        monkeypatch.setattr(server, "_tool_parser_instance", FakeToolParser())
+        monkeypatch.setattr(server, "_tool_call_parser", "gemma4")
+        monkeypatch.setattr(
+            server,
+            "_tool_parser_instance",
+            ToolParserManager.get_tool_parser("gemma4")(),
+        )
 
         request = ChatCompletionRequest(
             model="request-model",
@@ -3747,18 +3719,15 @@ class TestStreamChatCompletion:
             for chunk in chunks
             if chunk != "data: [DONE]\n\n"
         ]
-        tool_payloads = [
-            payload
-            for payload in payloads
-            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
-        ]
+        choices = [p["choices"][0] for p in payloads if p["choices"]]
 
-        assert len(tool_payloads) == 1
-        assert (
-            tool_payloads[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
-            == "read_file"
+        assert not [c for c in choices if c["delta"].get("tool_calls")]
+        assert call in "".join(
+            c["delta"].get("reasoning") or c["delta"].get("reasoning_content") or ""
+            for c in choices
         )
-        assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+        assert not "".join(c["delta"].get("content") or "" for c in choices)
+        assert [c["finish_reason"] for c in choices if c["finish_reason"]] == ["stop"]
 
     @pytest.mark.anyio
     async def test_reasoning_stream_skips_tool_parser_until_markup_appears(

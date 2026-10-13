@@ -149,6 +149,16 @@ For OpenAI requests, unspecified effort selects `high`; `minimal`, `low`, and
 `medium` select `low`; `high` and `xhigh` select `high`; and `max` selects
 `max`. The preview profile normalizes `low` to its `high` behavior.
 
+## Reasoning and Tool Calls
+
+When a reasoning parser and a tool parser are both configured, the reasoning is separated first and the tool parser is handed the **content part only**. This holds on every endpoint (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`), streaming or not:
+
+- Tool-call markup inside the thinking stays in `reasoning`, untouched. A model that drafts its call while thinking (`Let me make the call: <tool_call>...`) and then makes it after `</think>` yields one call, not two.
+- A call that exists only inside the thinking is not a call. This is the same answer as without a reasoning parser, where the tool parsers strip the thinking themselves, and as vLLM gives.
+- A generation cut off inside the thinking (`finish_reason: length`, `</think>` never written) has no content and therefore no tool calls. When the chat template opens `<think>` in the prompt (Qwen3.5/3.8) the non-streaming endpoints read an output with no tag at all as exactly that, as the streaming path does.
+
+Gemma 4 follows the same rule: a `<|tool_call>` inside an unclosed thought channel is reasoning, not a call.
+
 ## How It Works
 
 The reasoning parser uses text-based detection to identify thinking tags in the model output. During streaming, it tracks the current position in the output to correctly route each token to either `reasoning` or `content`.
