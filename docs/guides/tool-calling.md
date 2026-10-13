@@ -250,6 +250,9 @@ The model answers a call with `functools[{"name": ..., "arguments": {...}}]`; th
 parser finds the end of the list with a bracket scan, so arguments containing `]`
 are safe, and a list it cannot fully parse stays in `content`. It streams: each call
 is emitted once, when its list closes.
+Text after the closing `]` (for instance a stray `}` the 4-bit model appends) stays in `content`;
+vLLM's `phi4_mini_json` parser returns `content=None` for any output with a call and so drops it, along
+with any prose, which is why this parser keeps visible what it did not understand.
 
 ### Hermes-3 (3B and other plain-ChatML checkpoints)
 
@@ -265,6 +268,17 @@ vllm-mlx serve mlx-community/Hermes-3-Llama-3.2-3B-4bit \
   --enable-auto-tool-choice --tool-call-parser hermes \
   --chat-template "$TEMPLATE"
 ```
+
+The template uses the format the Hermes-3 model cards document (`{"arguments": ..., "name": ...}`
+inside `<tool_call>`, a newline before `<|im_end|>` after tool results), not vLLM's Hermes-2-Pro
+order. Measured on `mlx-community/Hermes-3-Llama-3.2-3B-4bit` (greedy, server output identical to
+`mlx_lm` direct on the same rendered prompt): the Hermes-2-Pro order made the 3B model write untagged
+JSON with typos (`{"name: "echo_args", ...}`, no call); the model-card order makes it write
+`<tool_call>{"arguments": ..., "name": ...}` and nested-object and list arguments parse into correct
+calls, the tool roundtrip answers cleanly. It is still a 3B 4-bit model: it sometimes drops characters
+from values (`<ok>` vanished from a string argument) or answers with untagged JSON, so expect
+unreliable calls (quantbench tool-echo: `object` 3/3 pass, scalars wrong values, `markup_in_value` and
+`code_value` no call).
 
 Requests without tools render byte-for-byte like the checkpoint's own template (tests pin this);
 requests with tools get the `<tools>` system prompt and `<tool_call>` instructions. The template

@@ -25,6 +25,14 @@
     * `json_to_python_type` follows the `items` key of an array schema (upstream applies
       Jinja's `items` filter to the whole schema and renders `list[Union[]]`), and the
       `Args:` entries of one tool are on separate lines (upstream runs them together);
+    * the tool-call format is the one the Hermes-3 model cards document (the models were
+      trained on it): the instruction is `{"arguments": <args-dict>, "name":
+      <function-name>}` with the pydantic schema listing `arguments` first, replayed calls
+      are written in that order, and a `tool` turn ends `</tool_response>\n<|im_end|>`.
+      vLLM's example (the Hermes-2-Pro format) says `name` first and has no newline;
+      measured on the mlx-community Hermes-3-Llama-3.2-3B-4bit with greedy decoding that
+      order made the model write untagged JSON with typos (`{"name: "echo_args", ...}`)
+      where this one makes it write `<tool_call>{"arguments": ..., "name": ...}`;
     * the JSON of `arguments` is rendered with the same `tojson` the server's other
       templates use, and string arguments are passed through unchanged.
   Use with `--tool-call-parser hermes`.
@@ -112,10 +120,10 @@
     {%- endif %}
 {%- endfor %}
 {{- " </tools>" }}
-{{- 'Use the following pydantic model json schema for each tool call you will make: {"properties": {"name": {"title": "Name", "type": "string"}, "arguments": {"title": "Arguments", "type": "object"}}, "required": ["name", "arguments"], "title": "FunctionCall", "type": "object"}}\n' }}
+{{- 'Use the following pydantic model json schema for each tool call you will make: {"properties": {"arguments": {"title": "Arguments", "type": "object"}, "name": {"title": "Name", "type": "string"}}, "required": ["arguments", "name"], "title": "FunctionCall", "type": "object"}\n' }}
 {{- "For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:\n" }}
 {{- "<tool_call>\n" }}
-{{- '{"name": <function-name>, "arguments": <args-dict>}\n' }}
+{{- '{"arguments": <args-dict>, "name": <function-name>}\n' }}
 {{- '</tool_call><|im_end|>\n' }}
 {%- for message in messages %}
     {%- if message.role == "assistant" and message.tool_calls %}
@@ -128,14 +136,16 @@
             {%- if tool_call.function is defined %}
                 {%- set tool_call = tool_call.function %}
             {%- endif %}
-            {{- '{"name": "' + tool_call.name + '"' }}
             {%- if tool_call.arguments is defined %}
-                {{- ', "arguments": ' }}
+                {{- '{"arguments": ' }}
                 {%- if tool_call.arguments is string %}
                     {{- tool_call.arguments }}
                 {%- else %}
                     {{- tool_call.arguments|tojson }}
                 {%- endif %}
+                {{- ', "name": "' + tool_call.name + '"' }}
+            {%- else %}
+                {{- '{"name": "' + tool_call.name + '"' }}
             {%- endif %}
             {{- '}\n</tool_call>' }}
         {%- endfor %}
@@ -146,7 +156,7 @@
         {%- endif %}
         {{- '\n<tool_response>\n' + (message.content or "") + '\n</tool_response>' }}
         {%- if loop.last or messages[loop.index0 + 1].role != "tool" %}
-            {{- '<|im_end|>\n' }}
+            {{- '\n<|im_end|>\n' }}
         {%- endif %}
     {%- else %}
         {{- '<|im_start|>' + message.role + '\n' + (message.content or "") + '<|im_end|>\n' }}

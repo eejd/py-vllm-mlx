@@ -173,7 +173,7 @@ class TestRenderTools:
             tools=TOOLS,
         )
         assert (
-            '{"name": "get_weather", "arguments": {"city": "Zürich", "ok": true, "n": null}}'
+            '{"arguments": {"city": "Zürich", "ok": true, "n": null}, "name": "get_weather"}'
             in prompt
         )
 
@@ -182,7 +182,7 @@ class TestRenderTools:
             [_USER, {"role": "assistant", "tool_calls": [_tool_call("f", '{"a": 1}')]}],
             tools=TOOLS,
         )
-        assert '{"name": "f", "arguments": {"a": 1}}' in prompt
+        assert '{"arguments": {"a": 1}, "name": "f"}' in prompt
 
     def test_assistant_content_survives_next_to_tool_calls(self):
         prompt = render(
@@ -227,7 +227,7 @@ class TestRenderTools:
         )
         assert prompt.endswith(
             "<|im_start|>tool\n<tool_response>\none\n</tool_response>\n"
-            "<tool_response>\ntwo\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+            "<tool_response>\ntwo\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n"
         )
         assert prompt.count("<|im_start|>tool") == 1
 
@@ -268,9 +268,11 @@ class TestParserReadsWhatTheTemplateTeachesTheModel:
 
         # The sentence at the end of the system turn is the model's instruction.
         assert (
-            '<tool_call>\n{"name": <function-name>, "arguments": <args-dict>}\n</tool_call>'
+            '<tool_call>\n{"arguments": <args-dict>, "name": <function-name>}\n</tool_call>'
             in render([_USER], tools=TOOLS)
         )
+        # The model card's pydantic schema lists `arguments` first.
+        assert '"required": ["arguments", "name"]' in render([_USER], tools=TOOLS)
         parsed = HermesToolParser().extract_tool_calls(
             '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>'
         )
