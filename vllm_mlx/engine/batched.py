@@ -27,6 +27,7 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
 from .base import (
     BaseEngine,
+    GenerationError,
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
@@ -60,6 +61,17 @@ def _resolve_metal_buffer_cache_limit(
             )
 
     return int(max_recommended * gpu_memory_utilization), "device-scaled"
+
+
+def _raise_if_generation_error(output: Any) -> None:
+    """Turn a scheduler's ``finish_reason="error"`` into :class:`GenerationError`.
+
+    The scheduler finishes the requests that were running when a step failed
+    (Metal out-of-memory, command-buffer error) with that reason and no text.
+    Passed on as output it reads as a normal, empty completion.
+    """
+    if getattr(output, "finish_reason", None) == "error":
+        raise GenerationError()
 
 
 def _normalize_tool_call_arguments_for_template(messages: list[dict]) -> list[dict]:
@@ -899,6 +911,8 @@ class BatchedEngine(BaseEngine):
                 ignore_eos=bool(kwargs.pop("ignore_eos", False)),
             )
 
+            _raise_if_generation_error(output)
+
             return GenerationOutput(
                 text=clean_output_text(output.output_text),
                 tokens=output.output_token_ids,
@@ -931,6 +945,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
         )
+        _raise_if_generation_error(output)
 
         text = clean_output_text(output.output_text)
 
@@ -1000,6 +1015,7 @@ class BatchedEngine(BaseEngine):
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
+                _raise_if_generation_error(output)
                 yield GenerationOutput(
                     text=clean_output_text(output.output_text),
                     new_text=output.new_text,
@@ -1038,6 +1054,7 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
+            _raise_if_generation_error(output)
             text = clean_output_text(output.output_text)
 
             yield GenerationOutput(

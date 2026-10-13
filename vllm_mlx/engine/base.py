@@ -64,6 +64,24 @@ class EngineStopped(RuntimeError):
     code = "engine_stopped"
 
 
+class GenerationError(RuntimeError):
+    """The engine aborted a request it had already accepted.
+
+    A scheduler that recovers from a failed step (a Metal out-of-memory, a
+    crashed command buffer) finishes every request that was running with
+    ``finish_reason="error"``.  Handed on as ordinary output that is a
+    successful, empty completion: HTTP 200, no error anywhere a client looks.
+    The engines raise this instead, as vLLM does for the same finish reason, so
+    the API layer can answer 500 or send an error event.  The message is
+    deliberately generic; the cause is in the engine log.
+    """
+
+    code = "generation_error"
+
+    def __init__(self, message: str = "Internal server error"):
+        super().__init__(message)
+
+
 @contextmanager
 def suspend_cancellation():
     """Temporarily clear task cancellation so cleanup can finish deterministically."""
