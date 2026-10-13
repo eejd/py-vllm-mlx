@@ -59,6 +59,51 @@ def _reference_ids(tok, prompt):
     return tok.encode(prompt, add_special_tokens=False)
 
 
+class TestBosRule:
+    """The rule is mlx-lm's / the Simple engine's, character for character."""
+
+    def test_bos_text_in_the_middle_of_a_prompt_does_not_count(self):
+        tok = FakeHFTokenizer()
+        assert prompt_adds_special_tokens(tok, f"hello {BOS} world") is True
+
+    def test_leading_whitespace_defeats_the_rule(self):
+        tok = FakeHFTokenizer()
+        assert prompt_adds_special_tokens(tok, f" {BOS} hello") is True
+
+    def test_empty_bos_token_matches_every_prompt_like_mlx_lm(self):
+        tok = FakeHFTokenizer(bos_token="")
+        assert prompt_adds_special_tokens(tok, "hello") is False
+
+    def test_non_string_bos_token_is_ignored(self):
+        tok = FakeHFTokenizer(bos_token=None)
+        tok.bos_token = object()
+        assert prompt_adds_special_tokens(tok, "hello") is True
+
+    def test_duck_typed_tokenizer_without_the_keyword_uses_its_defaults(self):
+        class PlainTokenizer:
+            bos_token = BOS
+
+            def encode(self, text):
+                return [len(w) for w in text.split()]
+
+        assert encode_prompt(PlainTokenizer(), CHAT_PROMPT) == [
+            len(w) for w in CHAT_PROMPT.split()
+        ]
+
+    def test_tokenizer_with_var_keyword_encode_gets_the_flag(self):
+        seen = {}
+
+        class KwTokenizer:
+            bos_token = BOS
+
+            def encode(self, text, **kwargs):
+                seen.update(kwargs)
+                return [1]
+
+        encode_prompt(KwTokenizer(), CHAT_PROMPT)
+        assert seen == {"add_special_tokens": False}
+
+
 def _bare_scheduler(tokenizer):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.tokenizer = tokenizer

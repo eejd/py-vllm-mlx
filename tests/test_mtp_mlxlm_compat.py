@@ -65,9 +65,7 @@ def test_scheduler_enable_mtp_survives_modern_batch_generator(caplog):
 
     model = SimpleNamespace(mtp=object())  # has an MTP head: only the guard disables
     tokenizer = SimpleNamespace(
-        encode=lambda text, add_special_tokens=True: list(
-            range(len(text.split()))
-        ),
+        encode=lambda text: list(range(len(text.split()))),
         decode=lambda ids: " ".join(str(i) for i in ids),
         eos_token_id=0,
         eos_token_ids={0},

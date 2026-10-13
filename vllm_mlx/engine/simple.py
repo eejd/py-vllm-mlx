@@ -34,7 +34,12 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from ..request import UnsupportedRequestOption
-from ..utils.tokenizer import collect_eos_token_ids, eos_ignoring_tokenizer
+from ..utils.tokenizer import (
+    collect_eos_token_ids,
+    encode_prompt,
+    eos_ignoring_tokenizer,
+    prompt_adds_special_tokens,
+)
 from .base import (
     BaseEngine,
     EngineBusy,
@@ -1474,9 +1479,7 @@ class SimpleEngine(BaseEngine):
 
             if use_specprefill:
                 tokenizer = self._model.tokenizer
-                add_special = tokenizer.bos_token is None or not prompt.startswith(
-                    tokenizer.bos_token
-                )
+                add_special = prompt_adds_special_tokens(tokenizer, prompt)
                 tokens_list = tokenizer.encode(prompt, add_special_tokens=add_special)
                 n_tokens = len(tokens_list)
 
@@ -1618,7 +1621,9 @@ class SimpleEngine(BaseEngine):
 
                     if not finished:
                         if prompt_tokens == 0 and self._model is not None:
-                            prompt_tokens = len(self._model.tokenizer.encode(prompt))
+                            prompt_tokens = len(
+                                encode_prompt(self._model.tokenizer, prompt)
+                            )
                         if request_id in self._active_requests:
                             self._active_requests[request_id].update(
                                 {
@@ -2234,8 +2239,7 @@ class SimpleEngine(BaseEngine):
             and not cache_blocking_controls
             and hasattr(tokenizer, "encode")
         ):
-            bos_token = getattr(tokenizer, "bos_token", None)
-            add_special = bos_token is None or not prompt.startswith(bos_token)
+            add_special = prompt_adds_special_tokens(tokenizer, prompt)
             full_tokens_list = tokenizer.encode(prompt, add_special_tokens=add_special)
             full_token_count = len(full_tokens_list)
             prefix_trie_eligible = bool(full_tokens_list)
@@ -2256,9 +2260,7 @@ class SimpleEngine(BaseEngine):
         if system_prefix_text is not None:
             system_hash = hashlib.sha256(system_prefix_text.encode()).hexdigest()[:16]
 
-            add_special = tokenizer.bos_token is None or not prompt.startswith(
-                tokenizer.bos_token
-            )
+            add_special = prompt_adds_special_tokens(tokenizer, prompt)
             if full_tokens_list is None:
                 full_tokens_list = tokenizer.encode(
                     prompt, add_special_tokens=add_special
@@ -2902,9 +2904,7 @@ class SimpleEngine(BaseEngine):
         # reported. Previously this only happened inside the system-KV-cache
         # branch (which requires a system message AND ChatML markers) or for
         # specprefill — every other request reported prompt_tokens=0.
-        _add_special = self._text_tokenizer.bos_token is None or not (
-            full_prompt.startswith(self._text_tokenizer.bos_token)
-        )
+        _add_special = prompt_adds_special_tokens(self._text_tokenizer, full_prompt)
         full_tokens_list = self._text_tokenizer.encode(
             full_prompt, add_special_tokens=_add_special
         )

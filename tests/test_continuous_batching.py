@@ -23,7 +23,7 @@ class TestContinuousBatchingBasic:
         """Test that scheduler can queue multiple requests."""
         model = MagicMock()
         tokenizer = MagicMock()
-        tokenizer.encode = lambda x, **_: list(range(len(x.split())))
+        tokenizer.encode = lambda x: list(range(len(x.split())))
 
         config = SchedulerConfig(max_num_seqs=32)
         scheduler = Scheduler(model, tokenizer, config)

@@ -212,7 +212,7 @@ class TestSchedulerBasic:
     def mock_tokenizer(self):
         """Create a mock tokenizer."""
         tokenizer = MagicMock()
-        tokenizer.encode = lambda x, **_: list(range(len(x.split())))
+        tokenizer.encode = lambda x: list(range(len(x.split())))
         tokenizer.decode = lambda x: " ".join(str(t) for t in x)
         tokenizer.eos_token_id = 0
         tokenizer.eos_token_ids = {0}
@@ -615,7 +615,7 @@ class TestEngineAsync:
         """Create mock model and tokenizer."""
         model = MagicMock()
         tokenizer = MagicMock()
-        tokenizer.encode = lambda x, **_: list(range(len(x.split())))
+        tokenizer.encode = lambda x: list(range(len(x.split())))
         tokenizer.decode = lambda x: " ".join(str(t) for t in x)
         tokenizer.eos_token_id = 0
         tokenizer.eos_token_ids = {0}
