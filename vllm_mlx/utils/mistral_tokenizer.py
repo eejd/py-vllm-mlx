@@ -34,14 +34,20 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # What ``transformers`` needs to be told to load the fast tokenizer of a tekken
-# checkpoint: skip the mistral-common auto-detection, and apply the Mistral
+# checkpoint: skip the mistral-common auto-detection, apply the Mistral
 # pre-tokenizer regex fix (a no-op when tokenizer.json already carries the right
 # pattern, which also silences a misleading "incorrect regex" warning on such repos;
 # it rescues a tokenizer.json that still has the old pattern, which the equivalence
-# check would otherwise reject).
+# check would otherwise reject), and prepend the BOS to ``add_special_tokens=True``
+# encodings.  tekken checkpoints' ``tokenizer.json`` has no BOS post-processor, but
+# mistral-common (what vLLM tokenizes raw completion prompts with:
+# ``encode(text, bos=add_special_tokens)``) always prepends it, and a raw prompt
+# without a BOS is out of distribution for the model.  ``add_special_tokens=False``
+# (a chat prompt the template rendered, ``<s>`` included) is unaffected.
 FAST_TOKENIZER_KWARGS: dict[str, Any] = {
     "mistral_format": False,
     "fix_mistral_regex": True,
+    "add_bos_token": True,
 }
 
 _CODE = '''
@@ -165,10 +171,14 @@ def _mismatch(fast: Any, reference: Any, tekken_path: Path) -> str | None:
     if reason is not None:
         return reason
     for probe in _PROBES:
-        if fast.encode(probe, add_special_tokens=False) != reference.encode(
-            probe, add_special_tokens=False
-        ):
-            return f"encoding of {probe[:40]!r} differs"
+        for add_special_tokens in (False, True):
+            if fast.encode(probe, add_special_tokens=add_special_tokens) != (
+                reference.encode(probe, add_special_tokens=add_special_tokens)
+            ):
+                return (
+                    f"encoding of {probe[:40]!r} differs "
+                    f"(add_special_tokens={add_special_tokens})"
+                )
     return None
 
 
