@@ -814,12 +814,13 @@ def _detach_layer(layer: Any, mx: Any, eval_targets: list[Any]) -> Any:
         snap.state = _detach_container_value(layer.state, mx, eval_targets)
         for attr in ("left_padding", "lengths"):
             if getattr(snap, attr, None) is not None:
-                setattr(snap, attr, _detach_array(getattr(snap, attr), mx, eval_targets))
+                setattr(
+                    snap, attr, _detach_array(getattr(snap, attr), mx, eval_targets)
+                )
         return snap
     if _bears_arrays(layer):
         raise UndetachableCacheError(
-            f"unrecognized cache layer type {type(layer).__name__} "
-            "carries arrays"
+            f"unrecognized cache layer type {type(layer).__name__} " "carries arrays"
         )
     return layer
 
