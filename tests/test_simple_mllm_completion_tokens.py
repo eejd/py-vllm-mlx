@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``usage.completion_tokens`` of the Simple engine's MLLM routes.
+"""``usage.completion_tokens`` and ``finish_reason`` of the Simple engine's MLLM routes.
 
 vLLM reports ``len(token_ids)``: every generated token, the one that ended the
 request (EOS / stop token) included, nothing else. mlx-vlm's ``stream_generate``
@@ -10,21 +10,30 @@ again the terminal chunk ``MLXMultimodalLM.stream_chat`` appends. A reply of 5
 tokens plus ``<end_of_turn>`` was billed 7 (Gemma-3 tool round trip: 2 for a reply
 that is the stop token alone), and a reply cut by ``max_tokens`` one over the cap.
 
+``finish_reason`` had the same family of fault: the MLLM routes hardcoded ``stop``,
+so a reply cut at ``max_tokens`` looked complete (``/v1/completions`` and vLLM say
+``length``). mlx-vlm's final chunk / ``GenerationResult`` carries the reason.
+
 The fakes below reproduce mlx-vlm's chunk sequence (``generate/dispatch.py``
 ``stream_generate``) and run it through the real ``_stream_mllm_generated_outputs``
 and the real ``SimpleEngine`` routes.
 """
 
 import asyncio
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from vllm_mlx.engine import simple as engine_module
-from vllm_mlx.models.mllm import MLLMOutput, _stream_mllm_generated_outputs
+from vllm_mlx.models.mllm import (
+    MLLMOutput,
+    MLXMultimodalLM,
+    _stream_mllm_generated_outputs,
+)
 
 
-def _mlx_vlm_chunks(n_content, *, flush_count):
+def _mlx_vlm_chunks(n_content, *, flush_count, finish="stop"):
     """``n_content`` per-token chunks, then the detokenizer-flush chunk."""
     chunks = [
         SimpleNamespace(text=f"t{i} ", prompt_tokens=9, generation_tokens=i + 1)
@@ -32,7 +41,7 @@ def _mlx_vlm_chunks(n_content, *, flush_count):
     ]
     chunks.append(
         SimpleNamespace(
-            text="", prompt_tokens=9, generation_tokens=flush_count, finish_reason="stop"
+            text="", prompt_tokens=9, generation_tokens=flush_count, finish_reason=finish
         )
     )
     return chunks
@@ -188,3 +197,135 @@ def test_streamed_counts_never_exceed_the_final_count(monkeypatch):
 
     assert counts == sorted(counts)
     assert counts[-1] == 6
+
+
+class TestFinishReason:
+    """``stop`` for a natural end, ``length`` for the cap, on every MLLM route."""
+
+    def test_wrapper_natural_stop(self):
+        assert _wrapped(_mlx_vlm_chunks(5, flush_count=6))[-1].finish_reason == "stop"
+
+    def test_wrapper_length_cap(self):
+        chunks = _mlx_vlm_chunks(3, flush_count=3, finish="length")
+
+        outputs = _wrapped(chunks)
+
+        assert outputs[-1].finish_reason == "length"
+        # Only the terminal output finishes the request.
+        assert all(o.finish_reason is None for o in outputs[:-1])
+
+    def test_wrapper_stop_sequence_is_a_stop_even_if_the_cap_was_reached(self):
+        # The consumer leaves at the stop sequence, before the flush chunk; if
+        # the cap was reached by that very chunk the reply still ended on the
+        # client's stop string.
+        chunks = _mlx_vlm_chunks(3, flush_count=3, finish="length")
+        chunks[-2].finish_reason = "length"
+
+        outputs = _wrapped(chunks, stop=["t2"])
+
+        assert outputs[-1].finish_reason == "stop"
+
+    def test_wrapper_stop_sequence_cut(self):
+        outputs = _wrapped(_mlx_vlm_chunks(5, flush_count=6), stop=["t1"])
+
+        assert outputs[-1].finish_reason == "stop"
+        assert outputs[-1].completion_tokens == 2
+
+    def test_wrapper_without_chunks_is_a_stop(self):
+        assert _wrapped([])[-1].finish_reason == "stop"
+
+    def test_a_reason_mlx_vlm_does_not_define_is_a_stop(self):
+        chunks = _mlx_vlm_chunks(2, flush_count=3, finish="abort")
+
+        assert _wrapped(chunks)[-1].finish_reason == "stop"
+
+
+@pytest.mark.parametrize("route", ["chat", "stream_chat"])
+@pytest.mark.parametrize(
+    "chunks, expected",
+    [
+        (_mlx_vlm_chunks(5, flush_count=6), "stop"),
+        (_mlx_vlm_chunks(0, flush_count=1), "stop"),
+        (_mlx_vlm_chunks(3, flush_count=3, finish="length"), "length"),
+    ],
+    ids=["natural", "stop-token-only", "cap"],
+)
+def test_simple_engine_reports_the_models_finish_reason(
+    monkeypatch, route, chunks, expected
+):
+    engine = _engine(_Model(chunks), monkeypatch)
+
+    result = _drive(engine, route)
+    final = result if route == "chat" else result[-1]
+
+    assert final.finish_reason == expected
+
+
+@pytest.fixture
+def wrapper(monkeypatch):
+    """The real ``MLXMultimodalLM`` with only mlx-vlm inference replaced."""
+    result = {"finish_reason": "stop"}
+
+    def generate(*args, **kwargs):
+        return SimpleNamespace(
+            text="reply",
+            prompt_tokens=3,
+            generation_tokens=3,
+            finish_reason=result["finish_reason"],
+        )
+
+    vlm = ModuleType("mlx_vlm")
+    vlm.generate = generate
+    vlm.stream_generate = lambda *a, **k: iter(
+        _mlx_vlm_chunks(2, flush_count=3, finish=result["finish_reason"])
+    )
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+    prompt_utils.apply_chat_template = lambda *a, **k: "prompt"
+    prompt_utils.get_chat_template = lambda *a, **k: "prompt"
+    cache = ModuleType("mlx_vlm.models.cache")
+    cache.make_prompt_cache = lambda *a, **k: []
+    models = ModuleType("mlx_vlm.models")
+    models.cache = cache
+    video = ModuleType("mlx_vlm.video_generate")
+    video.generate = generate
+    for module in (vlm, prompt_utils, models, cache, video):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    model = MLXMultimodalLM("test-model", enable_cache=False)
+    model._loaded = True
+    model.model = SimpleNamespace(language_model=object())
+    model.processor = SimpleNamespace(encode=lambda text: [1, 2, 3])
+    model.config = {}
+    monkeypatch.setattr(model, "_prepare_images", lambda images: ["prepared-image"])
+    monkeypatch.setattr(
+        model, "_prepare_native_video_inputs", lambda *a, **k: ("prompt", {})
+    )
+    model._finish = result
+    return model
+
+
+_IMAGE_CHAT = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this image"},
+            {"type": "image_url", "image_url": {"url": "test-image"}},
+        ],
+    }
+]
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+@pytest.mark.parametrize("route", ["generate", "chat", "native_video", "stream_chat"])
+def test_wrapper_routes_report_the_finish_reason_of_mlx_vlm(wrapper, route, finish):
+    wrapper._finish["finish_reason"] = finish
+    if route == "generate":
+        result = wrapper.generate(prompt="p", images=["test-image"])
+    elif route == "chat":
+        result = wrapper.chat(messages=_IMAGE_CHAT)
+    elif route == "native_video":
+        result = wrapper._generate_native_video(messages=_IMAGE_CHAT)
+    else:
+        result = list(wrapper.stream_chat(messages=_IMAGE_CHAT))[-1]
+
+    assert result.finish_reason == finish
