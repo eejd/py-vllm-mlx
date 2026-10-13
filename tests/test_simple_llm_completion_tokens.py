@@ -142,9 +142,7 @@ def _bos_tokenizer():
         single="<bos> $A", special_tokens=[("<bos>", BOS)]
     )
     return TokenizerWrapper(
-        PreTrainedTokenizerFast(
-            tokenizer_object=raw, bos_token="<bos>", unk_token="w0"
-        )
+        PreTrainedTokenizerFast(tokenizer_object=raw, bos_token="<bos>", unk_token="w0")
     )
 
 
@@ -154,7 +152,9 @@ class TestStreamingPromptTokens:
     def _prompt_tokens(self, model, prompt):
         wrapper = _llm(model)
         wrapper.tokenizer = _bos_tokenizer()
-        out = list(wrapper.stream_generate(prompt=prompt, max_tokens=2, temperature=0.0))
+        out = list(
+            wrapper.stream_generate(prompt=prompt, max_tokens=2, temperature=0.0)
+        )
         return out[0].prompt_tokens
 
     def _mlx_lm_prompt_size(self, model, prompt):

@@ -41,7 +41,10 @@ def _mlx_vlm_chunks(n_content, *, flush_count, finish="stop"):
     ]
     chunks.append(
         SimpleNamespace(
-            text="", prompt_tokens=9, generation_tokens=flush_count, finish_reason=finish
+            text="",
+            prompt_tokens=9,
+            generation_tokens=flush_count,
+            finish_reason=finish,
         )
     )
     return chunks
@@ -167,7 +170,11 @@ def _drive(engine, route):
 class TestSimpleEngineRoutes:
     def _count(self, engine, route):
         result = _drive(engine, route)
-        return result.completion_tokens if route == "chat" else result[-1].completion_tokens
+        return (
+            result.completion_tokens
+            if route == "chat"
+            else result[-1].completion_tokens
+        )
 
     def test_plain_reply_with_stop_token(self, monkeypatch, route):
         engine = _engine(_Model(_mlx_vlm_chunks(5, flush_count=6)), monkeypatch)
