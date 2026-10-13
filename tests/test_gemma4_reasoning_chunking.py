@@ -56,7 +56,11 @@ RAW = {
         "if a < b and <c> then <|x|>",
         "done",
     ),
-    "multibyte": ("<|channel>thought\n日本語 🤔<channel|>答えは42", "日本語 🤔", "答えは42"),
+    "multibyte": (
+        "<|channel>thought\n日本語 🤔<channel|>答えは42",
+        "日本語 🤔",
+        "答えは42",
+    ),
     # a channel name is only a name when it stands alone or a non-letter follows it
     "word-starting-with-thought": (
         "<|channel>thought\nOk.<channel|>thoughtful day",
@@ -84,7 +88,11 @@ RAW = {
         "A\nB",
         "C\nD",
     ),
-    "thought-label-then-word": ("<|channel>thoughtful plan<channel|>x", "thoughtful plan", "x"),
+    "thought-label-then-word": (
+        "<|channel>thoughtful plan<channel|>x",
+        "thoughtful plan",
+        "x",
+    ),
     "name-on-a-padded-line": (
         "<|channel>thought\nA\n  thought  \nB<channel|>x",
         "A\nB",
@@ -103,7 +111,11 @@ RAW = {
     ),
     # the stream ends in the middle of a marker or a channel name
     "cut-after-start-marker": ("<|channel>thought\nabc<|channel>", "abc", None),
-    "cut-in-response-marker": ("<|channel>thought\nabc<|channel>respo", "abcrespo", None),
+    "cut-in-response-marker": (
+        "<|channel>thought\nabc<|channel>respo",
+        "abcrespo",
+        None,
+    ),
     "cut-in-label": ("<|channel>thou", "thou", None),
     "cut-after-end-marker": ("<|channel>thought\nabc<channel|>", "abc", None),
     "cut-in-end-marker": ("<|channel>thought\nabc<channel|", "abc<channel|", None),
@@ -252,11 +264,30 @@ def test_random_single_cycle_outputs_stream_like_extract_reasoning():
     both channels, cut anywhere, delivered in random pieces."""
     import random
 
-    words = ["thought", "response", "thoughtful", "responses", "x", "Ok", "\n", " ",
-             "  ", ".", ",", "a b", "<", "<|", "|>", "\n\n", "thou", "respo"]
+    words = [
+        "thought",
+        "response",
+        "thoughtful",
+        "responses",
+        "x",
+        "Ok",
+        "\n",
+        " ",
+        "  ",
+        ".",
+        ",",
+        "a b",
+        "<",
+        "<|",
+        "|>",
+        "\n\n",
+        "thou",
+        "respo",
+    ]
     rng = random.Random(7)
     checked = 0
     for _ in range(6000):
+
         def body():
             return "".join(rng.choice(words) for _ in range(rng.randint(0, 7)))
 
@@ -275,7 +306,9 @@ def test_random_single_cycle_outputs_stream_like_extract_reasoning():
             or len(raw) < 2
         ):
             continue
-        cuts = sorted(rng.sample(range(1, len(raw)), min(len(raw) - 1, rng.randint(0, 6))))
+        cuts = sorted(
+            rng.sample(range(1, len(raw)), min(len(raw) - 1, rng.randint(0, 6)))
+        )
         chunks = [raw[i:j] for i, j in zip([0, *cuts], [*cuts, len(raw)])]
         reasoning, content = get_parser("gemma4")().extract_reasoning(raw)
         assert _stream(chunks) == (reasoning or "", content or ""), (raw, chunks)
