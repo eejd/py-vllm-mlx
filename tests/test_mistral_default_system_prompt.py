@@ -45,17 +45,22 @@ from vllm_mlx.utils import mistral_tokenizer as mt  # noqa: E402
 # unfilled {placeholders}.
 DEFAULT = (
     "You are Test-3B, a model.\\nThe current date is {today}.\\n"
-    "It\\'s \"quoted\" and {yesterday} too."
+    'It\\\'s "quoted" and {yesterday} too.'
 )
 _SYSTEM_BRANCH_END = "{% set ms = ms[1:] %}{% endif %}"
 assert _SYSTEM_BRANCH_END in _TEMPLATE
-TEMPLATE_WITH_DEFAULT = "{%- set default_system_message = '" + DEFAULT + "' %}" + (
-    _TEMPLATE.replace(
-        _SYSTEM_BRANCH_END,
-        "{% set ms = ms[1:] %}"
-        "{% elif default_system_message != '' %}"
-        "[SYSTEM_PROMPT]{{ default_system_message }}[/SYSTEM_PROMPT]"
-        "{% endif %}",
+TEMPLATE_WITH_DEFAULT = (
+    "{%- set default_system_message = '"
+    + DEFAULT
+    + "' %}"
+    + (
+        _TEMPLATE.replace(
+            _SYSTEM_BRANCH_END,
+            "{% set ms = ms[1:] %}"
+            "{% elif default_system_message != '' %}"
+            "[SYSTEM_PROMPT]{{ default_system_message }}[/SYSTEM_PROMPT]"
+            "{% endif %}",
+        )
     )
 )
 
@@ -176,9 +181,7 @@ class TestUnguardedDefaults:
     def small_template(self, request):
         return (_DATA / f"{request.param}_chat_template.jinja").read_text()
 
-    def test_the_template_is_left_alone_without_a_warning(
-        self, small_template, caplog
-    ):
+    def test_the_template_is_left_alone_without_a_warning(self, small_template, caplog):
         assert "default_system_message" in small_template
 
         with caplog.at_level(logging.INFO, logger=mt.logger.name):
