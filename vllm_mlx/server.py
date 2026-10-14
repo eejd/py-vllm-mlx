@@ -360,16 +360,30 @@ class PreparedChatInvocation:
     thinking_processor: object | None = None
 
 
+def _is_tool_turn_message(msg: Message | dict) -> bool:
+    """A tool result, or an assistant message that carries tool calls."""
+    if isinstance(msg, dict):
+        return msg.get("role") == "tool" or bool(msg.get("tool_calls"))
+    return msg.role == "tool" or bool(getattr(msg, "tool_calls", None))
+
+
 def _prepare_chat_messages(
     engine: BaseEngine,
     request_messages: list[Message | dict],
     *,
     validate_remote_media: bool = True,
+    flatten_tool_turns: bool = False,
 ) -> tuple[list[dict], list, list, list, bool]:
     """Normalize messages and collect media once for both stream/non-stream paths.
 
     ``validate_remote_media=False`` is for a caller that already validated the
     same messages (a streaming route validates before it starts the response).
+
+    ``flatten_tool_turns``: on an MLLM engine without native tool-message support
+    the messages are kept as they are, which hands ``role=tool`` /
+    ``tool_calls`` to a template that cannot render them.  A caller that has
+    always flattened them (the Responses route, via
+    ``extract_multimodal_content``) asks for that here; images stay in place.
     """
     if validate_remote_media:
         _validate_remote_media_urls(request_messages)
@@ -392,6 +406,13 @@ def _prepare_chat_messages(
         # (MLLM.chat() extracts images from message content internally)
         messages = []
         for msg in request_messages:
+            if (
+                flatten_tool_turns
+                and not preserve_native
+                and _is_tool_turn_message(msg)
+            ):
+                messages.extend(extract_multimodal_content([msg])[0])
+                continue
             if hasattr(msg, "model_dump"):
                 msg_dict = msg.model_dump(exclude_none=True)
             else:
@@ -2887,6 +2908,47 @@ def _responses_tools_to_chat_tools(
     return supported or None, unsupported
 
 
+_REASONING_ITEM_MARK = "_responses_reasoning_item"
+
+
+def _fold_reasoning_items(messages: list[dict], first: int) -> list[dict]:
+    """Attach a reasoning input item to the assistant message that follows it.
+
+    vLLM (``responses/utils.py``) puts a ``reasoning`` item on the next assistant
+    message's ``reasoning`` field, never into its visible content; that field is
+    ``reasoning_content`` here, which is what the chat route's replay reads.
+    A reasoning item with no assistant message after it stays an assistant
+    message of its own, as before.  History before ``first`` is left alone.
+    """
+    out = messages[:first]
+    pending: dict | None = None
+
+    def release() -> None:
+        nonlocal pending
+        if pending is not None:
+            pending.pop(_REASONING_ITEM_MARK, None)
+            out.append(pending)
+            pending = None
+
+    for msg in messages[first:]:
+        if msg.get(_REASONING_ITEM_MARK):
+            release()
+            pending = msg
+            continue
+        if (
+            pending is not None
+            and msg.get("role") == "assistant"
+            and not msg.get("reasoning_content")
+        ):
+            msg = {**msg, "reasoning_content": pending["content"]}
+            pending = None
+        else:
+            release()
+        out.append(msg)
+    release()
+    return out
+
+
 def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
     """Convert Responses API input items into chat-completions-style messages."""
     messages: list[dict] = []
@@ -2907,6 +2969,7 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
         messages.append({"role": "user", "content": request.input})
         return messages
 
+    first_new = len(messages)
     for item in request.input:
         if isinstance(item, dict):
             # ``type`` is optional on a message item (EasyInputMessage): a dict
@@ -2957,7 +3020,13 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                     p.get("text", "") for p in parts if isinstance(p, dict)
                 )
                 if reasoning_text:
-                    messages.append({"role": "assistant", "content": reasoning_text})
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": reasoning_text,
+                            _REASONING_ITEM_MARK: True,
+                        }
+                    )
             else:
                 logger.info(
                     "Skipping unsupported Responses input item type %r", item_type
@@ -3002,14 +3071,20 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
         elif isinstance(item, ResponseReasoningItem):
             reasoning_text = "\n".join(part.text for part in (item.content or []))
             if reasoning_text:
-                messages.append({"role": "assistant", "content": reasoning_text})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": reasoning_text,
+                        _REASONING_ITEM_MARK: True,
+                    }
+                )
         else:
             logger.info(
                 "Skipping unsupported Responses input item type %r",
                 getattr(item, "type", type(item).__name__),
             )
 
-    return messages
+    return _fold_reasoning_items(messages, first_new)
 
 
 def _responses_request_to_new_persisted_messages(
@@ -3285,6 +3360,7 @@ def _prepare_responses_request(
         engine,
         chat_request.messages,
         validate_remote_media=validate_remote_media,
+        flatten_tool_turns=True,
     )
 
     chat_kwargs = {

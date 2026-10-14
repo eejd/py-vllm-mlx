@@ -1511,3 +1511,194 @@ class TestResponsesInputImages:
         assert resp.status_code == 400, resp.text
         engine.chat.assert_not_called()
         assert engine._stream_calls == []
+
+
+_TOOL_FLOW = [
+    {"type": "message", "role": "user", "content": "Run it"},
+    {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "shell",
+        "arguments": '{"cmd":"pwd"}',
+    },
+    {"type": "function_call_output", "call_id": "call_1", "output": "/tmp/work"},
+]
+
+
+class TestResponsesPreparedMessages:
+    """What each kind of engine is handed for tool turns and replayed reasoning."""
+
+    def _post(self, client, engine, input_items):
+        import vllm_mlx.server as srv
+
+        srv._engine = engine
+        resp = client.post(
+            "/v1/responses", json={"model": "test-model", "input": input_items}
+        )
+        assert resp.status_code == 200, resp.text
+        return engine.chat.call_args.kwargs["messages"]
+
+    def test_mllm_engine_without_native_tools_gets_the_flattened_tool_turn(
+        self, client
+    ):
+        # A batched MLLM engine (Gemma-3) renders ``role=tool`` / ``tool_calls``
+        # with a template that cannot: it must see what an LLM engine sees.
+        mllm = _mock_engine(_output("Done"))
+        mllm.is_mllm = True
+        llm = _mock_engine(_output("Done"))
+        got = self._post(client, mllm, _TOOL_FLOW)
+        expected = self._post(client, llm, _TOOL_FLOW)
+
+        assert got == expected
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert "[Calling tool: shell(" in got[1]["content"]
+        assert "[Tool Result (call_1)]" in got[2]["content"]
+
+    def test_mllm_tool_turn_is_flattened_next_to_an_image(self, client):
+        engine = _mock_engine(_output("Done"))
+        engine.is_mllm = True
+        got = self._post(
+            client,
+            engine,
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [_text("Look"), _image()],
+                },
+                *_TOOL_FLOW[1:],
+            ],
+        )
+
+        assert got[0]["content"][1]["type"] == "image_url"
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert isinstance(got[1]["content"], str)
+
+    def test_mllm_engine_with_native_tools_keeps_the_structural_tool_turn(self, client):
+        engine = _mock_engine(_output("Done"))
+        engine.is_mllm = True
+        engine.preserve_native_tool_format = True
+        got = self._post(client, engine, _TOOL_FLOW)
+
+        assert [m["role"] for m in got] == ["user", "assistant", "tool"]
+        assert got[1]["tool_calls"][0]["function"]["arguments"] == {"cmd": "pwd"}
+        assert got[2]["tool_call_id"] == "call_1"
+
+    def test_harmony_rendering_keeps_the_structural_tool_turn(self, client):
+        engine = _mock_engine(_output("Done"))
+        engine.use_harmony_rendering = True
+        got = self._post(client, engine, _TOOL_FLOW)
+
+        assert [m["role"] for m in got] == ["user", "assistant", "tool"]
+        assert got[1]["tool_calls"][0]["function"]["name"] == "shell"
+        assert got[2]["content"] == "/tmp/work"
+
+    def test_without_harmony_the_tool_turn_is_text(self, client):
+        got = self._post(client, _mock_engine(_output("Done")), _TOOL_FLOW)
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+
+    def test_reasoning_item_rides_on_the_next_assistant_message(self, client):
+        # vLLM puts it on that message's ``reasoning`` field, never in the
+        # visible content: the answer must not be fused with the thinking.
+        engine = _mock_engine(_output("Done"))
+        engine.preserve_native_tool_format = True
+        got = self._post(
+            client,
+            engine,
+            [
+                {"type": "message", "role": "user", "content": "Run it"},
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "need pwd"}],
+                },
+                _TOOL_FLOW[1],
+                _TOOL_FLOW[2],
+            ],
+        )
+
+        assert [m["role"] for m in got] == ["user", "assistant", "tool"]
+        assert got[1]["reasoning_content"] == "need pwd"
+        assert got[1]["content"] == ""
+        assert got[1]["tool_calls"][0]["function"]["name"] == "shell"
+
+    def test_reasoning_item_never_joins_the_visible_answer(self, client):
+        got = self._post(
+            client,
+            _mock_engine(_output("Done")),
+            [
+                {"type": "message", "role": "user", "content": "Hi"},
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "thinking"}],
+                },
+                {"type": "message", "role": "assistant", "content": "Hello"},
+                {"type": "message", "role": "user", "content": "Again"},
+            ],
+        )
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert got[1]["content"] == "Hello"
+        assert "thinking" not in str(got)
+
+    def test_mllm_engine_gets_the_reasoning_of_the_assistant_message(self, client):
+        engine = _mock_engine(_output("Done"))
+        engine.is_mllm = True
+        got = self._post(
+            client,
+            engine,
+            [
+                {"type": "message", "role": "user", "content": "Hi"},
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "thinking"}],
+                },
+                {"type": "message", "role": "assistant", "content": "Hello"},
+                {"type": "message", "role": "user", "content": "Again"},
+            ],
+        )
+
+        assert got[1] == {
+            "role": "assistant",
+            "content": "Hello",
+            "reasoning_content": "thinking",
+        }
+
+    def test_text_parts_are_joined_by_newlines_in_order(self, client):
+        got = self._post(
+            client,
+            _mock_engine(_output("a")),
+            _user_input(_text("one"), _text("two"), _text("three")),
+        )
+
+        assert got[0]["content"] == "one\ntwo\nthree"
+
+    def test_bare_strings_in_a_part_list_are_text_parts(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._post(
+            client,
+            engine,
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": ["bare", "", _text("typed"), _image()],
+                }
+            ],
+        )
+
+        assert [p["type"] for p in got[0]["content"]] == [
+            "text",
+            "text",
+            "image_url",
+        ]
+        assert [p.get("text") for p in got[0]["content"][:2]] == ["bare", "typed"]
+
+    @pytest.mark.parametrize("detail", ["auto", "low", "high", "original"])
+    def test_every_documented_image_detail_is_accepted(self, client, detail):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._post(client, engine, _user_input(_image(detail=detail)))
+
+        assert got[0]["content"][0]["image_url"]["detail"] == detail
