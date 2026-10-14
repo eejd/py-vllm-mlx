@@ -3,7 +3,7 @@
 ## Requirements
 
 - macOS on Apple Silicon (M1/M2/M3/M4/M5)
-- Python 3.10+
+- Python 3.14+
 
 ## Install a release
 
@@ -18,15 +18,15 @@ their PR is closed. Check the release containing a required fix before choosing
 a model or enabling an advanced feature.
 
 Use an Apple Silicon-native Python installation (`arm64`), not a terminal or
-Python running under Rosetta. The example uses Python 3.12; install it first
+Python running under Rosetta. The example uses Python 3.14; install it first
 if that command is unavailable.
 
 ```bash
-python3.12 -c 'import platform; print(platform.system(), platform.machine())'
+python3.14 -c 'import platform; print(platform.system(), platform.machine())'
 # Expected: Darwin arm64
 mkdir vllm-mlx-demo
 cd vllm-mlx-demo
-python3.12 -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install 'vllm-mlx==0.4.1'
@@ -54,7 +54,7 @@ editable checkout into the release environment.
 ```bash
 git clone https://github.com/waybarrios/vllm-mlx.git
 cd vllm-mlx
-python3.12 -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 ```

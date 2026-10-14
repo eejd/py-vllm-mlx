@@ -58,7 +58,7 @@ vllm-mlx 通过集成以下组件，为 vLLM 带来原生 Apple Silicon GPU 加�
 ## 环境要求
 
 - 搭载 Apple Silicon 的 macOS（M1/M2/M3/M4/M5）
-- Python 3.10 及以上
+- Python 3.14 及以上
 - 推荐 8GB 及以上内存
 
 ## 许可证

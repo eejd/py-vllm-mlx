@@ -279,21 +279,12 @@ class LlamaToolParser(ToolParser):
         r'"(?:[^"\\]|\\.)*\\?|u[0-9a-fA-F]{0,3}'
         r"|-?\d*\.?\d*(?:[eE][+-]?\d*)?|t(?:ru?)?|f(?:a(?:ls?)?)?|n(?:ul?)?"
     )
-    # CPython before 3.14 reports a *complete* ``\uXXXX`` escape that is the last thing in
-    # the text as "Invalid \uXXXX escape" at the ``u`` (its scanner wants one more
-    # character after the digits); 3.14 reports the unterminated string instead.
-    _JSON_TRAILING_UNICODE_ESCAPE = re.compile(r"u[0-9a-fA-F]{4}")
 
     @classmethod
     def _json_ran_out(cls, text: str, exc: json.JSONDecodeError) -> bool:
         """Whether ``text`` failed to decode only because it ends early (a valid JSON prefix)
         rather than because it is malformed (``{x: 1}``, ``{'a': 1}``)."""
-        tail = text[exc.pos :]
-        if cls._JSON_CUT_OFF_TAIL.fullmatch(tail) is not None:
-            return True
-        return exc.msg.startswith("Invalid \\uXXXX escape") and bool(
-            cls._JSON_TRAILING_UNICODE_ESCAPE.fullmatch(tail)
-        )
+        return cls._JSON_CUT_OFF_TAIL.fullmatch(text[exc.pos :]) is not None
 
     @classmethod
     def _is_cut_off_call(cls, text: str, pending: int) -> bool:
