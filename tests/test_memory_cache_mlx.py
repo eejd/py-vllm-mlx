@@ -9,6 +9,45 @@ job excludes this file because MLX has no Linux distribution.
 
 from unittest.mock import MagicMock
 
+import pytest
+
+
+def _array_holders_left_by(action):
+    """MLX arrays that only a reference cycle keeps alive once *action* has returned.
+
+    Runs *action* with the cyclic GC off, then has the collector save everything
+    it finds unreachable instead of freeing it, and returns the arrays among
+    that.  Whatever reference counting could free is already gone by then.
+
+    Logging is switched off meanwhile: a record that carries an exception (the
+    cache logs why it rejected an entry) is kept by pytest's capture handler,
+    which keeps the exception's traceback, frames and arrays reachable and hides
+    exactly the cycles this looks for.
+    """
+    import gc
+    import logging
+
+    import mlx.core as mx
+
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    logging_was_disabled = logging.root.manager.disable
+    gc.disable()
+    logging.disable(logging.CRITICAL)
+    try:
+        action()
+        gc.set_debug(gc.DEBUG_SAVEALL)
+        try:
+            gc.collect()
+            return [o for o in gc.garbage if isinstance(o, mx.array)]
+        finally:
+            gc.set_debug(0)
+            gc.garbage.clear()
+    finally:
+        logging.disable(logging_was_disabled)
+        if gc_was_enabled:
+            gc.enable()
+
 
 class TestTrimCacheOffset:
     """Tests for ``_trim_cache_offset``, focused on the LCP contamination fix.
@@ -781,6 +820,45 @@ class TestDetachCacheForStorage:
         detached = _detach_cache_for_storage([layer])
         assert detached[0] is layer
 
+    def test_detach_leaves_no_unreachable_array_holders(self):
+        """Detaching must not build reference cycles around the snapshot's arrays.
+
+        A cycle is only reclaimed by the cyclic GC, which MLX array allocations
+        do not trigger, so anything it holds outlives the cache entry (see
+        TestStoreFailClosedAndEviction.test_evicted_entries_are_freed_without_a_gc_pass).
+        Covers every branch: KVCache, CacheList recursion, ArraysCache and dict
+        state.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        from vllm_mlx.memory_cache import _detach_cache_for_storage
+
+        def build():
+            kv = KVCache()
+            kv.keys = mx.ones((1, 2, 4, 3))
+            kv.values = mx.ones((1, 2, 4, 3))
+            kv.offset = 4
+            inner = KVCache()
+            inner.keys = mx.ones((1, 2, 4, 3))
+            inner.values = mx.ones((1, 2, 4, 3))
+            inner.offset = 4
+            ssm = ArraysCache(size=1)
+            ssm[0] = mx.ones((1, 8))
+            mx.eval(kv.keys, kv.values, inner.keys, inner.values, ssm[0])
+            return [
+                kv,
+                CacheList(inner),
+                ssm,
+                {"state": (mx.ones((2,)), mx.ones((2,)))},
+            ]
+
+        held = _array_holders_left_by(lambda: _detach_cache_for_storage(build()))
+
+        assert (
+            not held
+        ), f"{len(held)} MLX arrays were only reachable through a reference cycle"
+
 
 class TestStoreFailClosedAndEviction:
     """store()-level tests requested in review: fail-closed rejection,
@@ -848,6 +926,48 @@ class TestStoreFailClosedAndEviction:
         got, remaining = cache.fetch([3])
         assert got is not None
         assert remaining == []
+
+    def test_evicted_entries_are_freed_without_a_gc_pass(self):
+        """An evicted entry's buffers must be released by reference counting alone.
+
+        MLX arrays do not count towards Python's GC allocation thresholds, so a
+        reference cycle that holds a snapshot's arrays can outlive its eviction by
+        an unbounded time.  In production (64k-token context, 30B model, 6.4 GB per
+        entry) this made active memory grow by one full entry per request until
+        Metal ran out of memory.  Run with the cyclic collector off so any such
+        cycle stays alive, evict well past the cap, and check that resident memory
+        is cap-sized rather than store-count-sized.
+        """
+        import gc
+
+        import mlx.core as mx
+
+        entry_bytes = 4 * 2 * (8 * 2048 * 64 * 4)  # 4 layers x (keys + values)
+        cache = self._make_cache(max_memory_mb=40)  # holds exactly one entry
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            mx.eval(mx.zeros((1,)))
+            mx.synchronize()
+            base = mx.get_active_memory()
+            for i in range(8):
+                layers = [self._kv_layer(2048) for _ in range(4)]
+                assert cache.store([i, i + 1, i + 2], layers)
+                del layers
+            mx.synchronize()
+            mx.eval(mx.zeros((1,)))
+            retained = mx.get_active_memory() - base
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+        assert cache.get_stats()["evictions"] == 7
+        assert retained < entry_bytes * 2.5, (
+            f"{retained / 1e6:.0f}MB resident after 8 stores into a 1-entry cache "
+            f"(one entry is {entry_bytes / 1e6:.0f}MB): evicted snapshots are being "
+            f"kept alive by something reference counting cannot free"
+        )
 
     def test_store_real_extracted_batch_slice_cuts_batch_retention(self):
         """Drive store() with what the MLLM path actually produces —
@@ -1345,3 +1465,238 @@ class TestPersistedCacheFormat:
         else:
             assert loaded == 0
             assert "cache format mismatch" in caplog.text
+
+
+class TestNoReferenceCycles:
+    """With the cyclic GC off, nothing a cache path allocates may be left behind.
+
+    MLX arrays do not count towards Python's GC allocation thresholds, so memory
+    held by a reference cycle outlives its cache entry for an unbounded time (the
+    closure cycle fixed in ``_detach_cache_for_storage`` pinned one KV entry per
+    request).  Each test runs one path and asks the collector what it would have
+    to free: any MLX array in that answer is a cycle.  The kv_quantize store and
+    fetch paths and the fail-closed (rejecting) paths are covered here; the detach
+    branches are covered by ``TestDetachCacheForStorage``.
+    """
+
+    @staticmethod
+    def _kv(tokens=8):
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        kv = KVCache()
+        kv.keys = mx.ones((1, 2, tokens, 64))
+        kv.values = mx.ones((1, 2, tokens, 64))
+        kv.offset = tokens
+        mx.eval(kv.keys, kv.values)
+        return kv
+
+    @staticmethod
+    def _cache(max_memory_mb=8, **cfg):
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        class _Model:
+            pass
+
+        return MemoryAwarePrefixCache(
+            _Model(),
+            MemoryCacheConfig(max_memory_mb=max_memory_mb, min_prefix_tokens=1, **cfg),
+        )
+
+    def _quantizing_cache(self, **cfg):
+        return self._cache(
+            kv_quantize=True,
+            kv_min_quantize_tokens=1,
+            kv_bits=8,
+            kv_group_size=64,
+            **cfg,
+        )
+
+    @staticmethod
+    def _rotating(tokens=4):
+        import mlx.core as mx
+        from mlx_lm.models.cache import RotatingKVCache
+
+        layer = RotatingKVCache(max_size=tokens)
+        layer.update_and_fetch(mx.ones((1, 2, tokens, 64)), mx.ones((1, 2, tokens, 64)))
+        mx.eval(layer.keys, layer.values)
+        return layer
+
+    def test_dequantize_cache_copying_a_layer_that_is_not_quantized(self):
+        """``_dequantize_cache`` copies every layer it does not dequantize (a
+        sliding-window layer stays as it is when the rest is quantized): the
+        second branch is its own allocation path."""
+        from vllm_mlx.memory_cache import _dequantize_cache, _quantize_cache
+
+        mixed = _quantize_cache([self._kv(), self._rotating()])
+
+        assert not _array_holders_left_by(lambda: _dequantize_cache(mixed))
+
+    @pytest.mark.parametrize(
+        "match,tokens,remaining",
+        [("exact", [1, 2, 3], []), ("prefix", [1, 2, 3, 4, 5], [4, 5])],
+    )
+    def test_kv_quantize_fetch_of_an_entry_with_a_sliding_window_layer(
+        self, match, tokens, remaining
+    ):
+        cache = self._quantizing_cache()
+        assert cache.store([1, 2, 3], [self._kv(), self._rotating()])
+
+        def fetch():
+            got, left = cache.fetch(tokens)
+            assert got is not None and left == remaining
+
+        assert not _array_holders_left_by(fetch)
+        assert cache._last_match_type == match
+
+    def test_kv_quantize_store_of_an_entry_with_a_sliding_window_layer(self):
+        cache = self._quantizing_cache()
+
+        def store():
+            assert cache.store([1, 2, 3], [self._kv(), self._rotating()])
+
+        assert not _array_holders_left_by(store)
+
+    def test_quantize_cache(self):
+        from vllm_mlx.memory_cache import _quantize_cache
+
+        layers = [self._kv(), self._kv()]
+
+        assert not _array_holders_left_by(lambda: _quantize_cache(layers))
+
+    def test_dequantize_cache(self):
+        from vllm_mlx.memory_cache import _dequantize_cache, _quantize_cache
+
+        quantized = _quantize_cache([self._kv(), self._kv()])
+
+        assert not _array_holders_left_by(lambda: _dequantize_cache(quantized))
+
+    def test_kv_quantize_store(self):
+        cache = self._quantizing_cache()
+
+        def store():
+            assert cache.store([1, 2, 3], [self._kv(), self._kv()])
+
+        assert not _array_holders_left_by(store)
+
+    @pytest.mark.parametrize(
+        "match,tokens,remaining",
+        [
+            ("exact", [1, 2, 3], []),
+            ("prefix", [1, 2, 3, 4, 5], [4, 5]),
+            ("supersequence", [1, 2], []),
+            ("lcp", [1, 2, 9], [9]),
+        ],
+    )
+    def test_kv_quantize_fetch(self, match, tokens, remaining):
+        """Every way a hit is served dequantizes; none may leave a cycle."""
+        cache = self._quantizing_cache()
+        assert cache.store([1, 2, 3], [self._kv(), self._kv()])
+
+        def fetch():
+            got, left = cache.fetch(tokens)
+            assert got is not None and left == remaining
+
+        assert not _array_holders_left_by(fetch)
+        assert cache._last_match_type == match
+
+    def test_kv_quantize_save_to_disk_and_load(self, tmp_path):
+        """Saving dequantizes the entries; loading quantizes them again."""
+        source = self._quantizing_cache()
+        assert source.store([1, 2, 3], [self._kv(), self._kv()])
+        target = self._quantizing_cache()
+
+        def round_trip():
+            assert source.save_to_disk(str(tmp_path))
+            assert target.load_from_disk(str(tmp_path)) == 1
+
+        assert not _array_holders_left_by(round_trip)
+
+    def test_kv_quantize_eviction(self):
+        """Entries pushed out of a one-entry cache leave nothing behind."""
+        cache = self._quantizing_cache(max_memory_mb=1)
+
+        def churn():
+            for i in range(4):
+                cache.store([i, i + 1], [self._kv(2048)])
+
+        assert not _array_holders_left_by(churn)
+        assert cache.get_stats()["evictions"] >= 1
+
+    def test_rejected_unrecognised_layer(self):
+        """Fail closed on a layer that carries arrays in a shape detach cannot copy."""
+        import mlx.core as mx
+
+        from vllm_mlx.memory_cache import (
+            UndetachableCacheError,
+            _detach_cache_for_storage,
+        )
+
+        class Exotic:
+            def __init__(self):
+                self.buffers = [mx.ones((1, 4))]
+
+        layers = [self._kv(), Exotic()]
+
+        def reject():
+            try:
+                _detach_cache_for_storage(layers)
+            except UndetachableCacheError:
+                return
+            raise AssertionError("the exotic layer was not rejected")
+
+        assert not _array_holders_left_by(reject)
+
+    def test_rejected_layer_that_fails_while_being_copied(self):
+        from vllm_mlx.memory_cache import (
+            UndetachableCacheError,
+            _detach_cache_for_storage,
+        )
+
+        class Broken:
+            @property
+            def keys(self):
+                raise RuntimeError("boom")
+
+        layers = [self._kv(), Broken()]
+
+        def reject():
+            try:
+                _detach_cache_for_storage(layers)
+            except UndetachableCacheError:
+                return
+            raise AssertionError("the broken layer was not rejected")
+
+        assert not _array_holders_left_by(reject)
+
+    def test_rejected_store(self):
+        import mlx.core as mx
+
+        class Exotic:
+            def __init__(self):
+                self.buffers = [mx.ones((1, 4))]
+
+        cache = self._quantizing_cache()
+
+        def reject():
+            assert cache.store([1, 2, 3], [self._kv(), Exotic()]) is False
+
+        assert not _array_holders_left_by(reject)
+
+    def test_store_whose_snapshot_cannot_be_materialised(self, monkeypatch):
+        import mlx.core as mx
+
+        cache = self._cache()
+        layers = [self._kv()]
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("stream affinity")
+
+        def reject():
+            monkeypatch.setattr(mx, "eval", explode)
+            try:
+                assert cache.store([1, 2, 3], layers) is False
+            finally:
+                monkeypatch.undo()
+
+        assert not _array_holders_left_by(reject)
