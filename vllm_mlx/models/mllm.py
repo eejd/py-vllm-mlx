@@ -36,6 +36,8 @@ from vllm_mlx.engine.chat_template_safety import normalize_messages_for_chat_tem
 from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
 from vllm_mlx.mlx_cache_compat import clone_layer
 from vllm_mlx.utils.chat_template_override import apply_chat_template_override
+from vllm_mlx.utils.tokenizer import encode_prompt, resolve_add_special_tokens
+from vllm_mlx.utils.vlm_inputs import prepare_inputs
 from vllm_mlx.utils.mistral_tokenizer import (
     adopt_fast_tokenizer,
     drop_default_system_prompt,
@@ -572,6 +574,7 @@ def _stream_mllm_generated_outputs(
     generation_kwargs: dict,
     stop: list[str] | None,
     draft_metrics,
+    input_kwargs: dict | None = None,
 ):
     token_count = 0
     last_chunk = None
@@ -584,6 +587,7 @@ def _stream_mllm_generated_outputs(
         max_tokens=max_tokens,
         temperature=temperature,
         prompt_cache=prompt_cache,
+        **(input_kwargs or {}),
         **draft_kwargs,
         **generation_kwargs,
     )
@@ -1882,6 +1886,49 @@ class MLXMultimodalLM:
         """Get the text tokenizer (not the multimodal processor)."""
         return self.processor.tokenizer
 
+    def _prepared_inputs(
+        self,
+        prompt: str,
+        images: list | None,
+        audio: list | None,
+        add_special_tokens: bool | None,
+    ) -> dict:
+        """Tokenize ``prompt`` here and hand mlx-vlm the finished tensors.
+
+        ``mlx_vlm.generate`` decides ``add_special_tokens`` itself
+        (``should_add_special_tokens``): for gemma3/gemma4 it keys on
+        ``processor.chat_template`` being unset, which is always the case for the
+        custom ``Gemma3Processor`` mlx-vlm registers, so a rendered chat prompt
+        got ``[BOS, BOS, ...]``, and every other model type unconditionally adds
+        the tokenizer's markers on top of the template's.  ``add_special_tokens``
+        here is the request kind (False: the chat template rendered ``prompt``
+        and owns the BOS; None: a raw prompt, BOS unless it already starts with
+        one).  mlx-vlm consumes caller-prepared ``input_ids`` / ``pixel_values`` /
+        ``mask`` and any extra processor outputs without re-tokenizing.
+        """
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        inputs = prepare_inputs(
+            self.processor,
+            images=images or None,
+            audio=audio or None,
+            prompts=prompt,
+            image_token_index=getattr(
+                getattr(self.model, "config", None), "image_token_index", None
+            ),
+            add_special_tokens=resolve_add_special_tokens(
+                tokenizer, prompt, add_special_tokens
+            ),
+        )
+        prepared = {
+            key: value
+            for key, value in inputs.items()
+            if key not in ("input_ids", "pixel_values", "attention_mask")
+        }
+        prepared["input_ids"] = inputs["input_ids"]
+        prepared["pixel_values"] = inputs.get("pixel_values")
+        prepared["mask"] = inputs.get("attention_mask")
+        return prepared
+
     def _prepare_images(self, images: list) -> list[str]:
         """Process remote/base64 image inputs into local temp file paths."""
         return [process_image_input(image) for image in images]
@@ -2432,6 +2479,9 @@ class MLXMultimodalLM:
             top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
+            **self._prepared_inputs(
+                formatted_prompt, all_images, all_audio, add_special_tokens=None
+            ),
             **self._draft_generation_kwargs(kwargs),
             **kwargs,
         )
@@ -2553,6 +2603,9 @@ class MLXMultimodalLM:
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
             temperature=temperature,
+            **self._prepared_inputs(
+                formatted_prompt, all_images, all_audio, add_special_tokens=None
+            ),
             **self._draft_generation_kwargs(kwargs),
             **kwargs,
         ):
@@ -2784,6 +2837,9 @@ class MLXMultimodalLM:
                 f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
             )
 
+        # The chat template renders the BOS itself (vLLM: chat prompts are
+        # tokenized with add_special_tokens=False).
+        prompt_kind = False
         formatted_prompt = self._format_chat_prompt(
             chat_messages, tools, chat_template_kwargs, enable_thinking
         )
@@ -2805,7 +2861,7 @@ class MLXMultimodalLM:
             if hasattr(self.processor, "tokenizer")
             else self.processor
         )
-        token_ids = tokenizer.encode(formatted_prompt)
+        token_ids = encode_prompt(tokenizer, formatted_prompt, prompt_kind)
 
         # Check prefix cache
         if use_cache and all_audio:
@@ -2888,6 +2944,9 @@ class MLXMultimodalLM:
             verbose=False,
             prompt_cache=prompt_cache,
             skip_prompt_processing=skip_prompt_processing,
+            **self._prepared_inputs(
+                formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
+            ),
             **self._draft_generation_kwargs(kwargs),
             **kwargs,
         )
@@ -3090,6 +3149,9 @@ class MLXMultimodalLM:
         all_images.extend(all_video_frames)
         all_audio = self._prepare_audio(all_audio_inputs) if all_audio_inputs else []
 
+        # The chat template renders the BOS itself (vLLM: chat prompts are
+        # tokenized with add_special_tokens=False).
+        prompt_kind = False
         formatted_prompt = self._format_chat_prompt(
             chat_messages, tools, chat_template_kwargs, enable_thinking
         )
@@ -3138,6 +3200,9 @@ class MLXMultimodalLM:
             generation_kwargs=generation_kwargs,
             stop=stop,
             draft_metrics=lambda: self._draft_metrics_since(draft_accept_start),
+            input_kwargs=self._prepared_inputs(
+                formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
+            ),
         )
 
     def describe_image(

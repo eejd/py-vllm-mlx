@@ -1108,7 +1108,7 @@ class MLLMBatchGenerator:
         ):
             return
 
-        from mlx_vlm.utils import prepare_inputs
+        from .utils.vlm_inputs import prepare_inputs
 
         tic = time.perf_counter()
 
