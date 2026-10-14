@@ -248,7 +248,7 @@ POST /v1/responses
 | Part | Handling |
 |------|----------|
 | `input_text`, `output_text`, `text`, `refusal` | text |
-| `input_image` | an image, like a chat `image_url` part: `image_url` is a URL or a base64 data URL, `detail` is `auto` (default), `low`, `high` or `original`. `file_id` is rejected (no Files API). A multimodal model sees it in the message; for a text-only model it is extracted as on the chat route |
+| `input_image` | an image, like a chat `image_url` part: `image_url` is a URL or a base64 data URL, `detail` is `auto` (default), `low`, `high` or `original`. `file_id` is rejected (no Files API). A multimodal model sees it in the message; a text-only model ignores it, with no error, exactly as on the chat route |
 | anything else (`input_file`, `input_audio`, ...) | HTTP 400 naming the part type |
 
 Images are not allowed in `system`/`developer` messages (HTTP 400). An `input` that yields no
