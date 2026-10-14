@@ -511,6 +511,17 @@ class TestSimpleEngineTokenizer:
         assert "<pad>" not in out.text and "<bos>" not in out.text
         assert out.text.split() == _words(greedy_tokens, {hermes.pad_id, hermes.bos_id})
 
+    def test_generate_reports_the_cap_and_the_generated_ids(
+        self, model, greedy_tokens, hermes, layout
+    ):
+        """Hidden tokens must not make a run that hit the cap look stopped: the
+        ids and the finish reason are the generator's, not a re-encoding of the
+        (shorter) visible text."""
+        lm = self._language_model(model, _special_tokenizer(**_ids(hermes)), layout)
+        out = lm.generate(prompt=mx.array(PROMPT), max_tokens=CAP, temperature=0.0)
+        assert out.tokens == greedy_tokens
+        assert out.finish_reason == "length"
+
     def test_skip_special_tokens_false_renders_them(
         self, model, greedy_tokens, hermes, layout
     ):
