@@ -194,6 +194,7 @@ from .model_registry import (
 from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
+from .reasoning.harmony_channels import strip_reasoning_messages
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
@@ -3209,7 +3210,11 @@ async def _run_responses_request(
 
     # Reasoning is separated first; the tool parser sees the content part only.
     reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
-        output.text, chat_request, engine=engine, chat_kwargs=chat_kwargs
+        output.text,
+        chat_request,
+        allow_reasoning=not _thinking_disabled(chat_request, chat_kwargs),
+        engine=engine,
+        chat_kwargs=chat_kwargs,
     )
 
     output_items = _build_responses_output_items(
@@ -3391,6 +3396,7 @@ async def _stream_responses_request(
     tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    raw_tool_parser = _tool_parser_reads_raw_output(tool_parser)
     tool_calls_detected = False
     drop_post_call_text = _parser_drops_text_after_tool_call(tool_parser)
 
@@ -3458,7 +3464,11 @@ async def _stream_responses_request(
                 finished=output_finished,
             )
             if delta_msg is None:
-                if output_finished and tool_parser and tool_markup_possible:
+                if tool_parser and (
+                    raw_tool_parser or (output_finished and tool_markup_possible)
+                ):
+                    # The tool parser reads every raw delta, including the ones the
+                    # reasoning parser has nothing to say about.
                     delta_msg = DeltaMessage()
                 else:
                     continue
@@ -3480,21 +3490,24 @@ async def _stream_responses_request(
                 sequence += 1
 
             content = delta_msg.content or ""
-            if tool_parser and (content or (output_finished and tool_markup_possible)):
+            tool_input = _streaming_tool_input(tool_parser, delta_text, content)
+            if tool_parser and (
+                tool_input or (output_finished and tool_markup_possible)
+            ):
                 # This branch feeds every delta to the parser, so the other branches'
                 # "markup seen" latch is set here too: without it the empty output that
                 # ends the stream never reaches the parser or its end-of-stream hook, and
                 # a call still pending at the end is dropped.
                 if not tool_markup_possible and (
                     _streaming_tool_markup_possible_after_delta(
-                        tool_accumulated_text, content, tool_parser
+                        tool_accumulated_text, tool_input, tool_parser
                     )
                 ):
                     tool_markup_possible = True
                 tool_accumulated_text, tool_result = _extract_streaming_tool_delta(
                     tool_parser,
                     tool_accumulated_text,
-                    content,
+                    tool_input,
                     tool_request_context,
                 )
                 if output_finished and _should_finalize_tool_stream(
@@ -3777,18 +3790,11 @@ def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
     return bool(end and end != "<channel|>" and end in text)
 
 
-_HARMONY_ANALYSIS_BLOCK_RE = re.compile(
-    r"<\|channel\|>analysis[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>.*?"
-    r"(?=<\|channel\|>|<\|end\|>|\Z)",
-    re.DOTALL,
-)
-
-
 def _strip_harmony_analysis_blocks(text: str) -> str:
-    """Remove harmony analysis-channel blocks (and their content) so reasoning
-    text is never handed to the tool parser, while commentary/final text is
-    preserved."""
-    return _HARMONY_ANALYSIS_BLOCK_RE.sub("", text)
+    """Remove harmony analysis-channel messages (and their content) so reasoning
+    text is never handed to the tool parser, while commentary/final text, and a call
+    addressed to a function whatever its channel, are preserved."""
+    return strip_reasoning_messages(text)
 
 
 def _reasoning_has_tool_markup(text: str, tool_parser=None) -> bool:
@@ -3912,7 +3918,11 @@ def _extract_reasoning_and_tool_calls(
             cleaned_reasoning_text = None
         if cleaned_reasoning_text is not None:
             text_for_tool_parse = cleaned_reasoning_text
-        elif reasoning_text is not None:
+        elif reasoning_text is not None or (
+            _reasoning_parser_reads_control_tokens(_reasoning_parser)
+            and "<|channel|>" in output_text
+        ):
+            # (a harmony output with nothing to separate, only calls, lands here too)
             # Reasoning extracted but no final content channel - gpt-oss
             # jumped from <|channel|>analysis straight into
             # <|channel|>commentary to=functions.*. Hand the tool parser the
@@ -3930,6 +3940,17 @@ def _extract_reasoning_and_tool_calls(
                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""
+        if (
+            request is not None
+            and getattr(request, "tools", None)
+            and "<|channel|>" in output_text
+            and _configured_tool_parser_reads_raw_output()
+        ):
+            # A harmony output keeps its calls in the commentary channel, which the
+            # reasoning parser's content (the final channel) does not include: the
+            # tool parser reads everything but the analysis, a call before a final
+            # message included.
+            text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
         thinking_text = reasoning_text
         if suppress_reasoning:
             # Keep the cleaned answer, but do not expose thoughts emitted
@@ -4085,6 +4106,40 @@ def _get_streaming_tool_parser(
     except Exception as e:
         logger.warning(f"Failed to init generic streaming tool parser: {e}")
         return None
+
+
+def _tool_parser_reads_raw_output(tool_parser) -> bool:
+    """Whether the tool parser separates the channels itself.
+
+    A parser that does (harmony: analysis, commentary calls and the final answer are
+    channels of one stream) is handed the raw output with a reasoning parser too: the
+    calls live in a channel the reasoning parser keeps out of its content, and the
+    parser itself never reads the analysis channel as content or as a call.
+    """
+    return bool(getattr(tool_parser, "READS_RAW_OUTPUT", False))
+
+
+def _configured_tool_parser_reads_raw_output() -> bool:
+    """``_tool_parser_reads_raw_output`` for the parser the server was launched with."""
+    if not _enable_auto_tool_choice or not _tool_call_parser:
+        return False
+    try:
+        return _tool_parser_reads_raw_output(
+            ToolParserManager.get_tool_parser(_tool_call_parser)
+        )
+    except KeyError:
+        return False
+
+
+def _reasoning_parser_reads_control_tokens(reasoning_parser) -> bool:
+    """Whether the reasoning parser's markers are control tokens that the shared special
+    token filter would remove (the harmony channels), so it must be fed unfiltered."""
+    return bool(getattr(reasoning_parser, "READS_CONTROL_TOKENS", False))
+
+
+def _streaming_tool_input(tool_parser, raw_delta: str, content: str) -> str:
+    """The delta the tool parser is fed when a reasoning parser splits the stream."""
+    return raw_delta if _tool_parser_reads_raw_output(tool_parser) else content
 
 
 def _extract_streaming_tool_delta(
@@ -7363,6 +7418,10 @@ async def _stream_anthropic_messages(
     tool_parser = _get_streaming_tool_parser(openai_request, engine)
     reasoning_watch = _ReasoningMarkupWatch(tool_parser if reasoning_parser else None)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    raw_tool_parser = _tool_parser_reads_raw_output(tool_parser)
+    reads_raw_stream = raw_tool_parser or _reasoning_parser_reads_control_tokens(
+        reasoning_parser
+    )
     tool_request_context = openai_request.model_dump()
 
     try:
@@ -7385,11 +7444,19 @@ async def _stream_anthropic_messages(
             ):
                 continue
 
-            # Filter special tokens
+            # Filter special tokens. A harmony stream is made of control tokens, so its
+            # parsers read the raw delta (a delta that is nothing else still has to
+            # reach them) and only what is shown is filtered; every other parser reads
+            # the filtered delta, and a delta that is only special tokens is skipped.
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-            if not filtered and not (
-                (use_reasoning and output_finished)
-                or (tool_parser and tool_markup_possible and output_finished)
+            parse_text = delta_text if reads_raw_stream else filtered
+            if (
+                not filtered
+                and not reads_raw_stream
+                and not (
+                    (use_reasoning and output_finished)
+                    or (tool_parser and tool_markup_possible and output_finished)
+                )
             ):
                 continue
 
@@ -7398,14 +7465,14 @@ async def _stream_anthropic_messages(
                 and thinking_off
                 and not disabled_reasoning_latched
                 and _explicit_reasoning_markers_present(
-                    accumulated_text + filtered, reasoning_parser
+                    accumulated_text + parse_text, reasoning_parser
                 )
             ):
                 disabled_reasoning_latched = True
 
             if not (use_reasoning or disabled_reasoning_latched):
                 # Simple path — no reasoning parsing
-                accumulated_text += filtered
+                accumulated_text += parse_text
                 content_text += filtered
                 content_to_emit = filtered
 
@@ -7449,6 +7516,11 @@ async def _stream_anthropic_messages(
                             content_to_emit = _TOOL_MARKUP_PATTERN.sub(
                                 "", content_to_emit
                             )
+                            if reads_raw_stream:
+                                # the parser saw the raw delta: show it filtered
+                                content_to_emit = SPECIAL_TOKENS_PATTERN.sub(
+                                    "", content_to_emit
+                                )
                         if not content_to_emit:
                             continue
 
@@ -7457,18 +7529,34 @@ async def _stream_anthropic_messages(
 
             # Reasoning parser path
             previous_text = accumulated_text
-            accumulated_text += filtered
+            accumulated_text += parse_text
             assert reasoning_parser is not None
             delta_msg = _extract_streaming_reasoning_delta(
                 reasoning_parser,
                 previous_text,
                 accumulated_text,
-                filtered,
+                parse_text,
                 finished=output_finished,
             )
+            if delta_msg is not None and reads_raw_stream:
+                # the parsers saw the raw delta: what is shown is filtered
+                delta_msg = DeltaMessage(
+                    reasoning=SPECIAL_TOKENS_PATTERN.sub(
+                        "", getattr(delta_msg, "reasoning", None) or ""
+                    )
+                    or None,
+                    content=SPECIAL_TOKENS_PATTERN.sub(
+                        "", getattr(delta_msg, "content", None) or ""
+                    )
+                    or None,
+                )
 
             if delta_msg is None:
-                if output_finished and tool_parser and tool_markup_possible:
+                if tool_parser and (
+                    raw_tool_parser or (output_finished and tool_markup_possible)
+                ):
+                    # The tool parser reads every raw delta, including the ones the
+                    # reasoning parser has nothing to say about.
                     delta_msg = DeltaMessage()
                 else:
                     continue
@@ -7482,20 +7570,23 @@ async def _stream_anthropic_messages(
 
             content_text += delta_msg.content or ""
             content_to_emit = delta_msg.content or ""
-            if content_to_emit or (
-                tool_parser and output_finished and tool_markup_possible
+            tool_input = _streaming_tool_input(tool_parser, delta_text, content_to_emit)
+            if (
+                content_to_emit
+                or tool_input
+                or (tool_parser and output_finished and tool_markup_possible)
             ):
                 # Filter tool call markup during streaming
                 if tool_parser and (
-                    content_to_emit or (output.finished and tool_markup_possible)
+                    tool_input or (output.finished and tool_markup_possible)
                 ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content_to_emit, tool_parser
+                            tool_accumulated_text, tool_input, tool_parser
                         )
                     ):
-                        tool_accumulated_text += content_to_emit
+                        tool_accumulated_text += tool_input
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
@@ -7503,7 +7594,7 @@ async def _stream_anthropic_messages(
                             _parse_streaming_tool_content(
                                 tool_parser,
                                 tool_accumulated_text,
-                                content_to_emit,
+                                tool_input,
                                 tool_request_context,
                             )
                         )
@@ -7522,6 +7613,11 @@ async def _stream_anthropic_messages(
                             content_to_emit = _TOOL_MARKUP_PATTERN.sub(
                                 "", content_to_emit
                             )
+                            if reads_raw_stream:
+                                # the parser saw the raw delta: show it filtered
+                                content_to_emit = SPECIAL_TOKENS_PATTERN.sub(
+                                    "", content_to_emit
+                                )
                         if not content_to_emit:
                             continue
 
@@ -7791,6 +7887,7 @@ async def stream_chat_completion(
     tool_parser = _get_streaming_tool_parser(request, engine)
     reasoning_watch = _ReasoningMarkupWatch(tool_parser if reasoning_parser else None)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    raw_tool_parser = _tool_parser_reads_raw_output(tool_parser)
     buffer_typed_tool_calls = request.tool_argument_recovery == "buffered"
     buffered_tool_calls: dict[int, dict] = {}
     # Whether any emitted chunk carried a terminal finish_reason. The engine's
@@ -7848,7 +7945,11 @@ async def stream_chat_completion(
                 )
 
                 if delta_msg is None:
-                    if output_finished and tool_parser and tool_markup_possible:
+                    if tool_parser and (
+                        raw_tool_parser or (output_finished and tool_markup_possible)
+                    ):
+                        # The tool parser reads every raw delta, including the ones
+                        # the reasoning parser has nothing to say about.
                         delta_msg = DeltaMessage()
                     else:
                         # Skip this chunk (e.g., <think> token itself)
@@ -7862,24 +7963,31 @@ async def stream_chat_completion(
                 )
                 content = content or ""
 
+                # What the tool parser reads: the content part, or for a parser that
+                # reads the channels itself (harmony) the raw output.
+                tool_input = _streaming_tool_input(tool_parser, delta_text, content)
+
                 if thinking_off and reasoning:
                     # The request disabled thinking — surface only parsed
                     # content; drop reasoning the model emitted anyway.
                     reasoning = None
-                    if not content:
+                    if not content and not tool_input:
+                        # (a parser that reads the raw stream still has to see a delta
+                        # whose only visible part was reasoning: its state is made of
+                        # those control tokens)
                         continue
 
                 # Tool call parsing on content portion
                 if tool_parser and (
-                    content or (output_finished and tool_markup_possible)
+                    tool_input or (output_finished and tool_markup_possible)
                 ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content, tool_parser
+                            tool_accumulated_text, tool_input, tool_parser
                         )
                     ):
-                        tool_accumulated_text += content
+                        tool_accumulated_text += tool_input
                         # Emit as-is; no tool markup is even possible yet.
                     else:
                         if not tool_markup_possible:
@@ -7888,7 +7996,7 @@ async def stream_chat_completion(
                             _extract_streaming_tool_delta(
                                 tool_parser,
                                 tool_accumulated_text,
-                                content,
+                                tool_input,
                                 tool_request_context,
                             )
                         )
@@ -8271,6 +8379,17 @@ async def stream_chat_completion(
                 yield f"data: {tool_chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = True
                 fallback_call_emitted = True
+
+        if (
+            tool_parser
+            and tool_accumulated_text
+            and tool_calls_detected
+            and hasattr(tool_parser, "log_incomplete_call")
+        ):
+            # The re-parse above runs only when no call went out; a parser that logs a
+            # call cut off at the end of generation does it here too, so a complete call
+            # followed by a cut-off one is reported on every path.
+            tool_parser.log_incomplete_call(tool_accumulated_text)
 
         reasoning_watch.warn_if_no_call(tool_calls_detected or fallback_call_emitted)
 

@@ -179,21 +179,31 @@ class LlamaToolParser(ToolParser):
                     next_start += 1
                 if text.startswith(cls.PYTHON_TAG, next_start):
                     # the model repeated the tag before the next call
-                    after_tag = next_start + len(cls.PYTHON_TAG)
-                    while after_tag < len(text) and text[after_tag].isspace():
-                        after_tag += 1
-                    if after_tag >= len(text) or text[after_tag] == "{":
-                        next_start = after_tag
+                    next_start += len(cls.PYTHON_TAG)
+                    while next_start < len(text) and text[next_start].isspace():
+                        next_start += 1
                 if next_start >= len(text):
                     # A separator with nothing after it is not content: the span takes it,
                     # while the call chain stays pending (streaming) until the end.
                     consumed_end = len(text)
                     pending_start = separator_start
                     break
+                if cls.PYTHON_TAG.startswith(text[next_start:]):
+                    # a repeated tag still being written: undecidable
+                    pending_start = separator_start
+                    break
+                if text[next_start] != "{":
+                    # Only an object can be another call: whatever else follows the
+                    # separator is content, stream and whole text alike (the tag, if the
+                    # model wrote one, is dropped by the scan below).
+                    break
                 try:
                     next_obj, next_length = decoder.raw_decode(text[next_start:])
-                except json.JSONDecodeError:
-                    pending_start = separator_start
+                except json.JSONDecodeError as exc:
+                    if cls._json_ran_out(text[next_start:], exc):
+                        # a cut-off object may still become the next call
+                        pending_start = separator_start
+                    # else: malformed (``{x: 1}``), so content, as for a first call
                     break
                 next_call = cls._tool_call_from_object(next_obj)
                 if next_call is None:
@@ -377,6 +387,10 @@ class LlamaToolParser(ToolParser):
         """Return content newly made visible by the current parser state."""
         if current.startswith(previous):
             return current[len(previous) :]
+        if previous.startswith(current):
+            # the visible text shrank (whitespace after a call that turned out to lead a
+            # separator): what was emitted cannot be taken back, nothing new is due
+            return ""
         return current
 
     @staticmethod
@@ -398,6 +412,13 @@ class LlamaToolParser(ToolParser):
                 for index, call in enumerate(calls)
             ]
         }
+
+    def log_incomplete_call(self, model_output: str) -> None:
+        """Log what ``extract_tool_calls`` logs about a call cut off at the end of
+        generation, for a finished stream that was not re-parsed with it. The chat
+        stream re-parses only when no call went out, so a complete call followed by a
+        cut-off one used to leave no trace there, while every other path logged it."""
+        self.extract_tool_calls(model_output)
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -436,9 +457,10 @@ class LlamaToolParser(ToolParser):
             # extract_tool_calls only ever sees a finished response, so a tagged call still
             # incomplete here can never complete. Its text is content, the control token
             # stripped (``spans`` holds the tag), never nothing (#67); same rule as
-            # finalize_streaming. Streaming sites re-parse the finished text with this
-            # method, so this is where the situation is logged. Only sizes and a short
-            # prefix: the output may hold arguments.
+            # finalize_streaming.
+            # Streaming sites re-parse the finished text with this method, so this is
+            # where the situation is logged. Only sizes and a short prefix: the output may
+            # hold arguments.
             tail = model_output[python_pending:]
             logger.warning(
                 "Llama tool call incomplete at end of generation (EOS or length cap), "
@@ -508,19 +530,17 @@ class LlamaToolParser(ToolParser):
     def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
         """Resolve an incomplete Llama prefix when generation has ended.
 
-        A tagged call that is still incomplete can no longer complete: its text, the
-        control token stripped, is released as content, as ``extract_tool_calls`` returns
-        it. While generation runs ``extract_tool_calls_streaming`` holds it back. Anything
-        else still held back (a dangling ``;`` after a complete call) is not a call and
-        stays hidden, as before.
+        Whatever a tagged chain still holds back can no longer become a call: its text,
+        the control token stripped, is released as content exactly as
+        ``extract_tool_calls`` returns it (a cut-off call, a partly written repeated tag
+        after a separator). While generation runs ``extract_tool_calls_streaming`` holds
+        it back. A dangling ``;`` after a complete call is not content in either path.
         """
         calls, visible, pending = self._stream_state(current_text)
         if not pending:
             return None
         _, python_spans, python_pending = self._extract_python_tag_data(current_text)
-        if python_pending is not None and self._is_cut_off_call(
-            current_text, python_pending
-        ):
+        if python_pending is not None:
             _, xml_spans, _ = self._extract_xml_data(current_text)
             final = self._final_text(current_text, python_spans + xml_spans)
             return {"content": self._visible_delta(visible, final)}
