@@ -44,6 +44,13 @@ def prompt_adds_special_tokens(tokenizer, prompt: str) -> bool:
     tokenizer.  Every tokenization of a prompt string in the engines goes
     through this rule (or :func:`encode_prompt`) so counts, cache keys and
     prefix boundaries agree.
+
+    Divergence from upstream vLLM: a chat template that renders *no* BOS on a
+    tokenizer that adds one (TinyLlama, zephyr, OpenHermes) keeps the
+    tokenizer's BOS under this rule, as in mlx-lm, where vLLM's chat path adds
+    nothing. The batching engines do not apply the rule to a rendered chat
+    prompt (they tokenize it with ``add_special_tokens=False``, see
+    :func:`resolve_add_special_tokens`); the Simple engine does.
     """
     bos_token = getattr(tokenizer, "bos_token", None)
     return not (isinstance(bos_token, str) and prompt.startswith(bos_token))
