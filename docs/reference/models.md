@@ -26,6 +26,14 @@ it the server logs a warning and these models see `[INST]`, `<s>` and the other 
 of the prompt as plain text. Their template is stricter about message order than
 mistral-common's renderer (see [Tool Calling](../guides/tool-calling.md#mistral--devstral)).
 
+A default system prompt such a template renders under `if default_system_message != ''`
+(Ministral 3 Instruct and Reasoning, the official Devstral Small 2) is dropped at load, as
+mistral-common and vLLM's `mistral` mode build none: a request without a `system` message
+is prompted without one. **Ministral 3 Reasoning therefore loses its thinking-format
+prompt**: send the model card's `SYSTEM_PROMPT.txt` as the `system` message (the
+[Tool Calling](../guides/tool-calling.md#mistral--devstral) guide has the details).
+Templates that render the default unconditionally (Mistral Small 3.x) keep it.
+
 ### Recommended Models
 
 | Use Case | Model | Memory |

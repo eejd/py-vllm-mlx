@@ -45,6 +45,9 @@ class FakeEngine:
     async def stop(self) -> None:
         return None
 
+    async def validate_chat_template(self, messages, **kwargs) -> None:
+        return None
+
     async def generate(self, **kwargs):
         from vllm_mlx.engine.base import GenerationOutput
 

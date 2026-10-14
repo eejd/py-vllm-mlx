@@ -88,7 +88,7 @@ def _scheduler():
     from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 
     tok = MagicMock()
-    tok.encode = lambda x: list(range(len(x.split())))
+    tok.encode = lambda x, **_: list(range(len(x.split())))
     tok.eos_token_id = 0
     return Scheduler(MagicMock(), tok, SchedulerConfig(enable_prefix_cache=False))
 

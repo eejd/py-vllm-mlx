@@ -175,7 +175,7 @@ def _make_scheduler():
 
     model = MagicMock()
     tokenizer = MagicMock()
-    tokenizer.encode = lambda x: list(range(len(x.split())))
+    tokenizer.encode = lambda x, **_: list(range(len(x.split())))
     tokenizer.eos_token_id = 0
     return Scheduler(model, tokenizer, SchedulerConfig(enable_prefix_cache=False))
 

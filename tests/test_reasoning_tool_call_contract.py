@@ -170,6 +170,9 @@ def _engine(
             completion_tokens=len(deltas),
         )
 
+    async def validate_chat_template(messages, **kwargs):
+        return None
+
     return type(
         "FakeEngine",
         (),
@@ -179,6 +182,7 @@ def _engine(
             "preserve_native_tool_format": False,
             "stream_chat": staticmethod(stream_chat),
             "chat": staticmethod(chat),
+            "validate_chat_template": staticmethod(validate_chat_template),
             "_apply_chat_template": staticmethod(apply_chat_template),
         },
     )()
