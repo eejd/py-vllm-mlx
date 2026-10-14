@@ -533,6 +533,30 @@ def _until_stop_sequence(chunks, stop: list[str] | None):
             break
 
 
+def _generation_tokens(chunk, previous: int) -> int:
+    """Tokens generated so far, as mlx_vlm counts them.
+
+    ``stream_generate`` yields one chunk per decoded token plus a final chunk
+    that only flushes the detokenizer, so the number of chunks is not the
+    number of tokens (it is one too many at a length stop). ``generation_tokens``
+    is the model's own count: it includes the token that ended the generation,
+    which is how vLLM counts ``len(token_ids)``. A chunk without it (a custom
+    ``stream_generate``) falls back to one more than before.
+    """
+    count = getattr(chunk, "generation_tokens", None)
+    return count if isinstance(count, int) else previous + 1
+
+
+def _mllm_finish_reason(result) -> str:
+    """``length`` when mlx_vlm ended the generation at ``max_tokens``, else ``stop``.
+
+    mlx_vlm's last chunk / ``GenerationResult`` carries the reason; reporting a
+    fixed ``stop`` made a reply cut at the cap look complete (vLLM and the
+    ``/v1/completions`` route say ``length``).
+    """
+    return "length" if getattr(result, "finish_reason", None) == "length" else "stop"
+
+
 def _stream_mllm_generated_outputs(
     *,
     stream_generate_fn,
@@ -563,9 +587,11 @@ def _stream_mllm_generated_outputs(
         **draft_kwargs,
         **generation_kwargs,
     )
+    generated_text = ""
     for chunk in _until_stop_sequence(chunks, stop):
         last_chunk = chunk
-        token_count += 1
+        generated_text += _chunk_text(chunk)
+        token_count = _generation_tokens(chunk, token_count)
         yield MLLMOutput(
             text=_chunk_text(chunk),
             finish_reason=None,
@@ -573,9 +599,14 @@ def _stream_mllm_generated_outputs(
             completion_tokens=token_count,
         )
 
+    finish_reason = (
+        "stop"
+        if stop and any(seq in generated_text for seq in stop)
+        else _mllm_finish_reason(last_chunk)
+    )
     yield MLLMOutput(
         text="",
-        finish_reason="stop",
+        finish_reason=finish_reason,
         prompt_tokens=getattr(last_chunk, "prompt_tokens", 0) if last_chunk else 0,
         completion_tokens=token_count,
         **draft_metrics(),
@@ -2123,7 +2154,7 @@ class MLXMultimodalLM:
         if hasattr(result, "text"):
             return MLLMOutput(
                 text=result.text,
-                finish_reason="stop",
+                finish_reason=_mllm_finish_reason(result),
                 prompt_tokens=getattr(result, "prompt_tokens", 0),
                 completion_tokens=getattr(result, "generation_tokens", 0),
             )
@@ -2430,7 +2461,7 @@ class MLXMultimodalLM:
 
         return MLLMOutput(
             text=output_text,
-            finish_reason="stop",
+            finish_reason=_mllm_finish_reason(result),
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
             **draft_metrics,
@@ -2909,7 +2940,7 @@ class MLXMultimodalLM:
 
         return MLLMOutput(
             text=output_text,
-            finish_reason="stop",
+            finish_reason=_mllm_finish_reason(result),
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
             **draft_metrics,

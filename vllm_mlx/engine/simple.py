@@ -59,6 +59,20 @@ from ..mlx_streams import (
 logger = logging.getLogger(__name__)
 
 
+def _mllm_completion_tokens(chunk: Any, previous: int) -> int:
+    """Cumulative ``completion_tokens`` carried by an MLLM stream chunk.
+
+    The MLLM stream ends with a chunk that holds no new token (it flushes the
+    detokenizer and carries the finish reason), so counting chunks overstates
+    the generation by one. Chunks report the running token count themselves
+    (mlx-vlm's ``generation_tokens``, which includes the stop token, as vLLM's
+    ``len(token_ids)`` does); a chunk that does not falls back to one more than
+    before.
+    """
+    count = getattr(chunk, "completion_tokens", None)
+    return count if isinstance(count, int) else previous + 1
+
+
 def _reject_ignore_eos_on_mlx_vlm(kwargs: dict[str, Any]) -> None:
     """Refuse ``ignore_eos`` on a route that decodes through mlx-vlm.
 
@@ -1580,7 +1594,17 @@ class SimpleEngine(BaseEngine):
                             if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
                             else prompt_tokens
                         )
-                        completion_tokens += 1
+                        # mlx-vlm streams one chunk per token and then a last chunk with
+                        # no new token that flushes the detokenizer (the text of the
+                        # final token(s)) and carries the finish reason. Stopping at
+                        # the cap on the last token chunk dropped that text.
+                        vlm_stream = self._is_mllm and isinstance(
+                            getattr(chunk, "generation_tokens", None), int
+                        )
+                        if vlm_stream:
+                            completion_tokens = chunk.generation_tokens
+                        else:
+                            completion_tokens += 1
                         if request_id in self._active_requests:
                             self._active_requests[request_id].update(
                                 {
@@ -1592,10 +1616,13 @@ class SimpleEngine(BaseEngine):
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                         accumulated_text += new_text
 
-                        finished = (
-                            getattr(chunk, "finished", False)
-                            or completion_tokens >= max_tokens
-                        )
+                        if vlm_stream:
+                            finished = getattr(chunk, "finish_reason", None) is not None
+                        else:
+                            finished = (
+                                getattr(chunk, "finished", False)
+                                or completion_tokens >= max_tokens
+                            )
                         finish_reason = None
                         if finished:
                             finish_reason = getattr(chunk, "finish_reason", None)
@@ -2203,7 +2230,7 @@ class SimpleEngine(BaseEngine):
                             if chunk is _STREAM_DONE:
                                 break
 
-                            token_count += 1
+                            token_count = _mllm_completion_tokens(chunk, token_count)
                             new_text = (
                                 chunk.text if hasattr(chunk, "text") else str(chunk)
                             )
@@ -2259,7 +2286,7 @@ class SimpleEngine(BaseEngine):
                 request_id=request_id,
             )
             for chunk in chunks:
-                token_count += 1
+                token_count = _mllm_completion_tokens(chunk, token_count)
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
                 finished = chunk.finish_reason is not None
