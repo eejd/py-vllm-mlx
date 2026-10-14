@@ -11,6 +11,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.v1.worker.worker_base import WorkerBase
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -29,7 +30,7 @@ def _compilation_times():
     return CompilationTimes(language_model=0.0, encoder=0.0)
 
 
-class MLXWorker:
+class MLXWorker(WorkerBase):
     """
     Worker implementation for MLX-based inference on Apple Silicon.
 
@@ -60,23 +61,17 @@ class MLXWorker:
             distributed_init_method: Distributed initialization method
             is_driver_worker: Whether this worker handles driver responsibilities
         """
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.cache_config = vllm_config.cache_config
-        self.parallel_config = vllm_config.parallel_config
-        self.scheduler_config = vllm_config.scheduler_config
-        self.device_config = vllm_config.device_config
-        self.load_config = vllm_config.load_config
-
-        self.local_rank = local_rank
-        self.rank = rank
-        self.distributed_init_method = distributed_init_method
-        self.is_driver_worker = is_driver_worker
+        super().__init__(
+            vllm_config,
+            local_rank,
+            rank,
+            distributed_init_method,
+            is_driver_worker,
+        )
 
         # MLX model and tokenizer
         self.model = None
         self.tokenizer = None
-        self.model_runner = None
 
         # Device info
         self.device = torch.device("cpu")  # MLX uses its own device management
@@ -188,10 +183,40 @@ class MLXWorker:
             for i in range(num_layers)
         }
 
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        """KV cache layouts this worker accepts, most preferred first.
+
+        vLLM >= 0.31 asks every worker at engine start-up and resolves one
+        layout for the whole model (``resolve_kv_cache_layout``); an empty
+        answer is a hard error there.  MLX allocates no vLLM-side KV tensor
+        (mlx-lm keeps each request's cache inside its generator), so no
+        layout is unsupported and none is preferred.  That is the "no
+        backend declares a set" case of vLLM's own
+        ``get_supported_kv_cache_layouts``, which then returns the default
+        preference order; asking it keeps ``VLLM_KV_CACHE_LAYOUT`` and KV
+        connector preferences resolvable exactly as on the other platforms.
+        """
+        from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
+
+        return [layout.name for layout in get_supported_kv_cache_layouts(())]
+
     def initialize_from_config(self, kv_cache_config) -> None:
         """vLLM >= 0.27 entry point: size the cache from the planner's result."""
+        layout = getattr(kv_cache_config, "kv_cache_layout", None)
+        if layout is not None:
+            # Same adoption as GPUWorker: a worker created after the engine
+            # core resolved the layout only learns it through the config.
+            from vllm.v1.attention.backends.utils import record_kv_cache_layout
+
+            record_kv_cache_layout(self.cache_config, layout)
         num_blocks = getattr(kv_cache_config, "num_blocks", 0)
         self.initialize_cache(num_blocks, 0)
+
+    def synchronize_device(self) -> None:
+        """Wait for in-flight MLX work; MLX is outside ``torch.accelerator``."""
+        import mlx.core as mx
+
+        mx.synchronize()
 
     def compile_or_warm_up_model(self):
         """Warm up model for inference.
@@ -227,10 +252,14 @@ class MLXWorker:
         """vLLM >= 0.27 worker hook; MLX keeps no vLLM-side multimodal cache."""
 
     def sample_tokens(self, grammar_output=None):
-        """vLLM >= 0.27 two-phase step: return the output stashed by execute_model."""
+        """vLLM >= 0.27 two-phase step: sample what execute_model scheduled.
+
+        ``grammar_output`` (structured outputs) is applied to the logits of
+        the requests it names before they are sampled.
+        """
         if self.model_runner is None:
             return None
-        return self.model_runner.take_pending_output()
+        return self.model_runner.sample_tokens(grammar_output)
 
     # -- vLLM >= 0.27 worker RPC surface (collective_rpc targets) ----------
     def get_supported_tasks(self) -> tuple:
@@ -327,8 +356,11 @@ class MLXWorker:
         block_size = self.cache_config.block_size
         return 2 * block_size * num_layers * num_heads * head_size * 2
 
-    def profile(self, is_start: bool = True) -> None:
-        """Profiling (not yet implemented for MLX)."""
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        """Profiling (not yet implemented for MLX).
+
+        vLLM 0.31's ``Executor.profile`` also passes ``profile_prefix``.
+        """
         logger.debug("Profiling not yet implemented for MLX")
 
     def __repr__(self) -> str:
