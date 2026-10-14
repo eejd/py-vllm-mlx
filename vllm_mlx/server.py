@@ -3245,13 +3245,21 @@ async def _run_responses_request(
 
 
 async def _stream_responses_request(
-    request: ResponsesRequest, engine: BaseEngine | None = None
+    request: ResponsesRequest,
+    engine: BaseEngine | None = None,
+    prepared: tuple[BaseEngine, ChatCompletionRequest, list[dict], dict] | None = None,
 ) -> AsyncIterator[str]:
-    """Execute a Responses API request and stream SSE events incrementally."""
-    if engine is None:
-        prepared = _prepare_streaming_responses_request(request)
-    else:
-        prepared = _prepare_streaming_responses_request(request, engine=engine)
+    """Execute a Responses API request and stream SSE events incrementally.
+
+    ``prepared`` is the result of ``_prepare_streaming_responses_request`` when the
+    endpoint already built it (to pre-check the chat template before the stream
+    starts); without it the request is prepared here.
+    """
+    if prepared is None:
+        if engine is None:
+            prepared = _prepare_streaming_responses_request(request)
+        else:
+            prepared = _prepare_streaming_responses_request(request, engine=engine)
     engine, chat_request, messages, chat_kwargs = prepared
     tool_request_context = chat_request.model_dump()
 
@@ -6532,6 +6540,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _raise_remote_media_http_error(exc)
 
         if request.stream:
+            try:
+                await engine.validate_chat_template(
+                    prepared.messages, **prepared.chat_kwargs
+                )
+            except (UnsupportedRequestOption, EngineBusy) as exc:
+                _raise_preflight_error(exc, tracker)
             response, release_on_exit = await _build_chat_streaming_response(
                 engine,
                 prepared.messages,
@@ -6756,9 +6770,13 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
                     ignore_eos=True,
                     has_media=has_media_content(chat_request.messages),
                 )
+            prepared = _prepare_streaming_responses_request(request, engine=engine)
+            await prepared[0].validate_chat_template(prepared[2], **prepared[3])
             response = StreamingResponse(
                 _disconnect_guard(
-                    _stream_responses_request(request, engine=engine),
+                    _stream_responses_request(
+                        request, engine=engine, prepared=prepared
+                    ),
                     raw_request,
                     cleanup=(
                         _make_release_cleanup(raw_request)
@@ -7009,6 +7027,12 @@ async def create_anthropic_message(
             effective_max_tokens,
         )
         if anthropic_request.stream:
+            try:
+                await engine.validate_chat_template(
+                    prepared.messages, **prepared.chat_kwargs
+                )
+            except (UnsupportedRequestOption, EngineBusy) as exc:
+                _raise_preflight_error(exc, tracker)
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             )
@@ -7048,6 +7072,9 @@ async def create_anthropic_message(
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
+        except UnsupportedRequestOption as exc:
+            tracker.finish(result="client_error")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
