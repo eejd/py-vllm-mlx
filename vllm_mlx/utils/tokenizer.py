@@ -42,15 +42,39 @@ def prompt_adds_special_tokens(tokenizer, prompt: str) -> bool:
     whitespace defeats it, and an empty ``bos_token`` matches every prompt).  A
     raw completion prompt without a leading BOS text still gets one from the
     tokenizer.  Every tokenization of a prompt string in the engines goes
-    through :func:`encode_prompt` so counts, cache keys and prefix boundaries
-    agree.
+    through this rule (or :func:`encode_prompt`) so counts, cache keys and
+    prefix boundaries agree.
 
     Divergence from upstream vLLM: a chat template that renders *no* BOS on a
     tokenizer that adds one (TinyLlama, zephyr, OpenHermes) keeps the
-    tokenizer's BOS here and in mlx-lm, where vLLM's chat path adds nothing.
+    tokenizer's BOS under this rule, as in mlx-lm, where vLLM's chat path adds
+    nothing. The batching engines do not apply the rule to a rendered chat
+    prompt (they tokenize it with ``add_special_tokens=False``, see
+    :func:`resolve_add_special_tokens`); the Simple engine does.
     """
     bos_token = getattr(tokenizer, "bos_token", None)
     return not (isinstance(bos_token, str) and prompt.startswith(bos_token))
+
+
+def resolve_add_special_tokens(
+    tokenizer, prompt: str, add_special_tokens: bool | None = None
+) -> bool:
+    """The ``add_special_tokens`` value for a prompt of the given request kind.
+
+    ``add_special_tokens`` is the request kind, as in vLLM's tokenize params:
+
+    * ``False`` -- a prompt the chat template already rendered (the template
+      owns every marker, BOS included).  vLLM tokenizes chat prompts with
+      ``add_special_tokens=False`` (``vllm/renderers/base.py``
+      ``default_chat_tok_params``), so nothing is added.
+    * ``None`` -- a raw completion prompt: the tokenizer's default (BOS added),
+      except that a prompt which already starts with the BOS text keeps that
+      single BOS (:func:`prompt_adds_special_tokens`).
+    * ``True`` -- always the tokenizer's default.
+    """
+    if add_special_tokens is not None:
+        return add_special_tokens
+    return prompt_adds_special_tokens(tokenizer, prompt)
 
 
 def _encode_takes_add_special_tokens(encode) -> bool:
@@ -64,8 +88,10 @@ def _encode_takes_add_special_tokens(encode) -> bool:
     )
 
 
-def encode_prompt(tokenizer, prompt: str) -> list[int]:
-    """Tokenize ``prompt`` without duplicating a BOS the prompt already carries.
+def encode_prompt(
+    tokenizer, prompt: str, add_special_tokens: bool | None = None
+) -> list[int]:
+    """Tokenize ``prompt``; see :func:`resolve_add_special_tokens` for the kinds.
 
     A duck-typed tokenizer whose ``encode(text)`` takes no ``add_special_tokens``
     keyword is encoded with its own defaults.
@@ -73,7 +99,10 @@ def encode_prompt(tokenizer, prompt: str) -> list[int]:
     if not _encode_takes_add_special_tokens(tokenizer.encode):
         return tokenizer.encode(prompt)
     return tokenizer.encode(
-        prompt, add_special_tokens=prompt_adds_special_tokens(tokenizer, prompt)
+        prompt,
+        add_special_tokens=resolve_add_special_tokens(
+            tokenizer, prompt, add_special_tokens
+        ),
     )
 
 

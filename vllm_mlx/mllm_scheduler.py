@@ -36,7 +36,7 @@ from .mllm_batch_generator import (
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
-from .utils.tokenizer import boundary_token_ids, streaming_detokenizer
+from .utils.tokenizer import boundary_token_ids, encode_prompt, streaming_detokenizer
 
 if TYPE_CHECKING:
     from .mllm_specprefill import SpecPrefillOutcome, SpecPrefillRequestConfig
@@ -116,6 +116,10 @@ class MLLMRequest:
     audio: Optional[List[str]] = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     mllm_draft: bool = False
+    # Request kind for tokenization (vLLM ``add_special_tokens``): False for a
+    # prompt the chat template already rendered, None for a raw completion
+    # prompt (BOS added unless the prompt already starts with it).
+    add_special_tokens: Optional[bool] = None
     specprefill_config: Optional["SpecPrefillRequestConfig"] = None
     specprefill_outcome: Optional["SpecPrefillOutcome"] = None
     arrival_time: float = field(default_factory=time.time)
@@ -475,16 +479,16 @@ class MLLMScheduler:
             audio=audio,
             sampling_params=sampling_params,
             mllm_draft=bool(kwargs.pop("mllm_draft", False)),
+            add_special_tokens=kwargs.pop("add_special_tokens", None),
             specprefill_config=specprefill_config,
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
         # vision tokens are added during prefill but this gives a useful
-        # approximation for the status endpoint).  The batch generator
-        # tokenizes with ``mlx_vlm.utils.prepare_inputs`` which uses
-        # ``add_special_tokens=False`` (the rendered chat template is the sole
-        # source of the BOS), so count the same way: the default encode would
-        # add a second BOS for Gemma-3 and over-report usage.prompt_tokens.
+        # approximation for the status endpoint).  Count with the same
+        # ``add_special_tokens`` the batch generator hands to
+        # ``mlx_vlm.utils.prepare_inputs``, so usage.prompt_tokens matches the
+        # ids the model sees (a rendered chat prompt owns its BOS).
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
@@ -492,7 +496,7 @@ class MLLMScheduler:
         )
         try:
             request.num_prompt_tokens = len(
-                tokenizer.encode(prompt, add_special_tokens=False)
+                encode_prompt(tokenizer, prompt, request.add_special_tokens)
             )
         except Exception:
             pass
@@ -631,6 +635,7 @@ class MLLMScheduler:
                 logits_processors=request.sampling_params.logits_processors,
                 ignore_eos=request.sampling_params.ignore_eos,
                 mllm_draft=request.mllm_draft,
+                add_special_tokens=request.add_special_tokens,
                 specprefill_config=request.specprefill_config,
             )
             batch_requests.append(batch_req)

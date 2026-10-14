@@ -433,6 +433,7 @@ class EngineCore:
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
         prefix_boundary: int = 0,
+        add_special_tokens: Optional[bool] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -444,6 +445,8 @@ class EngineCore:
             images: Optional images for multimodal
             videos: Optional videos for multimodal
             prefix_boundary: Token count for shared prefix (for cache)
+            add_special_tokens: False when ``prompt`` was rendered by the chat
+                template (it owns the BOS); None for a raw completion prompt
 
         Returns:
             The request ID
@@ -461,6 +464,7 @@ class EngineCore:
             images=images,
             videos=videos,
             prefix_boundary=prefix_boundary,
+            add_special_tokens=add_special_tokens,
         )
 
         # Setup output collector with stream_interval from config

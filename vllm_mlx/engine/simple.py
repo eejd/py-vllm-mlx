@@ -1512,6 +1512,10 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # The Simple engine tokenizes string prompts with the mlx-lm rule (BOS
+        # added unless the prompt already starts with it), so the request-kind
+        # hint the batched schedulers use is accepted and not forwarded.
+        kwargs.pop("add_special_tokens", None)
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)

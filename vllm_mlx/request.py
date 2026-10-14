@@ -154,6 +154,10 @@ class Request:
     cache_credit_tokens: int = 0  # Tokens the cache credited as a hit at fetch time
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
+    # Request kind for tokenization (vLLM ``add_special_tokens``): False for a
+    # prompt the chat template already rendered, None for a raw completion
+    # prompt (tokenizer default, minus a duplicated leading BOS).
+    add_special_tokens: Optional[bool] = None
 
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
