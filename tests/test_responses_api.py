@@ -58,6 +58,8 @@ def server_state():
 def _mock_engine(*outputs):
     engine = MagicMock()
     engine.model_name = "test-model"
+    engine.is_mllm = False
+    engine.use_harmony_rendering = False
     engine.preserve_native_tool_format = False
     engine.chat = AsyncMock(side_effect=list(outputs))
     stream_calls = []
@@ -1187,3 +1189,325 @@ class TestResponsesRegistryRouting:
             assert resp.status_code == 400, resp.text
             assert registry.acquired.count("alpha") == (2 if stream else 1)
             assert registry.active_requests == 0
+
+
+_PNG = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4"
+    "nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+_PNG_2 = _PNG.replace("iVBORw0KGgo", "iVBORw0KGgp")
+
+
+def _user_input(*parts):
+    return [{"type": "message", "role": "user", "content": list(parts)}]
+
+
+def _text(text):
+    return {"type": "input_text", "text": text}
+
+
+def _image(url=_PNG, **extra):
+    return {"type": "input_image", "image_url": url, **extra}
+
+
+class TestResponsesInputImages:
+    """``input_image`` parts reach the engine exactly as chat-route images do."""
+
+    def _post(self, client, engine, input_items, **extra):
+        import vllm_mlx.server as srv
+
+        srv._engine = engine
+        return client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": input_items, **extra},
+        )
+
+    def _chat_call(self, client, engine, content):
+        import vllm_mlx.server as srv
+
+        srv._engine = engine
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": content}],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        return engine.chat.call_args.kwargs
+
+    def test_llm_engine_gets_text_and_the_extracted_image(self, client):
+        engine = _mock_engine(_output("a pixel"))
+        resp = self._post(client, engine, _user_input(_text("What is this?"), _image()))
+
+        assert resp.status_code == 200, resp.text
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["messages"] == [{"role": "user", "content": "What is this?"}]
+        assert kwargs["images"] == [_PNG]
+
+    def test_llm_engine_matches_the_chat_route(self, client):
+        responses_engine = _mock_engine(_output("a"))
+        self._post(client, responses_engine, _user_input(_text("Describe"), _image()))
+        chat_engine = _mock_engine(_output("a"))
+        chat = self._chat_call(
+            client,
+            chat_engine,
+            [
+                {"type": "text", "text": "Describe"},
+                {"type": "image_url", "image_url": {"url": _PNG}},
+            ],
+        )
+
+        got = responses_engine.chat.call_args.kwargs
+        assert got["messages"] == chat["messages"]
+        assert got["images"] == chat["images"]
+
+    def test_mllm_engine_keeps_the_image_in_the_message_like_the_chat_route(
+        self, client
+    ):
+        # An MLLM engine reads media out of the messages; its chat() has no use
+        # for an ``images`` argument, so flattening the message would drop it.
+        responses_engine = _mock_engine(_output("a"))
+        responses_engine.is_mllm = True
+        self._post(
+            client,
+            responses_engine,
+            _user_input(_text("Describe"), _image(detail="high")),
+        )
+        chat_engine = _mock_engine(_output("a"))
+        chat_engine.is_mllm = True
+        chat = self._chat_call(
+            client,
+            chat_engine,
+            [
+                {"type": "text", "text": "Describe"},
+                {"type": "image_url", "image_url": {"url": _PNG, "detail": "high"}},
+            ],
+        )
+
+        got = responses_engine.chat.call_args.kwargs
+        assert got["messages"] == chat["messages"]
+        assert got["messages"][0]["content"][1]["image_url"] == {
+            "url": _PNG,
+            "detail": "high",
+        }
+        assert "images" not in got
+
+    def test_image_only_message_is_not_an_empty_conversation(self, client):
+        engine = _mock_engine(_output("a"))
+        resp = self._post(client, engine, _user_input(_image()))
+
+        assert resp.status_code == 200, resp.text
+        assert engine.chat.call_args.kwargs["images"] == [_PNG]
+
+    def test_image_detail_defaults_to_auto(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        self._post(client, engine, _user_input(_image()))
+
+        part = engine.chat.call_args.kwargs["messages"][0]["content"][0]
+        assert part["image_url"]["detail"] == "auto"
+
+    def test_parts_keep_their_request_order(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        self._post(
+            client,
+            engine,
+            _user_input(_text("one"), _image(_PNG), _text("two"), _image(_PNG_2)),
+        )
+
+        content = engine.chat.call_args.kwargs["messages"][0]["content"]
+        assert [part.get("text") or part["image_url"]["url"] for part in content] == [
+            "one",
+            _PNG,
+            "two",
+            _PNG_2,
+        ]
+
+    def test_llm_engine_gets_every_image_in_order(self, client):
+        engine = _mock_engine(_output("a"))
+        self._post(
+            client, engine, _user_input(_image(_PNG), _text("vs"), _image(_PNG_2))
+        )
+
+        assert engine.chat.call_args.kwargs["images"] == [_PNG, _PNG_2]
+
+    def test_streaming_request_carries_the_image(self, client):
+        engine = _mock_engine()
+        engine._stream_outputs = [_stream_output("ok", finish_reason="stop")]
+        resp = self._post(
+            client, engine, _user_input(_text("Describe"), _image()), stream=True
+        )
+
+        assert resp.status_code == 200, resp.text
+        call = engine._stream_calls[0]
+        assert call["messages"] == [{"role": "user", "content": "Describe"}]
+        assert call["images"] == [_PNG]
+
+    def test_message_item_without_a_type_is_a_message(self, client):
+        # EasyInputMessage: ``type`` is optional when there is a role.
+        engine = _mock_engine(_output("a"))
+        resp = self._post(
+            client,
+            engine,
+            [{"role": "user", "content": [_text("Describe"), _image()]}],
+        )
+
+        assert resp.status_code == 200, resp.text
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["messages"] == [{"role": "user", "content": "Describe"}]
+        assert kwargs["images"] == [_PNG]
+
+    def test_image_is_replayed_through_previous_response_id(self, client):
+        engine = _mock_engine(_output("a pixel"), _output("still a pixel"))
+        first = self._post(client, engine, _user_input(_text("What?"), _image()))
+        resp = self._post(
+            client,
+            engine,
+            "And now?",
+            previous_response_id=first.json()["id"],
+        )
+
+        assert resp.status_code == 200, resp.text
+        kwargs = engine.chat.call_args_list[1].kwargs
+        assert [m["role"] for m in kwargs["messages"]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert kwargs["images"] == [_PNG]
+
+    def test_text_part_types_of_history_are_accepted(self, client):
+        engine = _mock_engine(_output("a"))
+        resp = self._post(
+            client,
+            engine,
+            [
+                {"type": "message", "role": "user", "content": [_text("Hi")]},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": "No."}],
+                },
+                {"type": "message", "role": "user", "content": [_text("Again")]},
+            ],
+        )
+
+        assert resp.status_code == 200, resp.text
+        contents = [m["content"] for m in engine.chat.call_args.kwargs["messages"]]
+        assert contents == ["Hi", "Hello\n\nNo.", "Again"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "part, expected",
+        [
+            (
+                {"type": "input_file", "file_data": "abc", "filename": "a.pdf"},
+                "input_file",
+            ),
+            (
+                {"type": "input_audio", "input_audio": {"data": "x", "format": "wav"}},
+                "input_audio",
+            ),
+            ({"type": "made_up"}, "made_up"),
+        ],
+    )
+    def test_unsupported_part_is_a_400_naming_it(self, client, part, expected, stream):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(client, engine, _user_input(_text("hi"), part), stream=stream)
+
+        assert resp.status_code == 400, resp.text
+        assert expected in resp.json()["detail"]
+        engine.chat.assert_not_called()
+        assert engine._stream_calls == []
+
+    @pytest.mark.parametrize(
+        "part, expected",
+        [
+            ({"type": "input_image", "file_id": "file-1"}, "file_id"),
+            ({"type": "input_image"}, "image_url"),
+            ({"type": "input_image", "image_url": ""}, "image_url"),
+            ({"type": "input_image", "image_url": {"url": _PNG}}, "image_url"),
+            (_image(detail="ultra"), "detail"),
+            ({"image_url": _PNG}, "no `type`"),
+        ],
+    )
+    def test_malformed_part_is_a_400(self, client, part, expected):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(client, engine, _user_input(part))
+
+        assert resp.status_code == 400, resp.text
+        assert expected in resp.json()["detail"]
+        engine.chat.assert_not_called()
+
+    @pytest.mark.parametrize("role", ["system", "developer"])
+    def test_image_in_a_system_message_is_a_400(self, client, role):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(
+            client,
+            engine,
+            [
+                {"type": "message", "role": role, "content": [_image()]},
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "system or developer" in resp.json()["detail"]
+        engine.chat.assert_not_called()
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "items, seen",
+        [
+            ([], None),
+            ([{"type": "item_reference", "id": "msg_1"}], "item_reference"),
+            (
+                [
+                    {"type": "item_reference", "id": "msg_1"},
+                    {"type": "computer_call_output", "call_id": "c"},
+                ],
+                "computer_call_output, item_reference",
+            ),
+        ],
+    )
+    def test_empty_conversation_is_a_400_not_a_500(self, client, items, seen, stream):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(client, engine, items, stream=stream, instructions="Be nice")
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert "no conversation message" in detail
+        if seen:
+            assert seen in detail
+        engine.chat.assert_not_called()
+        assert engine._stream_calls == []
+
+    def test_history_alone_is_not_an_empty_conversation(self, client):
+        engine = _mock_engine(_output("one"), _output("two"))
+        first = self._post(client, engine, "Hello")
+        resp = self._post(client, engine, [], previous_response_id=first.json()["id"])
+
+        assert resp.status_code == 200, resp.text
+        roles = [m["role"] for m in engine.chat.call_args_list[1].kwargs["messages"]]
+        assert roles == ["user", "assistant"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_private_image_url_is_refused_like_on_the_chat_route(self, client, stream):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(
+            client,
+            engine,
+            _user_input(_image("http://127.0.0.1:9/secret.png")),
+            stream=stream,
+        )
+
+        assert resp.status_code == 400, resp.text
+        engine.chat.assert_not_called()
+        assert engine._stream_calls == []

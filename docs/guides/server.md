@@ -236,6 +236,26 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit \
 `/metrics` is intentionally unauthenticated. Expose it only on a trusted
 network or behind a reverse proxy / firewall that limits who can scrape it.
 
+### Responses API input
+
+```bash
+POST /v1/responses
+```
+
+`input` is a string or a list of items. Message items (`type: "message"`, or just a
+`role`) carry a string or a list of content parts:
+
+| Part | Handling |
+|------|----------|
+| `input_text`, `output_text`, `text`, `refusal` | text |
+| `input_image` | an image, like a chat `image_url` part: `image_url` is a URL or a base64 data URL, `detail` is `auto` (default), `low`, `high` or `original`. `file_id` is rejected (no Files API). A multimodal model sees it in the message; for a text-only model it is extracted as on the chat route |
+| anything else (`input_file`, `input_audio`, ...) | HTTP 400 naming the part type |
+
+Images are not allowed in `system`/`developer` messages (HTTP 400). An `input` that yields no
+conversation message (an empty list, or only item types the server skips such as
+`item_reference`) is HTTP 400, not a server error. Remote image URLs go through the same
+private-address check as the chat route.
+
 ### Anthropic Messages API
 
 ```bash

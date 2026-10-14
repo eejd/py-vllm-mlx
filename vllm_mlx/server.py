@@ -363,9 +363,16 @@ class PreparedChatInvocation:
 def _prepare_chat_messages(
     engine: BaseEngine,
     request_messages: list[Message | dict],
+    *,
+    validate_remote_media: bool = True,
 ) -> tuple[list[dict], list, list, list, bool]:
-    """Normalize messages and collect media once for both stream/non-stream paths."""
-    _validate_remote_media_urls(request_messages)
+    """Normalize messages and collect media once for both stream/non-stream paths.
+
+    ``validate_remote_media=False`` is for a caller that already validated the
+    same messages (a streaming route validates before it starts the response).
+    """
+    if validate_remote_media:
+        _validate_remote_media_urls(request_messages)
 
     is_mllm = bool(getattr(engine, "is_mllm", False))
     preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
@@ -2744,6 +2751,99 @@ def _response_content_to_text(content) -> str:
     return "\n".join(part for part in text_parts if part)
 
 
+_RESPONSES_TEXT_PART_TYPES = ("text", "input_text", "output_text", "refusal")
+_RESPONSES_IMAGE_DETAILS = ("auto", "low", "high", "original")
+_RESPONSES_SUPPORTED_PART_TYPES = "input_image, input_text, output_text, refusal, text"
+
+
+def _response_part_field(part, name: str):
+    if isinstance(part, dict):
+        return part.get(name)
+    return getattr(part, name, None)
+
+
+def _response_input_image_to_chat_part(part) -> dict:
+    """Convert a Responses ``input_image`` part into a chat ``image_url`` part.
+
+    ``image_url`` is a URL or a data URL, as in the OpenAI Responses API (where
+    the chat API wraps it in an object).  ``file_id`` needs a Files API this
+    server does not have.
+    """
+    image_url = _response_part_field(part, "image_url")
+    detail = _response_part_field(part, "detail") or "auto"
+    if not isinstance(image_url, str) or not image_url.strip():
+        if _response_part_field(part, "file_id"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Responses input_image.file_id is not supported (there is no "
+                    "Files API on this server); send image_url"
+                ),
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="Responses input_image requires image_url: a URL or data URL string",
+        )
+    if detail not in _RESPONSES_IMAGE_DETAILS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Responses input_image.detail {detail!r} is invalid; "
+                f"expected one of {', '.join(_RESPONSES_IMAGE_DETAILS)}"
+            ),
+        )
+    return {"type": "image_url", "image_url": {"url": image_url, "detail": detail}}
+
+
+def _response_content_to_chat_content(content) -> str | list[dict]:
+    """Convert Responses message content into chat-completions message content.
+
+    Text-only content becomes one string (parts joined by newlines).  Content
+    with an ``input_image`` stays a list of chat parts (``text`` / ``image_url``)
+    in request order, the shape the chat route's multimodal handling reads.
+    A part type that cannot be served (``input_file``, ...) is a 400 naming it,
+    never a silent drop: the model would answer a prompt the client did not send.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+
+    parts: list[dict] = []
+    has_image = False
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                parts.append({"type": "text", "text": part})
+            continue
+        part_type = _response_part_field(part, "type")
+        if part_type in _RESPONSES_TEXT_PART_TYPES:
+            text = _response_part_field(
+                part, "refusal" if part_type == "refusal" else "text"
+            )
+            if text:
+                parts.append({"type": "text", "text": text})
+        elif part_type == "input_image":
+            parts.append(_response_input_image_to_chat_part(part))
+            has_image = True
+        elif part_type is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Responses input message content part has no `type`",
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported Responses input content part type {part_type!r}; "
+                    f"supported: {_RESPONSES_SUPPORTED_PART_TYPES}"
+                ),
+            )
+    if has_image:
+        return parts
+    return "\n".join(part["text"] for part in parts)
+
+
 def _responses_tools_to_chat_tools(
     tools: list[ResponseFunctionTool | dict],
 ) -> tuple[list[dict] | None, list[str]]:
@@ -2809,7 +2909,9 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
 
     for item in request.input:
         if isinstance(item, dict):
-            item_type = item.get("type", "")
+            # ``type`` is optional on a message item (EasyInputMessage): a dict
+            # with a role and no type is a message, as in the OpenAI SDK types.
+            item_type = item.get("type") or ("message" if "role" in item else "")
             if item_type == "message":
                 role = item.get("role", "user")
                 if role == "developer":
@@ -2817,7 +2919,9 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                 messages.append(
                     {
                         "role": role,
-                        "content": _response_content_to_text(item.get("content")),
+                        "content": _response_content_to_chat_content(
+                            item.get("content")
+                        ),
                     }
                 )
             elif item_type == "function_call":
@@ -2867,7 +2971,7 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
             messages.append(
                 {
                     "role": role,
-                    "content": _response_content_to_text(item.content),
+                    "content": _response_content_to_chat_content(item.content),
                 }
             )
         elif isinstance(item, ResponseFunctionCallItem):
@@ -2967,6 +3071,37 @@ def _responses_request_to_chat_request(
 
     system_messages = [msg for msg in messages if msg.get("role") == "system"]
     non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
+    if not non_system_messages:
+        # Nothing for the model to answer: an empty ``input`` list, or only
+        # items of types this server skips.  The engine cannot render an empty
+        # conversation (IndexError -> plain-text 500).
+        item_types = sorted(
+            {
+                str(
+                    (item.get("type") or ("message" if "role" in item else "unknown"))
+                    if isinstance(item, dict)
+                    else getattr(item, "type", type(item).__name__)
+                )
+                for item in (request.input if isinstance(request.input, list) else [])
+            }
+        )
+        seen = f" (input item types: {', '.join(item_types)})" if item_types else ""
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Responses input has no conversation message to answer{seen}; "
+                "supported input items: message, function_call, "
+                "function_call_output, reasoning"
+            ),
+        )
+    if any(isinstance(msg.get("content"), list) for msg in system_messages):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Responses input_image is not supported in system or developer "
+                "messages; send it in a user message"
+            ),
+        )
     merged_system_content = "\n\n".join(
         str(msg.get("content", "")).strip()
         for msg in system_messages
@@ -3143,14 +3278,14 @@ def _prepare_responses_request(
             f"tools={len(request.tools)}"
         )
 
-    if validate_remote_media:
-        _validate_remote_media_urls(chat_request.messages)
-
-    messages, images, videos, audios = extract_multimodal_content(
+    # The chat route's own preparer: an MLLM engine reads images out of the
+    # messages (its stream_chat has no use for an ``images`` argument), an LLM
+    # engine gets them extracted, and remote media URLs are validated once.
+    messages, images, videos, _, _ = _prepare_chat_messages(
+        engine,
         chat_request.messages,
-        preserve_native_format=engine.preserve_native_tool_format,
+        validate_remote_media=validate_remote_media,
     )
-    messages = canonicalize_system_messages(messages)
 
     chat_kwargs = {
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
