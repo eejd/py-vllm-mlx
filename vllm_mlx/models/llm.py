@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
-from ..utils.tokenizer import eos_ignoring_tokenizer
+from ..utils.tokenizer import eos_ignoring_tokenizer, unfiltered_tokenizer
 
 if TYPE_CHECKING:
     import mlx.core as mx
@@ -152,6 +152,21 @@ class MLXLanguageModel:
         )
         return processors if processors else None
 
+    def _generation_tokenizer(self, ignore_eos: bool, skip_special_tokens: bool):
+        """The tokenizer view a request decodes under.
+
+        The loaded tokenizer already leaves BOS/PAD/UNK/EOS out of the text, and
+        stops on EOS; a request that asks for ``ignore_eos`` or
+        ``skip_special_tokens=False`` gets a view that does not.
+        """
+        if ignore_eos:
+            return eos_ignoring_tokenizer(
+                self.tokenizer, skip_special_tokens=skip_special_tokens
+            )
+        if not skip_special_tokens:
+            return unfiltered_tokenizer(self.tokenizer)
+        return self.tokenizer
+
     def generate(
         self,
         prompt: str,
@@ -165,6 +180,7 @@ class MLXLanguageModel:
         stop: list[str] | None = None,
         logits_processors: list | None = None,
         ignore_eos: bool = False,
+        skip_special_tokens: bool = True,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -185,6 +201,8 @@ class MLXLanguageModel:
                 penalty processors.
             ignore_eos: Keep generating past EOS tokens until ``max_tokens``.
                 EOS tokens are counted but not rendered in the text.
+            skip_special_tokens: False renders BOS/PAD/UNK/EOS tokens into the
+                text (vLLM's request field); by default they are left out.
 
         Returns:
             GenerationOutput with generated text and tokens
@@ -205,9 +223,7 @@ class MLXLanguageModel:
             all_processors = list(logits_processors) + all_processors
 
         # Generate text
-        tokenizer = self.tokenizer
-        if ignore_eos:
-            tokenizer = eos_ignoring_tokenizer(tokenizer)
+        tokenizer = self._generation_tokenizer(ignore_eos, skip_special_tokens)
         # Drive ``stream_generate`` (what ``mlx_lm.generate`` wraps) so the ids
         # and the finish reason are the generator's own. Re-encoding the output
         # text instead adds a BOS, drops the stop token and merges tokens that
@@ -249,6 +265,7 @@ class MLXLanguageModel:
         logits_processors: list | None = None,
         prompt_cache=None,
         ignore_eos: bool = False,
+        skip_special_tokens: bool = True,
         **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
@@ -267,6 +284,8 @@ class MLXLanguageModel:
             prompt_cache: Pre-populated KV cache (e.g. from SpecPrefill)
             ignore_eos: Keep generating past EOS tokens until ``max_tokens``.
                 EOS tokens are counted but not rendered in the text.
+            skip_special_tokens: False renders BOS/PAD/UNK/EOS tokens into the
+                text (vLLM's request field); by default they are left out.
 
         Yields:
             StreamingOutput for each generated token
@@ -312,9 +331,7 @@ class MLXLanguageModel:
         if prompt_cache is not None:
             mtp_kwargs["prompt_cache"] = prompt_cache
 
-        tokenizer = self.tokenizer
-        if ignore_eos:
-            tokenizer = eos_ignoring_tokenizer(tokenizer)
+        tokenizer = self._generation_tokenizer(ignore_eos, skip_special_tokens)
 
         for token_count, response in enumerate(
             stream_generate(

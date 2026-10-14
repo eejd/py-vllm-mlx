@@ -28,8 +28,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
-from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
@@ -38,6 +36,7 @@ from .mllm_batch_generator import (
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
+from .utils.tokenizer import boundary_token_ids, streaming_detokenizer
 
 if TYPE_CHECKING:
     from .mllm_specprefill import SpecPrefillOutcome, SpecPrefillRequestConfig
@@ -465,6 +464,7 @@ class MLLMScheduler:
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             logits_processors=kwargs.pop("logits_processors", None),
             ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+            skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
         )
 
         request = MLLMRequest(
@@ -731,18 +731,24 @@ class MLLMScheduler:
             # The request always owns a detokenizer from its first token on, so
             # the final text never has to be rebuilt from the raw ids (which
             # would render a terminator that is the only token generated).
-            # A stop-finishing token is the terminator, not content. Under
-            # ignore_eos an EOS token is generated and counted but does not
-            # finish the request, so it is dropped here instead: the same text
-            # a natural stop gives.
+            # A stop-finishing token is the terminator, not content. Every
+            # other token goes through that detokenizer, which leaves out
+            # BOS/PAD/UNK/EOS (``boundary_token_ids``) unless the request set
+            # ``skip_special_tokens=False``: under ignore_eos an EOS token is
+            # generated and counted but does not finish the request, and is
+            # dropped there, the same text a natural stop gives.
             detok = self._detokenizer_pool.get(request_id)
             if detok is None:
-                detok = NaiveStreamingDetokenizer(tokenizer)
+                detok = streaming_detokenizer(
+                    tokenizer,
+                    (
+                        boundary_token_ids(tokenizer)
+                        if request.sampling_params.skip_special_tokens
+                        else frozenset()
+                    ),
+                )
                 self._detokenizer_pool[request_id] = detok
-            if response.finish_reason == "stop" or (
-                request.sampling_params.ignore_eos
-                and response.token in self.stop_tokens
-            ):
+            if response.finish_reason == "stop":
                 new_text = ""
             else:
                 detok.add_token(response.token)

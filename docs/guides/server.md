@@ -200,6 +200,30 @@ building the prompt, is still a server error (500). The simple engine's
 multimodal route no longer answers with a prompt built from the last user message alone when the chat
 template fails to render the conversation: the failure is the 400 or 500 above.
 
+### Special tokens in the text: `skip_special_tokens`
+
+Like vLLM, the text leaves out the BOS, PAD, UNK and EOS tokens a model generates. Hermes-3 on
+Llama-3.2 ends a raw-prompt document with `<|end_of_text|>` (not a stop token for it) and goes on
+with `<|begin_of_text|>`; the completion text does not contain either, while `usage.completion_tokens`
+still counts them. The token that ends a request is never part of the text. Other special tokens
+(`<|python_tag|>`, `<|channel|>`, `[TOOL_CALLS]`) are kept: the tool-call and reasoning parsers read
+them from the text.
+
+`skip_special_tokens: false` (chat completions, completions, `/v1/responses`) renders the generated
+tokens as they are and skips the fixed cleanup that non-stream responses apply to the text:
+
+```python
+response = client.completions.create(
+    model="default",
+    prompt="The capital of France is",
+    max_tokens=100,
+    extra_body={"skip_special_tokens": False},
+)
+```
+
+Requests that the simple engine decodes through mlx-vlm (image/video/audio inputs, completions on a
+multimodal model) keep mlx-vlm's own detokenizer, which renders what it is fed whatever the field says.
+
 ### Models
 
 ```bash

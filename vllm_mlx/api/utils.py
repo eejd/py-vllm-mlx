@@ -74,7 +74,7 @@ def _clean_gpt_oss_output(text: str) -> str:
     return cleaned.strip()
 
 
-def clean_output_text(text: str) -> str:
+def clean_output_text(text: str, skip_special_tokens: bool = True) -> str:
     """
     Clean model output by removing special tokens.
 
@@ -86,11 +86,13 @@ def clean_output_text(text: str) -> str:
 
     Args:
         text: Raw model output
+        skip_special_tokens: The request's vLLM field. False asks for the text
+            as generated, so nothing is removed or added.
 
     Returns:
         Cleaned text with special tokens removed
     """
-    if not text:
+    if not text or not skip_special_tokens:
         return text
 
     # GPT-OSS channel format — extract final content before general stripping

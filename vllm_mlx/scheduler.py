@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
-from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import (
     MemoryAwarePrefixCache,
@@ -47,6 +46,7 @@ from .request import (
     UnsupportedRequestOption,
 )
 from .utils.mamba_cache import ensure_mamba_support
+from .utils.tokenizer import boundary_token_ids, streaming_detokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -921,9 +921,9 @@ class Scheduler:
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
         self._detokenizer_pool: Dict[str, Any] = {}
-        # The model's EOS ids, read from the tokenizer on first use. Needed to
-        # keep EOS tokens out of the text of ``ignore_eos`` requests.
-        self._eos_token_id_set: Optional[Set[int]] = None
+        # Tokens vLLM never renders (``boundary_token_ids`` and the stop ids),
+        # read from the tokenizer on first use.
+        self._hidden_token_id_set: Optional[frozenset] = None
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -1025,10 +1025,18 @@ class Scheduler:
         return tokenizer
 
     def _get_detokenizer(self, request_id: str) -> Any:
-        """Get or create a streaming detokenizer for a request."""
+        """Get or create a streaming detokenizer for a request.
+
+        It leaves BOS/PAD/UNK/EOS out of the text, unless the request asked for
+        ``skip_special_tokens=False`` (vLLM's request field).
+        """
         if request_id not in self._detokenizer_pool:
-            detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
-            self._detokenizer_pool[request_id] = detok
+            request = self.requests.get(request_id)
+            skip = request is None or request.sampling_params.skip_special_tokens
+            self._detokenizer_pool[request_id] = streaming_detokenizer(
+                self._actual_tokenizer,
+                self._hidden_token_ids() if skip else frozenset(),
+            )
         return self._detokenizer_pool[request_id]
 
     def _cleanup_detokenizer(self, request_id: str) -> None:
@@ -1055,11 +1063,18 @@ class Scheduler:
                     stop_tokens.add(tok.eos_token_ids)
         return stop_tokens
 
-    def _eos_token_ids(self) -> Set[int]:
-        """The model's EOS token ids (cached; the tokenizer does not change)."""
-        if self._eos_token_id_set is None:
-            self._eos_token_id_set = self._get_stop_tokens()
-        return self._eos_token_id_set
+    def _hidden_token_ids(self) -> frozenset:
+        """Ids that never reach the text (cached; the tokenizer does not change).
+
+        BOS/PAD/UNK and every id the scheduler stops on, which includes the EOS
+        ids the processor of a multimodal model declares.
+        """
+        if self._hidden_token_id_set is None:
+            self._hidden_token_id_set = frozenset(
+                boundary_token_ids(self._actual_tokenizer)
+                | {t for t in self._get_stop_tokens() if t is not None}
+            )
+        return self._hidden_token_id_set
 
     def _create_batch_generator(
         self, sampling_params: SamplingParams
@@ -2421,15 +2436,15 @@ class Scheduler:
             # The request always owns a detokenizer from its first token on, so
             # the final text never has to be rebuilt from the raw ids (which
             # would render a terminator that is the only token generated).
-            # A stop-finishing token is the terminator, not content. Under
-            # ignore_eos the EOS token is generated and counted but never
-            # finishes the request, so it is dropped here instead -- the same
-            # text a natural stop would have produced for it.
+            # A stop-finishing token is the terminator, not content. Every
+            # other token goes through that detokenizer, which leaves out
+            # BOS/PAD/UNK/EOS (``boundary_token_ids``) unless the request set
+            # ``skip_special_tokens=False``: under ignore_eos an EOS token is
+            # generated and counted but never finishes the request, and is
+            # dropped there -- the same text a natural stop would have
+            # produced for it.
             detok = self._get_detokenizer(request_id)
-            if response.finish_reason == "stop" or (
-                request.sampling_params.ignore_eos
-                and response.token in self._eos_token_ids()
-            ):
+            if response.finish_reason == "stop":
                 new_text = ""
             else:
                 detok.add_token(response.token)

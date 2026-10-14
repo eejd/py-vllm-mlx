@@ -907,6 +907,16 @@ def _coerce_logit_bias(logit_bias: dict[str, float]) -> dict[int, float]:
     return coerced
 
 
+def _attach_skip_special_tokens(kwargs: dict, request) -> None:
+    """Pass vLLM's ``skip_special_tokens=False`` on to the engine.
+
+    The engines leave BOS/PAD/UNK/EOS out of the text by default, as vLLM does
+    (its default is true), so only the opt-out has to reach them.
+    """
+    if getattr(request, "skip_special_tokens", True) is False:
+        kwargs["skip_special_tokens"] = False
+
+
 def _attach_logit_bias_processor(
     chat_kwargs: dict, logit_bias: dict[str, float] | None
 ):
@@ -952,6 +962,7 @@ def _prepare_chat_completion_invocation(
     _attach_logit_bias_processor(chat_kwargs, getattr(request, "logit_bias", None))
     if getattr(request, "ignore_eos", False):
         chat_kwargs["ignore_eos"] = True
+    _attach_skip_special_tokens(chat_kwargs, request)
 
     if has_media:
         chat_kwargs["images"] = images if images else None
@@ -3059,6 +3070,7 @@ def _responses_request_to_chat_request(
         top_p=request.top_p,
         max_tokens=request.max_output_tokens,
         ignore_eos=request.ignore_eos,
+        skip_special_tokens=request.skip_special_tokens,
         stream=False,
         tools=tools,
         tool_choice=request.tool_choice,
@@ -3233,6 +3245,7 @@ def _prepare_responses_request(
     }
     if chat_request.ignore_eos:
         chat_kwargs["ignore_eos"] = True
+    _attach_skip_special_tokens(chat_kwargs, chat_request)
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         chat_request.chat_template_kwargs
     )
@@ -3291,7 +3304,11 @@ async def _run_responses_request(
     )
 
     output_items = _build_responses_output_items(
-        clean_output_text(cleaned_text) if cleaned_text else None,
+        (
+            clean_output_text(cleaned_text, chat_request.skip_special_tokens)
+            if cleaned_text
+            else None
+        ),
         reasoning_text,
         tool_calls,
     )
@@ -3743,7 +3760,7 @@ async def _stream_responses_request(
     )
     final_text = accumulated_text
     if cleaned_text is not None and not final_text and not tool_calls:
-        final_text = clean_output_text(cleaned_text)
+        final_text = clean_output_text(cleaned_text, chat_request.skip_special_tokens)
 
     reasoning_item = None
     if reasoning_item_id is not None:
@@ -6546,6 +6563,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             )
             if getattr(request, "ignore_eos", False):
                 generate_kwargs["ignore_eos"] = True
+            _attach_skip_special_tokens(generate_kwargs, request)
             if request.specprefill is not None:
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
@@ -6838,7 +6856,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 ChatCompletionChoice(
                     message=AssistantMessage(
                         content=(
-                            clean_output_text(cleaned_text) if cleaned_text else None
+                            clean_output_text(cleaned_text, request.skip_special_tokens)
+                            if cleaned_text
+                            else None
                         ),
                         reasoning=reasoning_text,
                         tool_calls=tool_calls,
@@ -7992,6 +8012,7 @@ async def stream_completion(
     )
     if getattr(request, "ignore_eos", False):
         generate_kwargs["ignore_eos"] = True
+    _attach_skip_special_tokens(generate_kwargs, request)
     if request.specprefill is not None:
         generate_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
