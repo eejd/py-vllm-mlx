@@ -842,6 +842,28 @@ class SimpleEngine(BaseEngine):
 
         self._model.load()
 
+    def _load_specprefill_draft(self) -> None:
+        """Load the SpecPrefill scoring model.  Runs on the generation worker.
+
+        MLX streams are thread-local, so the draft's buffers can only be
+        evaluated on the thread that built them: loading it on the event loop
+        and scoring on the worker fails every request with "There is no
+        Stream(gpu, N) in current thread".
+        """
+        try:
+            from mlx_lm import load as mlx_lm_load
+
+            self._draft_model, _ = mlx_lm_load(self._specprefill_draft_model_path)
+            logger.info(
+                "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
+                self._specprefill_draft_model_path,
+                self._specprefill_threshold,
+                self._specprefill_keep_pct * 100,
+            )
+        except Exception as e:
+            logger.error("SpecPrefill: draft model load failed: %s", e)
+            self._draft_model = None
+
     def _uses_default_prepare_for_start(self) -> bool:
         """Return True when prepare_for_start is the class implementation."""
         method = getattr(self.prepare_for_start, "__func__", None)
@@ -894,23 +916,13 @@ class SimpleEngine(BaseEngine):
                     "Deferring MLLM TextModel construction until a non-draft request"
                 )
 
-            # Load SpecPrefill draft model (small model for importance scoring)
+            # Load SpecPrefill draft model (small model for importance scoring).
+            # On the generation worker, like the target model: score_tokens runs
+            # there, and the draft's buffers belong to the thread that loaded them.
             if self._specprefill_enabled and self._specprefill_draft_model_path:
-                try:
-                    from mlx_lm import load as mlx_lm_load
-
-                    self._draft_model, _ = mlx_lm_load(
-                        self._specprefill_draft_model_path
-                    )
-                    logger.info(
-                        "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
-                        self._specprefill_draft_model_path,
-                        self._specprefill_threshold,
-                        self._specprefill_keep_pct * 100,
-                    )
-                except Exception as e:
-                    logger.error("SpecPrefill: draft model load failed: %s", e)
-                    self._draft_model = None
+                await run_blocking_startup_work(
+                    self._load_specprefill_draft, executor=self._generation_worker()
+                )
 
             # Warn if MTP is enabled without continuous-batching and text routing not available
             if self._mtp and (not self._is_mllm or self._text_model is None):
