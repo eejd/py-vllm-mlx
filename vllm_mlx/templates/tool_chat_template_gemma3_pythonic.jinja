@@ -1,0 +1,151 @@
+{#- SPDX-License-Identifier: Apache-2.0 -#}
+{#- SPDX-FileCopyrightText: Copyright contributors to the vLLM project -#}
+{#-
+  Tool-calling chat template for Gemma 3 (google/gemma-3-*-it and the mlx-community
+  quantizations), whose own template ignores the OpenAI `tools=` argument.
+
+  Derived from vLLM's examples/tool_chat_template_gemma3_pythonic.jinja
+  (https://github.com/vllm-project/vllm, Apache-2.0, Copyright contributors to the vLLM
+  project). Changes made in this fork (vllm-mlx):
+    * WITHOUT tools the output is byte-identical to Gemma 3's own template (the
+      `<bos>` is rendered, as there), so a server started with this template renders
+      requests that carry no tools exactly as it would without it. Only the tools
+      branch differs from the stock template, and it is vLLM's prompt text;
+    * `<bos>` stays in the template, as in Gemma 3's own: SimpleEngine and mlx-lm do not
+      add a second one when the prompt already starts with it, and the multimodal
+      batching path (which Gemma 3 takes) tokenizes without special tokens and needs
+      it. (The text-only batching scheduler encodes with default special tokens and
+      would double the BOS of any template that renders one, Gemma's own included.)
+    * the keyword arguments of an assistant `tool_calls` entry are separated by `, `.
+      Upstream sets its `first` flag inside the loop, where Jinja scopes it to one
+      iteration, so the separator never rendered and history showed the model
+      `f(a=1b="x")`, which neither the model nor the parser can read;
+    * `tools` is tested for truthiness (`tools=[]` adds no tools prompt), an assistant
+      message whose `tool_calls` is empty or null is a plain message (in the
+      alternation check too, where upstream's `selectattr("tool_calls", "undefined")`
+      skipped it and so rejected the conversation), and `arguments` that arrive as a
+      string (JSON the server could not parse) are rendered as one JSON string instead
+      of being iterated character by character.
+  Use with `--tool-call-parser pythonic` (alias `gemma3_pythonic`).
+-#}
+{#- Begin-of-sequence token to start the model prompt -#}
+{{ bos_token }}
+{#- Extracts the system message. Gemma does not support system messages so it will be prepended to first user message. -#}
+{%- if messages[0]['role'] == 'system' -%}
+    {%- if messages[0]['content'] is string -%}
+        {%- set first_user_prefix = messages[0]['content'] + '\n\n' -%}
+    {%- else -%}
+        {%- set first_user_prefix = messages[0]['content'][0]['text'] + '\n\n' -%}
+    {%- endif -%}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set first_user_prefix = "" -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+{#- Set tools to none if not defined for this ChatCompletion request (helps avoid errors later) -#}
+{%- if not tools is defined %}
+    {%- set tools = none %}
+{%- endif %}
+{#- Validate alternating user/assistant messages (excluding 'tool' messages and ones with tool_calls) -#}
+{%- for message in loop_messages | rejectattr("role", "equalto", "tool") | rejectattr("tool_calls") -%}
+    {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}
+        {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}
+    {%- endif -%}
+{%- endfor -%}
+
+{#- Main loop over all messages in the conversation history -#}
+{%- for message in loop_messages -%}
+    {#- Normalize roles for model prompt formatting -#}
+    {%- if (message['role'] == 'assistant') -%}
+        {%- set role = "model" -%}
+    {%- elif (message['role'] == 'tool') -%}
+        {%- set role = "user" -%}
+    {%- else -%}
+        {%- set role = message['role'] -%}
+    {%- endif -%}
+    {#- Mark the start of a message block with the appropriate role -#}
+    {{ '<start_of_turn>' + role + '\n' -}}
+
+    {#- Insert system message content (if present) at the beginning of the first message. -#}
+    {%- if loop.first -%}
+        {{ first_user_prefix }}
+        {#- Append system message with tool information if using tools in message request. -#}
+        {%- if tools -%}
+            {{- "Tools (functions) are available. If you decide to invoke one or more of the tools, you must respond with a python list of the function calls.\n" -}}
+            {{- "Example Format: [func_name1(params_name1=params_value1, params_name2=params_value2...), func_name2(params)] \n" -}}
+            {{- "Do not use variables. DO NOT USE MARKDOWN SYNTAX. You SHOULD NOT include any other text in the response if you call a function. If none of the functions can be used, point it out. If you lack the parameters required by the function, also point it out.\n" -}}
+            {{- "Here is a list of functions in JSON format that you can invoke.\n" -}}
+            {{- tools | tojson(indent=4) -}}
+            {{- "\n\n" -}}
+        {%- endif -%}
+    {%- endif -%}
+
+    {#- Format model tool calls (turns where model indicates they want to call a tool) -#}
+    {%- if message.tool_calls -%}
+        {#- Opening bracket for tool call list. -#}
+        {{- '[' -}}
+        {#- For each tool call -#}
+        {%- for tool_call in message.tool_calls -%}
+            {#- Get tool call function. -#}
+            {%- if tool_call.function is defined -%}
+                {%- set tool_call = tool_call.function -%}
+            {%- endif -%}
+            {#- Function name & opening parenthesis. -#}
+            {{- tool_call.name + '(' -}}
+
+            {#-- Handle arguments as list (positional) or dict (named) --#}
+            {#-- Named arguments (dict) --#}
+            {%- if tool_call.arguments is iterable and tool_call.arguments is mapping -%}
+                {%- for key, val in tool_call.arguments.items() -%}
+                    {%- if not loop.first %}, {% endif -%}
+                    {{ key }}={{ val | tojson }}
+                {%- endfor -%}
+            {#-- Positional arguments (list) --#}
+            {%- elif tool_call.arguments is iterable and tool_call.arguments is not string -%}
+                {{- tool_call.arguments | map('tojson') | join(', ') -}}
+            {#-- Fallback: single positional value --#}
+            {%- else -%}
+                {{- tool_call.arguments | tojson -}}
+            {#-- Closing parenthesis. --#}
+            {%- endif -%}
+                {{- ')' -}}
+            {#-- If more than one tool call, place comma and move to formatting next tool call --#}
+            {%- if not loop.last -%}, {% endif -%}
+        {%- endfor -%}
+        {#- Closing bracket for tool call list. -#}
+        {{- ']' -}}
+    {%- endif -%}
+
+    {#- Tool response start tag (for messages from a tool) -#}
+    {%- if (message['role'] == 'tool') -%}
+        {{ '<tool_response>\n' -}}
+    {%- endif -%}
+
+    {#- Render the message content: handle plain string or multimodal content like image/text -#}
+    {%- if message['content'] is string -%}
+        {{ message['content'] | trim }}
+    {%- elif message['content'] is iterable -%}
+        {%- for item in message['content'] -%}
+            {%- if item['type'] == 'image' -%}
+                {{ '<start_of_image>' }}
+            {%- elif item['type'] == 'text' -%}
+                {{ item['text'] | trim }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{ raise_exception("Invalid content type") }}
+    {%- endif -%}
+
+    {#- Tool response end tag -#}
+    {%- if (message['role'] == 'tool') -%}
+        {{ '</tool_response>' -}}
+    {%- endif -%}
+
+    {#- Mark end of a single turn -#}
+    {{ '<end_of_turn>\n' }}
+{%- endfor -%}
+
+{#- If generation is to be triggered, add model prompt prefix -#}
+{%- if add_generation_prompt -%}
+    {{'<start_of_turn>model\n'}}
+{%- endif -%}

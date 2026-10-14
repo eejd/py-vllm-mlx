@@ -47,6 +47,8 @@ from .mllm_specprefill import (
     request_eligibility_reason,
     run_media_specprefill,
 )
+from .request import ERROR_KIND_PREPROCESSING
+from .utils.tokenizer import resolve_add_special_tokens
 from .vision_embedding_cache import VisionEmbeddingCache
 
 logger = logging.getLogger(__name__)
@@ -224,6 +226,10 @@ class MLLMBatchRequest:
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
     mllm_draft: bool = False
+    # Request kind for tokenization (vLLM ``add_special_tokens``): False for a
+    # prompt the chat template already rendered, None for a raw completion
+    # prompt (BOS added unless the prompt already starts with it).
+    add_special_tokens: Optional[bool] = None
     # Extra logits processors (e.g. JSON schema constrained decoding).
     # Merged with built-in repetition/presence penalty processors in
     # ``_prefill_batch``.
@@ -293,6 +299,9 @@ class MLLMBatchResponse:
     mtp_attempted: bool = False  # True when the primary step attempted MTP
     mtp_attempted_count: int = 0  # Number of draft tokens attempted
     specprefill_outcome: Optional[SpecPrefillOutcome] = None
+    # With finish_reason "error": ERROR_KIND_PREPROCESSING when the request's
+    # inputs could not be preprocessed, None for a failure while generating.
+    error_kind: Optional[str] = None
 
 
 @dataclass
@@ -1128,7 +1137,7 @@ class MLLMBatchGenerator:
         ):
             return
 
-        from mlx_vlm.utils import prepare_inputs
+        from .utils.vlm_inputs import prepare_inputs
 
         tic = time.perf_counter()
 
@@ -1201,6 +1210,11 @@ class MLLMBatchGenerator:
             audio=all_audio if all_audio else None,
             prompts=request.prompt,
             image_token_index=image_token_index,
+            add_special_tokens=resolve_add_special_tokens(
+                getattr(self.processor, "tokenizer", self.processor),
+                request.prompt,
+                request.add_special_tokens,
+            ),
         )
 
         request.input_ids = inputs.get("input_ids")
@@ -2000,11 +2014,15 @@ class MLLMBatchGenerator:
 
         tic = time.perf_counter()
 
-        # Preprocess all requests (per-request error handling)
+        # Preprocess all requests (per-request error handling).  Only a failure
+        # of the inputs themselves is the client's; once they are preprocessed,
+        # a failure (rope derivation) is ours.
         failed_requests = []
         for req in requests:
+            failure_kind = ERROR_KIND_PREPROCESSING
             try:
                 self._preprocess_request(req)
+                failure_kind = None
                 req.rope_deltas = self._derive_request_rope_deltas(req)
                 self._record_prompt_tokens(req)
             except Exception as e:
@@ -2012,11 +2030,11 @@ class MLLMBatchGenerator:
                     f"Failed to preprocess request {req.request_id}: "
                     f"{type(e).__name__}: {e}"
                 )
-                failed_requests.append(req)
+                failed_requests.append((req, failure_kind))
 
         # Remove failed requests from batch and create error responses
         if failed_requests:
-            for req in failed_requests:
+            for req, failure_kind in failed_requests:
                 requests.remove(req)
                 self._pending_error_responses.append(
                     MLLMBatchResponse(
@@ -2025,6 +2043,7 @@ class MLLMBatchGenerator:
                         token=0,
                         logprobs=mx.zeros(1),
                         finish_reason="error",
+                        error_kind=failure_kind,
                         specprefill_outcome=req.specprefill_outcome,
                     )
                 )
@@ -3964,6 +3983,7 @@ def install_chunked_prefill_mllm(
                                         token=0,
                                         logprobs=mx.zeros(1),
                                         finish_reason="error",
+                                        error_kind=ERROR_KIND_PREPROCESSING,
                                     )
                                 )
                                 continue
@@ -4211,9 +4231,13 @@ def install_chunked_prefill_mllm(
                     break
 
             if text_only_req is not None:
+                # Only a failure of the inputs themselves is the client's; once
+                # they are preprocessed, a failure (rope derivation) is ours.
+                failure_kind = ERROR_KIND_PREPROCESSING
                 try:
                     # Preprocess to get input_ids
                     batch_gen._preprocess_request(text_only_req)
+                    failure_kind = None
                     text_only_req.rope_deltas = batch_gen._derive_request_rope_deltas(
                         text_only_req
                     )
@@ -4230,6 +4254,7 @@ def install_chunked_prefill_mllm(
                             token=0,
                             logprobs=mx.zeros(1),
                             finish_reason="error",
+                            error_kind=failure_kind,
                             specprefill_outcome=text_only_req.specprefill_outcome,
                         )
                     )

@@ -327,9 +327,10 @@ async def test_a_complete_call_then_an_unterminated_one_keeps_the_call_and_relea
     assert calls == ["echo_args"]
     assert "".join(texts) == '; {"name": "echo_args", "parame'
     assert TAG not in "".join(texts)
-    # the chat stream re-parses only when no call went out, so it logs nothing here
+    # every path logs it once, chat stream included
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warnings) == (0 if site == "chat" else 1)
+    assert len(warnings) == 1
+    assert "1 complete call(s)" in warnings[0].getMessage()
 
 
 @pytest.mark.parametrize("site", SITES)
@@ -368,3 +369,34 @@ async def test_a_tag_repeated_after_the_separator_is_another_call(
 
     assert calls == ["echo_args", "echo_args"]
     assert texts == []
+
+
+@pytest.mark.parametrize("site", SITES)
+@pytest.mark.parametrize("finish_on_last_delta", FINISH_ON)
+@pytest.mark.parametrize(
+    "deltas,complete,shown",
+    [
+        ([TAG], 0, ""),
+        (["Hi ", TAG], 0, "Hi "),
+        ([TAG, COMPLETE, " ", TAG], 1, ""),
+    ],
+    ids=["tag-only", "text-then-tag", "call-then-tag"],
+)
+@pytest.mark.anyio
+async def test_a_lone_tag_at_the_end_of_generation_is_a_cut_off_call_and_logged_once(
+    monkeypatch, caplog, site, finish_on_last_delta, deltas, complete, shown
+):
+    """The tag alone (nothing, not even ``{``, after it) is the start of a call that never
+    came: the stripped text is released as content and every path says so."""
+    engine = _engine(deltas, "length", finish_on_last_delta=finish_on_last_delta)
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.tool_parsers"):
+        texts, calls, _ = await _run(site, monkeypatch, engine)
+
+    assert len(calls) == complete
+    # (whitespace between a call and the tag may stream; the whole text strips it)
+    assert "".join(texts).strip() == shown.strip()
+    assert TAG not in "".join(texts)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert f"{complete} complete call(s)" in warnings[0]
