@@ -94,6 +94,14 @@ class Recorder:
         assert not isinstance(prompt, str), "mlx-lm must be handed ids, not a string"
         return prompt.tolist() if hasattr(prompt, "tolist") else list(prompt)
 
+    def patched(self):
+        """Both routes: ``MLXLanguageModel.generate`` drives whichever mlx-lm
+        entry point the checkout uses (``generate``, or ``stream_generate`` once
+        it counts the ids itself), so a stub must cover the pair."""
+        return patch.multiple(
+            "mlx_lm", generate=self.generate, stream_generate=self.stream_generate
+        )
+
     def stream_generate(self, _model, _tokenizer, *, prompt, **_kwargs):
         self.prompts.append(self._ids(prompt))
         yield SimpleNamespace(text="hi.", token=ord("h"), finish_reason="stop")
@@ -146,7 +154,7 @@ async def test_stream_chat_feeds_and_counts_the_reference_ids(renders_bos):
 async def test_chat_feeds_and_counts_the_reference_ids(renders_bos):
     engine, tokenizer = _engine(renders_bos)
     recorder = Recorder()
-    with patch("mlx_lm.generate", recorder.generate):
+    with recorder.patched():
         output = await engine.chat(MESSAGES, max_tokens=4, temperature=0.0)
     assert recorder.prompts == [reference_ids(tokenizer)]
     assert output.prompt_tokens == len(reference_ids(tokenizer))
@@ -158,7 +166,7 @@ async def test_stream_and_non_stream_chat_agree(renders_bos):
     streaming, non_streaming = Recorder(), Recorder()
     with patch("mlx_lm.stream_generate", streaming.stream_generate):
         streamed = await _last(engine.stream_chat(MESSAGES, max_tokens=4))
-    with patch("mlx_lm.generate", non_streaming.generate):
+    with non_streaming.patched():
         plain = await engine.chat(MESSAGES, max_tokens=4)
     assert streaming.prompts == non_streaming.prompts
     assert streamed.prompt_tokens == plain.prompt_tokens
@@ -293,6 +301,113 @@ async def test_mllm_engine_text_route_feeds_and_counts_the_reference_ids(renders
     assert outputs[-1].prompt_tokens == len(reference_ids(tokenizer))
 
 
+SYSTEM = {"role": "system", "content": "Be brief"}
+
+
+def _mllm_text_engine(renders_bos):
+    tokenizer = FakeTokenizer(renders_bos)
+    engine = SimpleEngine("test-model", force_mllm=True)
+    engine._loaded = True
+    engine._text_model = FakeModel()
+    engine._text_tokenizer = tokenizer
+    engine._supports_system_kv_cache = True
+    engine._system_kv_cache_enabled = True
+    return engine, tokenizer
+
+
+async def _text_route(engine, messages):
+    return [
+        chunk
+        async for chunk in engine._stream_generate_text(
+            messages, max_tokens=4, temperature=0.0, top_p=1.0
+        )
+    ]
+
+
+def _system_prefix_len(tokenizer, renders_bos):
+    prefix = (
+        BOS_TEXT if renders_bos else ""
+    ) + "<|im_start|>system\nBe brief<|im_end|>\n"
+    return len(tokenizer.encode(prefix, add_special_tokens=False))
+
+
+@TEMPLATES
+async def test_mllm_text_route_system_kv_cache_keeps_working_on_a_bos_adding_tokenizer(
+    renders_bos,
+):
+    # The system prefix is tokenized as a rendered chat prompt, like the full
+    # prompt: with the tokenizer's BOS added to the prefix only, the prefix is no
+    # longer a token prefix of the prompt and the cache silently switches itself
+    # off (no snapshot, no hit, the whole prompt prefilled every time).
+    engine, tokenizer = _mllm_text_engine(renders_bos)
+    messages = [SYSTEM, *MESSAGES]
+    reference = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+    suffix = reference[_system_prefix_len(tokenizer, renders_bos) :]
+    recorder = Recorder()
+    with (
+        patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
+        patch("mlx_lm.models.cache.make_prompt_cache", return_value=[FakeCache()]),
+        patch("mlx_lm.stream_generate", recorder.stream_generate),
+    ):
+        miss = await _text_route(engine, messages)
+        hit = await _text_route(engine, messages)
+    assert engine._system_kv_cache_stats["stores"] == 1
+    assert engine._system_kv_cache_stats["hits"] == 1
+    # mlx-lm is handed only what the snapshot does not cover, both times ...
+    assert recorder.prompts == [suffix, suffix]
+    # ... and the request is still billed for the whole prompt.
+    assert miss[-1].prompt_tokens == hit[-1].prompt_tokens == len(reference)
+
+
+@pytest.mark.parametrize("with_system", [False, True], ids=["no-system", "system-kv"])
+@TEMPLATES
+async def test_mllm_text_route_specprefill_failure_resends_the_counted_ids(
+    renders_bos, with_system
+):
+    # SpecPrefill dies after the system snapshot was taken: the retry is a plain
+    # decode of the whole prompt on a fresh cache, fed the ids that were counted
+    # (a string would be tokenized again by mlx-lm's own BOS rule).
+    engine, tokenizer = _mllm_text_engine(renders_bos)
+    engine._draft_model = object()
+    engine._specprefill_threshold = 0
+    messages = [SYSTEM, *MESSAGES] if with_system else MESSAGES
+    reference = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True
+    )
+    recorder = Recorder()
+    with (
+        patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
+        patch("mlx_lm.models.cache.make_prompt_cache", return_value=[FakeCache()]),
+        patch("vllm_mlx.specprefill.score_tokens", side_effect=RuntimeError("boom")),
+        patch("vllm_mlx.specprefill.cleanup_rope"),
+        patch("mlx_lm.stream_generate", recorder.stream_generate),
+    ):
+        outputs = await _text_route(engine, messages)
+    assert recorder.prompts == [reference]
+    assert outputs[-1].prompt_tokens == len(reference)
+
+
+async def test_stream_that_ends_unfinished_counts_the_prompt_by_request_kind():
+    # A stream that never reports a prompt size and stops before its last chunk
+    # is closed with a final chunk whose count is re-derived from the prompt:
+    # by the same kind it was generated with.
+    engine, _ = _engine(renders_bos=False)
+
+    def silent_stream(**_kwargs):
+        yield SimpleNamespace(text="a", token=ord("a"), finished=False)
+
+    engine._model.stream_generate = silent_stream
+    rendered = "<|im_start|>user\nhello<|im_end|>\n"
+    chat = await _last(
+        engine.stream_generate(rendered, max_tokens=4, add_special_tokens=False)
+    )
+    raw = await _last(engine.stream_generate(RAW, max_tokens=4))
+    assert chat.prompt_tokens == len(rendered)
+    assert raw.prompt_tokens == len(RAW) + 1
+
+
 class TestModelWrapper:
     """``MLXLanguageModel`` on its own: the kind arrives as ``add_special_tokens``."""
 
@@ -314,6 +429,6 @@ class TestModelWrapper:
         model.tokenizer = SimpleNamespace(
             bos_token=BOS_TEXT, encode=FakeTokenizer(False).encode
         )
-        with patch("mlx_lm.generate", recorder.generate):
+        with recorder.patched():
             model.chat(MESSAGES, max_tokens=2)
         assert recorder.prompts[0][0] == BOS_ID
