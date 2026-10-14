@@ -40,7 +40,9 @@ from vllm_mlx.utils.tokenizer import encode_prompt, resolve_add_special_tokens
 from vllm_mlx.utils.vlm_inputs import prepare_inputs
 from vllm_mlx.utils.mistral_tokenizer import (
     adopt_fast_tokenizer,
+    drop_default_system_prompt,
     holds_mistral_common_tokenizer,
+    mentions_default_system_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -418,6 +420,29 @@ def _serialize_tool_messages_gemma_native(messages: list[dict]) -> list[dict]:
             pending_outputs.append(_stringify_message_content(msg.get("content", "")))
             continue
 
+        if (
+            role == "user"
+            and pending_outputs
+            and (msg.get("content") is None or isinstance(msg["content"], (str, list)))
+        ):
+            # A tool result followed directly by the user's next message: one user turn.
+            # Two consecutive user turns are refused by Gemma's alternation check. The
+            # message keeps its own shape: text gets the block prepended, a list of
+            # parts (images, video, audio) gets it as a leading text part, and a turn
+            # with no content becomes the block alone.
+            body = "\n".join(pending_outputs)
+            pending_outputs.clear()
+            block = f"```tool_output\n{body}\n```"
+            content = msg.get("content")
+            if isinstance(content, str):
+                merged: object = f"{block}\n\n{content}" if content else block
+            elif isinstance(content, list):
+                merged = [{"type": "text", "text": block}, *content]
+            else:
+                merged = block
+            out.append({**msg, "content": merged})
+            continue
+
         _flush_outputs()
 
         tool_calls = msg.get("tool_calls")
@@ -510,6 +535,30 @@ def _until_stop_sequence(chunks, stop: list[str] | None):
             break
 
 
+def _generation_tokens(chunk, previous: int) -> int:
+    """Tokens generated so far, as mlx_vlm counts them.
+
+    ``stream_generate`` yields one chunk per decoded token plus a final chunk
+    that only flushes the detokenizer, so the number of chunks is not the
+    number of tokens (it is one too many at a length stop). ``generation_tokens``
+    is the model's own count: it includes the token that ended the generation,
+    which is how vLLM counts ``len(token_ids)``. A chunk without it (a custom
+    ``stream_generate``) falls back to one more than before.
+    """
+    count = getattr(chunk, "generation_tokens", None)
+    return count if isinstance(count, int) else previous + 1
+
+
+def _mllm_finish_reason(result) -> str:
+    """``length`` when mlx_vlm ended the generation at ``max_tokens``, else ``stop``.
+
+    mlx_vlm's last chunk / ``GenerationResult`` carries the reason; reporting a
+    fixed ``stop`` made a reply cut at the cap look complete (vLLM and the
+    ``/v1/completions`` route say ``length``).
+    """
+    return "length" if getattr(result, "finish_reason", None) == "length" else "stop"
+
+
 def _stream_mllm_generated_outputs(
     *,
     stream_generate_fn,
@@ -542,9 +591,11 @@ def _stream_mllm_generated_outputs(
         **draft_kwargs,
         **generation_kwargs,
     )
+    generated_text = ""
     for chunk in _until_stop_sequence(chunks, stop):
         last_chunk = chunk
-        token_count += 1
+        generated_text += _chunk_text(chunk)
+        token_count = _generation_tokens(chunk, token_count)
         yield MLLMOutput(
             text=_chunk_text(chunk),
             finish_reason=None,
@@ -552,9 +603,14 @@ def _stream_mllm_generated_outputs(
             completion_tokens=token_count,
         )
 
+    finish_reason = (
+        "stop"
+        if stop and any(seq in generated_text for seq in stop)
+        else _mllm_finish_reason(last_chunk)
+    )
     yield MLLMOutput(
         text="",
-        finish_reason="stop",
+        finish_reason=finish_reason,
         prompt_tokens=getattr(last_chunk, "prompt_tokens", 0) if last_chunk else 0,
         completion_tokens=token_count,
         **draft_metrics(),
@@ -1708,6 +1764,14 @@ class MLXMultimodalLM:
                     get_model_path(self.model_name),
                     eos_token_ids=getattr(self.model.config, "eos_token_id", None),
                 )
+            # ... and whose template's default system prompt mistral-common does not
+            # render (see drop_default_system_prompt).
+            if mentions_default_system_message(self.processor):
+                from mlx_vlm.utils import get_model_path
+
+                drop_default_system_prompt(
+                    self.processor, get_model_path(self.model_name)
+                )
             apply_chat_template_override(self.processor, self._chat_template)
             self.config = load_config(self.model_name)
             if self.draft_model_path:
@@ -2137,7 +2201,7 @@ class MLXMultimodalLM:
         if hasattr(result, "text"):
             return MLLMOutput(
                 text=result.text,
-                finish_reason="stop",
+                finish_reason=_mllm_finish_reason(result),
                 prompt_tokens=getattr(result, "prompt_tokens", 0),
                 completion_tokens=getattr(result, "generation_tokens", 0),
             )
@@ -2447,7 +2511,7 @@ class MLXMultimodalLM:
 
         return MLLMOutput(
             text=output_text,
-            finish_reason="stop",
+            finish_reason=_mllm_finish_reason(result),
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
             **draft_metrics,
@@ -2547,6 +2611,84 @@ class MLXMultimodalLM:
         ):
             yield chunk
 
+    def _format_chat_prompt(
+        self,
+        chat_messages: list[dict],
+        tools: list[dict] | None,
+        chat_template_kwargs: dict,
+        enable_thinking: bool,
+    ) -> str:
+        """Render ``chat_messages`` through the processor's chat template.
+
+        Used by ``chat``, ``stream_chat`` and ``render_chat_prompt`` so the
+        pre-check of a request renders exactly as the request itself.
+        """
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        # Build template kwargs for tool definitions
+        template_extra_kwargs = {}
+        if tools:
+            template_extra_kwargs["tools"] = tools
+        # Forward any remaining chat_template_kwargs (parity with the text path)
+        template_extra_kwargs.update(chat_template_kwargs)
+
+        try:
+            return get_chat_template(
+                self.processor,
+                chat_messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                **template_extra_kwargs,
+            )
+        except TypeError:
+            # The processor's chat template doesn't accept some forwarded
+            # chat_template_kwargs — drop them and retry (mirror llm.py).
+            for key in chat_template_kwargs:
+                template_extra_kwargs.pop(key, None)
+            return get_chat_template(
+                self.processor,
+                chat_messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                **template_extra_kwargs,
+            )
+
+    def render_chat_prompt(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict | None = None,
+        enable_thinking: bool | None = None,
+    ) -> str:
+        """Render the prompt ``chat`` / ``stream_chat`` would build, without media work.
+
+        Same message preparation and renderer as the request path, with no image,
+        audio or video fetched (a video counts as one placeholder frame), so a
+        template that refuses the conversation raises before any generation starts.
+        """
+        if not self._loaded:
+            self.load()
+        ctk = dict(chat_template_kwargs or {})
+        # ``chat`` defaults enable_thinking to True; a value nested in
+        # chat_template_kwargs wins over the request-level one.
+        if enable_thinking is None:
+            enable_thinking = True
+        if "enable_thinking" in ctk:
+            enable_thinking = ctk.pop("enable_thinking")
+        if not _template_supports_tool_role(self.processor, self.config):
+            messages = _serialize_tool_messages_gemma_native(messages)
+        # Frames are not extracted: one placeholder frame per video is enough for a
+        # template to accept or refuse the conversation's shape.
+        video_frame_counts = {
+            msg_idx: len(inputs)
+            for msg_idx, inputs in self._collect_video_inputs(messages).items()
+        }
+        chat_messages = _build_mllm_chat_messages(
+            messages, all_image_urls=[], video_frame_counts=video_frame_counts
+        )
+        return self._format_chat_prompt(chat_messages, tools, ctk, enable_thinking)
+
     def chat(
         self,
         messages: list[dict],
@@ -2575,7 +2717,6 @@ class MLXMultimodalLM:
             self.load()
 
         from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import get_chat_template
 
         # Extract text, images and audio from messages
         # Build chat_messages for multi-turn support WITH proper image/audio tokens per message
@@ -2696,56 +2837,12 @@ class MLXMultimodalLM:
                 f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
             )
 
-        # Build template kwargs for tool definitions (tools already popped above)
-        template_extra_kwargs = {}
-        if tools:
-            template_extra_kwargs["tools"] = tools
-        # Forward any remaining chat_template_kwargs (parity with the text path)
-        template_extra_kwargs.update(chat_template_kwargs)
-
         # The chat template renders the BOS itself (vLLM: chat prompts are
         # tokenized with add_special_tokens=False).
         prompt_kind = False
-        try:
-            formatted_prompt = get_chat_template(
-                self.processor,
-                chat_messages,
-                add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-                **template_extra_kwargs,
-            )
-        except TypeError:
-            # The processor's chat template doesn't accept some forwarded
-            # chat_template_kwargs — drop them and retry (mirror llm.py).
-            for key in chat_template_kwargs:
-                template_extra_kwargs.pop(key, None)
-            formatted_prompt = get_chat_template(
-                self.processor,
-                chat_messages,
-                add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-                **template_extra_kwargs,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to apply chat template: {e}, using last user message"
-            )
-            # Fallback to last user message if template fails
-            last_user_msg = ""
-            for m in reversed(chat_messages):
-                if m["role"] == "user":
-                    content = m.get("content", "")
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                last_user_msg = item.get("text", "")
-                                break
-                    else:
-                        last_user_msg = content
-                    break
-            formatted_prompt = last_user_msg
-            # Not rendered by the template: a raw prompt, BOS decided by the rule.
-            prompt_kind = None
+        formatted_prompt = self._format_chat_prompt(
+            chat_messages, tools, chat_template_kwargs, enable_thinking
+        )
 
         # Prefix caching with vision embedding support
         # Following LMCache approach: cache vision embeddings to skip encoder on hit
@@ -2902,7 +2999,7 @@ class MLXMultimodalLM:
 
         return MLLMOutput(
             text=output_text,
-            finish_reason="stop",
+            finish_reason=_mllm_finish_reason(result),
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
             **draft_metrics,
@@ -2937,7 +3034,6 @@ class MLXMultimodalLM:
 
         try:
             from mlx_vlm import stream_generate
-            from mlx_vlm.prompt_utils import get_chat_template
         except ImportError:
             # Fallback to non-streaming if stream_generate not available
             output = self.chat(
@@ -3053,56 +3149,12 @@ class MLXMultimodalLM:
         all_images.extend(all_video_frames)
         all_audio = self._prepare_audio(all_audio_inputs) if all_audio_inputs else []
 
-        # Build template kwargs for tool definitions (tools already popped above)
-        template_extra_kwargs = {}
-        if tools:
-            template_extra_kwargs["tools"] = tools
-        # Forward any remaining chat_template_kwargs (parity with the text path)
-        template_extra_kwargs.update(chat_template_kwargs)
-
         # The chat template renders the BOS itself (vLLM: chat prompts are
         # tokenized with add_special_tokens=False).
         prompt_kind = False
-        try:
-            formatted_prompt = get_chat_template(
-                self.processor,
-                chat_messages,
-                add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-                **template_extra_kwargs,
-            )
-        except TypeError:
-            # The processor's chat template doesn't accept some forwarded
-            # chat_template_kwargs — drop them and retry (mirror llm.py).
-            for key in chat_template_kwargs:
-                template_extra_kwargs.pop(key, None)
-            formatted_prompt = get_chat_template(
-                self.processor,
-                chat_messages,
-                add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-                **template_extra_kwargs,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to apply chat template: {e}, using last user message"
-            )
-            # Fallback to last user message if template fails
-            last_user_msg = ""
-            for m in reversed(chat_messages):
-                if m["role"] == "user":
-                    content = m.get("content", "")
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                last_user_msg = item.get("text", "")
-                                break
-                    else:
-                        last_user_msg = content
-                    break
-            formatted_prompt = last_user_msg
-            # Not rendered by the template: a raw prompt, BOS decided by the rule.
-            prompt_kind = None
+        formatted_prompt = self._format_chat_prompt(
+            chat_messages, tools, chat_template_kwargs, enable_thinking
+        )
 
         # Check cache for existing KV state (uses images as cache key)
         from mlx_vlm.models import cache as vlm_cache

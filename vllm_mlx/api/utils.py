@@ -74,7 +74,7 @@ def _clean_gpt_oss_output(text: str) -> str:
     return cleaned.strip()
 
 
-def clean_output_text(text: str) -> str:
+def clean_output_text(text: str, skip_special_tokens: bool = True) -> str:
     """
     Clean model output by removing special tokens.
 
@@ -86,11 +86,13 @@ def clean_output_text(text: str) -> str:
 
     Args:
         text: Raw model output
+        skip_special_tokens: The request's vLLM field. False asks for the text
+            as generated, so nothing is removed or added.
 
     Returns:
         Cleaned text with special tokens removed
     """
-    if not text:
+    if not text or not skip_special_tokens:
         return text
 
     # GPT-OSS channel format — extract final content before general stripping
@@ -622,7 +624,13 @@ def extract_multimodal_content(
                 tool_call_id = msg.get("tool_call_id", "") or ""
             else:
                 tool_call_id = getattr(msg, "tool_call_id", None) or ""
-            tool_content = content if content else ""
+            if isinstance(content, list):
+                # OpenAI allows a tool result as a list of text parts. Templates
+                # concatenate it as a string (``'' + message.content``), which raises
+                # on a list; vLLM flattens the text parts for such templates too.
+                tool_content = _content_to_text(content)
+            else:
+                tool_content = content if content else ""
 
             if preserve_native_format:
                 # Preserve native tool format for models that support it

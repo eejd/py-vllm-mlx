@@ -2942,7 +2942,7 @@ class TestSimpleEngineConcurrency:
             engine._model.model = MagicMock()
             engine._model.tokenizer = MagicMock()
             engine._model.tokenizer.decode = MagicMock(return_value="A")
-            engine._model.tokenizer.eos_token_id = 0
+            engine._model.tokenizer.eos_token_id = 99
 
             outputs = []
             with (

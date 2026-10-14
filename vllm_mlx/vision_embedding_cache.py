@@ -119,10 +119,15 @@ def compute_image_hash(image_path: str) -> str:
 
 
 def compute_images_hash(images: List[str]) -> str:
-    """Compute combined hash for multiple images."""
+    """Compute combined hash for multiple images.
+
+    Order matters: ``[A, B]`` and ``[B, A]`` are different requests (the
+    k-th image fills the k-th placeholder, so the pixels and the prompt tokens
+    differ), and must never share a cache entry.
+    """
     if not images:
         return "no_images"
-    hashes = sorted(compute_image_hash(img) for img in images)
+    hashes = [compute_image_hash(img) for img in images]
     return hashlib.sha256("_".join(hashes).encode()).hexdigest()[:16]
 
 
@@ -250,7 +255,9 @@ class VisionEmbeddingCache:
             input_ids=input_ids,
             attention_mask=attention_mask,
             image_grid_thw=image_grid_thw,
-            extra_kwargs=extra_kwargs or {},
+            # Own the dict: the request that produced it clears its own
+            # extra_kwargs after prefill, which must not empty this entry.
+            extra_kwargs=dict(extra_kwargs) if extra_kwargs else {},
             processing_time=processing_time,
         )
         self._pixel_cache[key] = entry

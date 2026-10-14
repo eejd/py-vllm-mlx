@@ -54,13 +54,13 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--default-temperature` | Default temperature when not specified in request | None |
 | `--default-top-p` | Default top_p when not specified in request | None |
 | `--default-chat-template-kwargs` | Default chat template kwargs applied when request `chat_template_kwargs` is omitted (JSON object) | None |
-| `--chat-template` | Replace the model's chat template: path to a Jinja file, or the template on one line. Not supported with `--models-config` | None |
+| `--chat-template` | Replace the model's chat template: path to a Jinja file, or the template on one line. The package ships tool templates for Phi-4-mini and Hermes-3 (`vllm_mlx.templates`). Not supported with `--models-config` | None |
 | `--max-audio-upload-mb` | Maximum uploaded audio size for `/v1/audio/transcriptions` | 25 |
 | `--max-tts-input-chars` | Maximum text length accepted by `/v1/audio/speech` | 4096 |
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
-| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`, `lfm2`, `minicpm`; see the tool-calling guide for the full list) | None |
+| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`, `lfm2`, `minicpm`, `pythonic`; see the tool-calling guide for the full list) | None |
 | `--models-config` | YAML registry file for multi-model serving | None |
 | `--memory-budget-gb` | Override the registry manager model-weight residency budget in GB. This is not a total runtime-memory limit and does not guarantee prevention of Metal/MLX OOM. | YAML manager budget |
 | `--fp32-matmul-precision` | Precision of float32 matmul, attention and convolution on GPUs with matrix units (Apple M5 and later): `highest` keeps full float32, `high` allows MLX's reduced TF32-class precision. Unset leaves MLX's default and `MLX_ENABLE_TF32` in effect. Half-precision and quantized models with half-precision activations are unaffected. Also accepted by `vllm-mlx bench`. | Unset (MLX default: `high`) |

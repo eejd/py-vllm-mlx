@@ -172,6 +172,9 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: int | None = None
     # vLLM sampling extension: EOS tokens no longer end generation.
     ignore_eos: bool = False
+    # vLLM extension (default true): BOS/PAD/UNK/EOS tokens the model generates
+    # are left out of the text. False renders them.
+    skip_special_tokens: bool = True
     stream: bool = False
     tools: list[ResponseFunctionTool | dict] = Field(default_factory=list)
     tool_choice: str | dict | None = "auto"
@@ -254,6 +257,22 @@ class ResponseInProgressEvent(ResponsesEventBase):
 class ResponseCompletedEvent(ResponsesEventBase):
     type: Literal["response.completed"] = "response.completed"
     response: ResponseObject
+
+
+class ResponseFailedEvent(ResponsesEventBase):
+    """The response failed; ``response.error`` says how (OpenAI ``response.failed``)."""
+
+    type: Literal["response.failed"] = "response.failed"
+    response: ResponseObject
+
+
+class ResponseErrorEvent(ResponsesEventBase):
+    """Stream-level error (OpenAI ``error`` event: ``code``, ``message``, ``param``)."""
+
+    type: Literal["error"] = "error"
+    code: str | None = None
+    message: str
+    param: str | None = None
 
 
 class ResponseOutputItemAddedEvent(ResponsesEventBase):

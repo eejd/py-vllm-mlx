@@ -20,7 +20,7 @@ def _make_scheduler(
     """Create a scheduler with mocked model/tokenizer for unit tests."""
     model = MagicMock()
     tokenizer = MagicMock()
-    tokenizer.encode = lambda x: list(range(len(x.split())))
+    tokenizer.encode = lambda x, **_: list(range(len(x.split())))
     tokenizer.eos_token_id = 0
 
     config = SchedulerConfig(

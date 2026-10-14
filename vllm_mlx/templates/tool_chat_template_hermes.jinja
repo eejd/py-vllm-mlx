@@ -1,0 +1,171 @@
+{#- SPDX-License-Identifier: Apache-2.0 -#}
+{#- SPDX-FileCopyrightText: Copyright contributors to the vLLM project -#}
+{#-
+  Tool-calling chat template for the Hermes family served from checkpoints whose own
+  template is plain ChatML with no tool support (NousResearch/Hermes-3-Llama-3.2-3B
+  and its mlx-community conversions: their template never reads the OpenAI `tools=`
+  argument, so the model is not told that any tool exists).
+
+  Derived from vLLM's examples/tool_chat_template_hermes.jinja
+  (https://github.com/vllm-project/vllm, Apache-2.0, Copyright contributors to the vLLM
+  project), which is the `tool_use` template NousResearch publishes with
+  Hermes-3-Llama-3.1-8B. Changes made in this fork (vllm-mlx):
+    * WITHOUT tools the output is byte-identical to this checkpoint's own template (the
+      branch below is that template, verbatim), so a server started with this template
+      renders requests that carry no tools exactly as it would without it;
+    * no `bos_token` is emitted: vllm-mlx tokenizes the rendered string with special
+      tokens enabled (the model's tokenizer adds `<|begin_of_text|>` itself), and the
+      checkpoint's own template does not emit it either; vLLM tokenizes chat prompts
+      without special tokens, which is why upstream's template starts with it;
+    * every turn ends `<|im_end|>\n` like the ChatML turns around it (upstream leaves
+      the newline off after `tool` and tool-calling assistant turns);
+    * an assistant turn that has both content and `tool_calls` keeps its content
+      (upstream drops it), a `tool_calls` value of null or [] means "no tool calls",
+      and a tool without `parameters` or `description`, or with a nullable (`"type": ["string", "null"]`),
+      typeless or unknown-typed property, renders instead of failing (upstream recurses forever on a
+      string-valued `type` it does not know);
+    * `json_to_python_type` follows the `items` key of an array schema (upstream applies
+      Jinja's `items` filter to the whole schema and renders `list[Union[]]`), and the
+      `Args:` entries of one tool are on separate lines (upstream runs them together);
+    * the tool-call format is the one the Hermes-3 model cards document (the models were
+      trained on it): the instruction is `{"arguments": <args-dict>, "name":
+      <function-name>}` with the pydantic schema listing `arguments` first, replayed calls
+      are written in that order, and a `tool` turn ends `</tool_response>\n<|im_end|>`.
+      vLLM's example (the Hermes-2-Pro format) says `name` first and has no newline;
+      measured on the mlx-community Hermes-3-Llama-3.2-3B-4bit with greedy decoding that
+      order made the model write untagged JSON with typos (`{"name: "echo_args", ...}`)
+      where this one makes it write `<tool_call>{"arguments": ..., "name": ...}`;
+    * the JSON of `arguments` is rendered with the same `tojson` the server's other
+      templates use, and string arguments are passed through unchanged.
+  Use with `--tool-call-parser hermes`.
+-#}
+{%- if not tools -%}
+{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '
+' + message['content'] + '<|im_end|>' + '
+'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
+' }}{% endif %}
+{%- else -%}
+{%- macro json_to_python_type(json_spec) %}
+    {%- set basic_type_map = {
+    "string": "str",
+    "number": "float",
+    "integer": "int",
+    "boolean": "bool",
+    "null": "None"
+} %}
+
+    {%- if basic_type_map[json_spec.type] is defined %}
+        {{- basic_type_map[json_spec.type] }}
+    {%- elif json_spec.type == "array" %}
+        {{- "list[" + (json_to_python_type(json_spec["items"]) if json_spec["items"] is defined else "Any") + "]" }}
+    {%- elif json_spec.type == "object" %}
+        {%- if json_spec.additionalProperties is defined %}
+            {{- "dict[str, " + json_to_python_type(json_spec.additionalProperties) + ']' }}
+        {%- else %}
+            {{- "dict" }}
+        {%- endif %}
+    {%- elif json_spec.type is defined and json_spec.type is not string and json_spec.type is iterable %}
+        {{- "Union[" }}
+        {%- for t in json_spec.type %}
+            {{- json_to_python_type({"type": t}) }}
+            {%- if not loop.last %}
+                {{- "," }}
+            {%- endif %}
+        {%- endfor %}
+        {{- "]" }}
+    {%- else %}
+        {{- "Any" }}
+    {%- endif %}
+{%- endmacro %}
+
+{{- "<|im_start|>system\nYou are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions. Here are the available tools: <tools> " }}
+{%- for tool in tools %}
+    {%- if tool.function is defined %}
+        {%- set tool = tool.function %}
+    {%- endif %}
+    {%- set properties = tool.parameters.properties if tool.parameters and tool.parameters.properties else {} %}
+    {{- '{"type": "function", "function": ' }}
+    {{- '{"name": "' + tool.name + '", ' }}
+    {{- '"description": "' + tool.name + '(' }}
+    {%- for param_name, param_fields in properties|items %}
+        {{- param_name + ": " + json_to_python_type(param_fields) }}
+        {%- if not loop.last %}
+            {{- ", " }}
+        {%- endif %}
+    {%- endfor %}
+    {{- ")" }}
+    {%- if tool.return is defined %}
+        {{- " -> " + json_to_python_type(tool.return) }}
+    {%- endif %}
+    {{- " - " + (tool.description or "") + "\n\n" }}
+    {%- for param_name, param_fields in properties|items %}
+        {%- if loop.first %}
+            {{- "    Args:\n" }}
+        {%- endif %}
+        {{- "        " + param_name + "(" + json_to_python_type(param_fields) + "): " + param_fields.description|trim }}
+        {%- if not loop.last %}
+            {{- "\n" }}
+        {%- endif %}
+    {%- endfor %}
+    {%- if tool.return is defined and tool.return.description is defined %}
+        {{- "\n    Returns:\n        " + tool.return.description }}
+    {%- endif %}
+    {{- '"' }}
+    {{- ', "parameters": ' }}
+    {%- if not properties %}
+        {{- "{}" }}
+    {%- else %}
+        {{- tool.parameters|tojson }}
+    {%- endif %}
+    {{- "}" }}
+    {%- if not loop.last %}
+        {{- "\n" }}
+    {%- endif %}
+{%- endfor %}
+{{- " </tools>" }}
+{{- 'Use the following pydantic model json schema for each tool call you will make: {"properties": {"arguments": {"title": "Arguments", "type": "object"}, "name": {"title": "Name", "type": "string"}}, "required": ["arguments", "name"], "title": "FunctionCall", "type": "object"}\n' }}
+{{- "For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:\n" }}
+{{- "<tool_call>\n" }}
+{{- '{"arguments": <args-dict>, "name": <function-name>}\n' }}
+{{- '</tool_call><|im_end|>\n' }}
+{%- for message in messages %}
+    {%- if message.role == "assistant" and message.tool_calls %}
+        {{- '<|im_start|>assistant' }}
+        {%- if message.content %}
+            {{- '\n' + message.content }}
+        {%- endif %}
+        {%- for tool_call in message.tool_calls %}
+            {{- '\n<tool_call>\n' }}
+            {%- if tool_call.function is defined %}
+                {%- set tool_call = tool_call.function %}
+            {%- endif %}
+            {%- if tool_call.arguments is defined %}
+                {{- '{"arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments|tojson }}
+                {%- endif %}
+                {{- ', "name": "' + tool_call.name + '"' }}
+            {%- else %}
+                {{- '{"name": "' + tool_call.name + '"' }}
+            {%- endif %}
+            {{- '}\n</tool_call>' }}
+        {%- endfor %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or messages[loop.index0 - 1].role != "tool" %}
+            {{- '<|im_start|>tool' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' + (message.content or "") + '\n</tool_response>' }}
+        {%- if loop.last or messages[loop.index0 + 1].role != "tool" %}
+            {{- '\n<|im_end|>\n' }}
+        {%- endif %}
+    {%- else %}
+        {{- '<|im_start|>' + message.role + '\n' + (message.content or "") + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt is not defined or add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}
+{%- endif %}
