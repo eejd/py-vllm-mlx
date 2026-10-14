@@ -98,7 +98,7 @@ RAW = {
         "A\nB",
         "x",
     ),
-    "empty-thought": ("<|channel>thought\n<channel|>", None, None),
+    "empty-thought-no-content": ("<|channel>thought\n<channel|>", None, None),
     "whitespace-at-the-edges": (
         "<|channel>thought\n\n  Think.  \n\n<channel|>\n\n  Answer.  \n\n",
         "Think.",
