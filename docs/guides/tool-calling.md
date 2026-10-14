@@ -75,7 +75,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `qwen` | `qwen3` | Qwen, Qwen3 | `<tool_call>` XML or `[Calling tool:]` |
 | `qwen3_xml` | `qwen3.5`, `qwen3_coder` | Qwen 3.5, Qwen3 Coder | Typed streaming XML |
 | `llama` | `llama3`, `llama4` | Llama 3.x, 4.x | `<\|python_tag\|>` JSON, bare JSON, or `<function=name>` tags |
-| `hermes` | `nous` | Hermes, NousResearch | `<tool_call>` JSON in XML |
+| `hermes` | `nous` | Hermes, NousResearch | `<tool_call>` JSON in XML; Hermes-3-3B needs `--chat-template` (see below) |
 | `deepseek` | `deepseek_v3`, `deepseek_r1` | DeepSeek V3, R1 | Unicode delimiters |
 | `deepseek_v4` | `dsml` | DeepSeek V4 Flash / Flash-0731 | DSML typed parameters |
 | `gemma4` | | Gemma 4 | `<\|tool_call>` call blocks |
@@ -92,6 +92,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `lfm2` | `lfm2.5` | Liquid LFM2, LFM2.5 | `<\|tool_call_start\|>[fn(arg=value)]<\|tool_call_end\|>` Python-call list |
 | `minicpm` | `minicpm5` | MiniCPM5 | `<function name=".."><param name="..">..</param></function>` XML |
 | `phi4_mini_json` | `phi4_mini`, `phi4` | Microsoft Phi-4-mini | `functools[{"name": .., "arguments": {..}}]` JSON list; needs `--chat-template` |
+| `pythonic` | `gemma3_pythonic` | Llama 3.2/4, ToolACE, Gemma 3 | Bare Python list of keyword-only calls `[fn(arg=value), ...]`, no marker; needs a template that shows the tools (`gemma3_pythonic` goes with the shipped Gemma 3 one) |
 
 ## Model Examples
 
@@ -128,6 +129,42 @@ template rejects fail with the template's message:
 mistral-common itself accepts both (it emits the extra system prompt in place, or joins
 consecutive same-role messages with a blank line). Merge such messages in the client; the
 server does not rewrite them.
+
+**System prompt (tekken checkpoints).** A request without a `system` message is prompted
+without one, exactly as mistral-common (and vLLM's `mistral` tokenizer mode, and mlx-lm)
+builds it. Some templates would insert a default system prompt of their own: Ministral 3
+Instruct's is Mistral's `SYSTEM_PROMPT.txt` with the model name filled in and the literal
+text `The current date is {today}.` (and `{yesterday}`) in about 500 tokens, and the
+official Devstral Small 2 template carries a Mistral Vibe prompt. The server empties that
+default at load, so such a request renders as `<s>[INST]...[/INST]`. The log line names
+the checkpoint, the size and the start of what was dropped (`dropped the chat template's
+default system prompt (... characters, starting '...')`) and says how to get it back. A
+request's own `system` message is rendered as before.
+
+> **Ministral 3 Reasoning loses its thinking-format prompt.** The Reasoning templates'
+> default is the prompt that tells the model how to think and answer
+> (`# HOW YOU SHOULD THINK AND ANSWER ...`). It is dropped like the others, as vLLM's
+> `mistral` mode and mistral-common build none, so a Reasoning checkpoint served without
+> a `system` message no longer gets it. Send the model card's `SYSTEM_PROMPT.txt` as the
+> `system` message (fill `{name}`, `{today}`, `{yesterday}` as the card's
+> `load_system_prompt` does), as for vLLM. There is no flag to keep the template's
+> default; `--chat-template` with the checkpoint's own `chat_template.jinja` restores it.
+
+Only a default the template renders under `{% if default_system_message != '' %}` is
+dropped. Templates that render it unconditionally, such as Mistral Small 3.x's
+(`"..." + today + "..."`, with the real date from `strftime_now`), keep it: emptying it
+there would emit an empty `[SYSTEM_PROMPT][/SYSTEM_PROMPT]` block, which mistral-common
+does not build either. Ministral-3-3B at temperature 0 padded optional tool arguments
+(`count: 0, flag: false`) under the template's default prompt and did not under
+mistral-common's.
+
+**Text after a call.** A `[TOOL_CALLS]name[ARGS]{...}` call has no terminator of its own,
+so a model may write prose after the closing brace. The call's arguments are the first
+complete JSON value; the text after it is dropped, streaming and not (as in vLLM,
+vllm-project/vllm#48975). The prose is not returned as content. A call with no name, or
+after `[ARGS]` a name that is not `[A-Za-z0-9_.-]+`, is not returned either. Arguments
+that are not JSON are rejected in a complete response (the call is not returned) but a
+stream has already sent them by the time it can tell, so it carries them as generated.
 
 ### Qwen
 
@@ -250,6 +287,105 @@ The model answers a call with `functools[{"name": ..., "arguments": {...}}]`; th
 parser finds the end of the list with a bracket scan, so arguments containing `]`
 are safe, and a list it cannot fully parse stays in `content`. It streams: each call
 is emitted once, when its list closes.
+Text after the closing `]` (for instance a stray `}` the 4-bit model appends) stays in `content`;
+vLLM's `phi4_mini_json` parser returns `content=None` for any output with a call and so drops it, along
+with any prose, which is why this parser keeps visible what it did not understand.
+
+### Hermes-3 (3B and other plain-ChatML checkpoints)
+
+`NousResearch/Hermes-3-Llama-3.2-3B` and its mlx-community conversions ship a plain ChatML
+template that never reads `tools=` (the 8B and larger Hermes checkpoints carry a `tool_use`
+template; the 3B does not), so the model is not told any tool exists and answers in prose. The package
+ships the Hermes tool template (vLLM's `examples/tool_chat_template_hermes.jinja`, which is the
+`tool_use` template NousResearch publishes, adapted: see the header of the file):
+
+```bash
+TEMPLATE=$(python -c 'import vllm_mlx.templates as t; print(t.HERMES_TOOL_TEMPLATE)')
+vllm-mlx serve mlx-community/Hermes-3-Llama-3.2-3B-4bit \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --chat-template "$TEMPLATE"
+```
+
+The template uses the format the Hermes-3 model cards document (`{"arguments": ..., "name": ...}`
+inside `<tool_call>`, a newline before `<|im_end|>` after tool results), not vLLM's Hermes-2-Pro
+order. Measured on `mlx-community/Hermes-3-Llama-3.2-3B-4bit` (greedy, server output identical to
+`mlx_lm` direct on the same rendered prompt): the Hermes-2-Pro order made the 3B model write untagged
+JSON with typos (`{"name: "echo_args", ...}`, no call); the model-card order makes it write
+`<tool_call>{"arguments": ..., "name": ...}` and nested-object and list arguments parse into correct
+calls, the tool roundtrip answers cleanly. It is still a 3B 4-bit model: it sometimes drops characters
+from values (`<ok>` vanished from a string argument) or answers with untagged JSON, so expect
+unreliable calls (quantbench tool-echo: `object` 3/3 pass, scalars wrong values, `markup_in_value` and
+`code_value` no call).
+
+Requests without tools render byte-for-byte like the checkpoint's own template (tests pin this);
+requests with tools get the `<tools>` system prompt and `<tool_call>` instructions. The template
+emits no `<|begin_of_text|>`: the server tokenizes the rendered prompt with special tokens, so the
+tokenizer adds it (vLLM tokenizes chat prompts without special tokens, which is why upstream's
+template starts with it).
+
+### Templates that ignore tools
+
+The tool parser only reads what the model writes. It is the chat template that tells the model which
+tools exist, and some conversions ship a template that never reads `tools` (Phi-4-mini, Hermes-3-3B and
+Gemma-3 as converted). With `--enable-auto-tool-choice` on, the server renders a probe tool through the
+active template once at startup and logs a WARNING naming the shipped template for the parser (or
+pointing at `--chat-template`) when the probe tool does not appear in the prompt. Without such a template
+the model answers in prose and the request ends with no tool call.
+
+Gemma-3 (`google/gemma-3-*-it` and conversions) is in this group and the package ships no template for it.
+vLLM serves it with `examples/tool_chat_template_gemma3_pythonic.jinja` and its `pythonic` tool parser
+(`[get_weather(city="Paris")]`); vllm-mlx has no `pythonic` parser. Tool results sent back to a Gemma-3
+multimodal model are rendered as Gemma-native ```` ```tool_code ```` / ```` ```tool_output ```` text turns,
+on the batched engine as on the simple one, so a conversation that carries a tool result is served instead
+of failing on the template's role check.
+
+### Pythonic tool calls (Gemma 3, Llama 3.2/4, ToolACE)
+
+These models answer a tool request with nothing but a Python list of keyword-only calls,
+no marker tokens: `[get_weather(city='Paris'), get_time(tz='UTC')]`. The `pythonic`
+parser (a port of vLLM's, same accepted language) reads it:
+
+* the answer is a tool call only when its **first character is `[`**; anything else
+  (including leading whitespace) is plain content, streaming or not;
+* every element must be a call with keyword arguments only and literal values (strings,
+  numbers, `True`/`False`/`None` or `true`/`false`/`null`, lists, tuples/sets as lists,
+  dicts with literal keys); a positional argument, `**kwargs`, a variable, an
+  expression, an empty list or any other element leaves the **whole** answer in
+  `content`; dotted names (`a.b(x=1)`) are kept dotted; a Python comment between two
+  calls or before the `]` also leaves it in `content` (the bracket scan does not read
+  comments);
+* text after the closing `]` is returned as `content` next to the calls;
+* streaming withholds a leading `[...` until it is known to be a call list or not: the
+  calls of a list are emitted once, with their absolute index, when its `]` arrives
+  (all or nothing, so streaming returns what non-streaming returns), and bracket text
+  that is not a call list, or a list the model never closed, is released as content.
+
+Gemma 3's own template never shows the model the tools, so the package ships vLLM's
+Gemma 3 pythonic template (adapted, see the header of the file; the parser alias
+`gemma3_pythonic` is the same parser):
+
+```bash
+TEMPLATE=$(python -c 'import vllm_mlx.templates as t; print(t.GEMMA3_PYTHONIC_TOOL_TEMPLATE)')
+vllm-mlx serve mlx-community/gemma-3-4b-it-qat-4bit --continuous-batching \
+  --enable-auto-tool-choice --tool-call-parser pythonic \
+  --chat-template "$TEMPLATE"
+```
+
+Requests **without tools** render byte-for-byte like Gemma's own template (the `<bos>`
+included, which every engine path handles: SimpleEngine and mlx-lm do not add a second
+one, the multimodal batching path tokenizes without special tokens). With tools the
+first user turn carries vLLM's function-calling prompt; assistant `tool_calls` are
+replayed as the list the model is asked to write and `tool` results become
+`<tool_response>` user turns. For other model families (Llama 3.2/4) use
+`--tool-call-parser pythonic` with that family's own pythonic template (vLLM ships
+`tool_chat_template_llama3.2_pythonic.jinja` and `tool_chat_template_llama4_pythonic.jinja`);
+they are not bundled here.
+
+Model quality is the limit, not the parser: `gemma-3-4b-it-qat-4bit` writes correct
+calls for simple tools (`get_weather(city="Paris")`, two parallel calls, two different
+tools) but wraps the call in quotes for some schemas (`['echo_args(text=...)']`, a list
+holding a string, which is content) and often ends its turn at once after a tool result
+(measured with mlx-lm at temperature 0 on the same prompt, so not the server's doing).
 
 ### Salesforce xLAM
 

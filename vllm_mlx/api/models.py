@@ -188,6 +188,9 @@ class ChatCompletionRequest(BaseModel):
     # EOS tokens no longer end generation; only ``max_completion_tokens`` /
     # ``max_tokens`` or an explicit ``stop`` string does.
     ignore_eos: bool = False
+    # vLLM sampling extension (default true): BOS/PAD/UNK/EOS tokens the model
+    # generates are left out of the text. False renders them.
+    skip_special_tokens: bool = True
     stream: bool = False
     stream_options: StreamOptions | None = (
         None  # Streaming options (include_usage, etc.)
@@ -343,6 +346,9 @@ class CompletionRequest(BaseModel):
     max_tokens: int | None = Field(default=None, gt=0)
     # vLLM sampling extension: EOS tokens no longer end generation.
     ignore_eos: bool = False
+    # vLLM sampling extension (default true): BOS/PAD/UNK/EOS tokens the model
+    # generates are left out of the text. False renders them.
+    skip_special_tokens: bool = True
     stream: bool = False
     stop: list[str] | None = None
     # Sampling penalties

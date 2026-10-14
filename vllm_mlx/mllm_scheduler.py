@@ -28,8 +28,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
-from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
@@ -38,7 +36,7 @@ from .mllm_batch_generator import (
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
-from .utils.tokenizer import encode_prompt
+from .utils.tokenizer import boundary_token_ids, encode_prompt, streaming_detokenizer
 
 if TYPE_CHECKING:
     from .mllm_specprefill import SpecPrefillOutcome, SpecPrefillRequestConfig
@@ -470,6 +468,7 @@ class MLLMScheduler:
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             logits_processors=kwargs.pop("logits_processors", None),
             ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+            skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
         )
 
         request = MLLMRequest(
@@ -694,6 +693,20 @@ class MLLMScheduler:
                 request.specprefill_outcome = response.specprefill_outcome
 
             generator = getattr(self, "batch_generator", None)
+            pop_prompt_tokens = getattr(generator, "pop_prompt_tokens", None)
+            if callable(pop_prompt_tokens):
+                # A media prompt only reaches its real length in the processor
+                # (one placeholder becomes hundreds of image tokens); the
+                # tokenizer estimate made at admission is a lower bound.
+                actual = pop_prompt_tokens(request_id)
+                if (
+                    isinstance(actual, int)
+                    and actual > 0
+                    and actual != request.num_prompt_tokens
+                ):
+                    self.total_prompt_tokens += actual - request.num_prompt_tokens
+                    request.num_prompt_tokens = actual
+
             if request.cached_tokens is None and generator is not None:
                 reused = generator.pop_cached_tokens(request_id)
                 if reused is not None:
@@ -716,6 +729,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    error_kind=response.error_kind,
                     specprefill_outcome=request.specprefill_outcome,
                 )
                 request.status = RequestStatus.FINISHED_ABORTED
@@ -739,24 +753,29 @@ class MLLMScheduler:
                 request.first_token_time = time.time()
 
             # Decode the new token using streaming detokenizer (UTF-8 safe).
-            # Skip stop tokens — they are not content. Under ignore_eos an EOS
-            # token is generated and counted but does not finish the request,
-            # so it is dropped here instead: the same text a natural stop gives.
+            # The request always owns a detokenizer from its first token on, so
+            # the final text never has to be rebuilt from the raw ids (which
+            # would render a terminator that is the only token generated).
+            # A stop-finishing token is the terminator, not content. Every
+            # other token goes through that detokenizer, which leaves out
+            # BOS/PAD/UNK/EOS (``boundary_token_ids``) unless the request set
+            # ``skip_special_tokens=False``: under ignore_eos an EOS token is
+            # generated and counted but does not finish the request, and is
+            # dropped there, the same text a natural stop gives.
+            detok = self._detokenizer_pool.get(request_id)
+            if detok is None:
+                detok = streaming_detokenizer(
+                    tokenizer,
+                    (
+                        boundary_token_ids(tokenizer)
+                        if request.sampling_params.skip_special_tokens
+                        else frozenset()
+                    ),
+                )
+                self._detokenizer_pool[request_id] = detok
             if response.finish_reason == "stop":
                 new_text = ""
-            elif request.sampling_params.ignore_eos and (
-                response.token in self.stop_tokens
-            ):
-                if request_id not in self._detokenizer_pool:
-                    self._detokenizer_pool[request_id] = NaiveStreamingDetokenizer(
-                        tokenizer
-                    )
-                new_text = ""
             else:
-                if request_id not in self._detokenizer_pool:
-                    detok = NaiveStreamingDetokenizer(tokenizer)
-                    self._detokenizer_pool[request_id] = detok
-                detok = self._detokenizer_pool[request_id]
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
@@ -786,12 +805,9 @@ class MLLMScheduler:
                 finished_ids.add(request_id)
 
                 # Finalize streaming detokenizer and get full output
-                detok = self._detokenizer_pool.pop(request_id, None)
-                if detok is not None:
-                    detok.finalize()
-                    output.output_text = detok.text
-                else:
-                    output.output_text = tokenizer.decode(request.output_tokens)
+                self._detokenizer_pool.pop(request_id, None)
+                detok.finalize()
+                output.output_text = detok.text
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
 

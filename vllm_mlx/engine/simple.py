@@ -35,9 +35,10 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from ..request import UnsupportedRequestOption
 from ..utils.tokenizer import (
-    collect_eos_token_ids,
+    decode_visible,
     encode_prompt,
     eos_ignoring_tokenizer,
+    unfiltered_tokenizer,
 )
 from .base import (
     BaseEngine,
@@ -50,7 +51,9 @@ from .base import (
 )
 from .chat_template_safety import (
     build_system_prompt_cache_prefix,
+    chat_template_rejections,
     normalize_messages_for_chat_template,
+    reject_template_errors,
 )
 from ..mlx_streams import (
     bind_generation_streams,
@@ -59,6 +62,20 @@ from ..mlx_streams import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _mllm_completion_tokens(chunk: Any, previous: int) -> int:
+    """Cumulative ``completion_tokens`` carried by an MLLM stream chunk.
+
+    The MLLM stream ends with a chunk that holds no new token (it flushes the
+    detokenizer and carries the finish reason), so counting chunks overstates
+    the generation by one. Chunks report the running token count themselves
+    (mlx-vlm's ``generation_tokens``, which includes the stop token, as vLLM's
+    ``len(token_ids)`` does); a chunk that does not falls back to one more than
+    before.
+    """
+    count = getattr(chunk, "completion_tokens", None)
+    return count if isinstance(count, int) else previous + 1
 
 
 def _reject_ignore_eos_on_mlx_vlm(kwargs: dict[str, Any]) -> None:
@@ -76,6 +93,34 @@ def _reject_ignore_eos_on_mlx_vlm(kwargs: dict[str, Any]) -> None:
             "on the simple engine); use --continuous-batching or a text-only "
             "chat request"
         )
+
+
+def _prepare_mlx_vlm_kwargs(kwargs: dict[str, Any]) -> None:
+    """Check the request options of a route that decodes through mlx-vlm.
+
+    ``ignore_eos`` is refused (see ``_reject_ignore_eos_on_mlx_vlm``).
+    ``skip_special_tokens`` is not an mlx-vlm argument: its detokenizer renders
+    whatever it is fed and stops on its own EOS, so the field is consumed here
+    and ``False`` is what that route does anyway.
+    """
+    _reject_ignore_eos_on_mlx_vlm(kwargs)
+    kwargs.pop("skip_special_tokens", None)
+
+
+def _request_tokenizer(tokenizer, ignore_eos: bool, skip_special_tokens: bool):
+    """The tokenizer a mlx-lm decode of this request runs under.
+
+    The engine's tokenizer already stops on EOS and leaves BOS/PAD/UNK/EOS out of
+    the text; ``ignore_eos`` and ``skip_special_tokens=False`` change that per
+    request, through a view that does not touch the shared tokenizer.
+    """
+    if ignore_eos:
+        return eos_ignoring_tokenizer(
+            tokenizer, skip_special_tokens=skip_special_tokens
+        )
+    if not skip_special_tokens:
+        return unfiltered_tokenizer(tokenizer)
+    return tokenizer
 
 
 def _bind_worker_generation_streams(stream: object | None = None) -> object:
@@ -1117,12 +1162,14 @@ class SimpleEngine(BaseEngine):
             # stop-token handling on the batched path.
             from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-            from ..utils.tokenizer import collect_eos_token_ids
+            from ..utils.tokenizer import collect_eos_token_ids, hide_boundary_tokens
 
             eos_ids = collect_eos_token_ids(self._text_tokenizer)
-            self._text_tokenizer = TokenizerWrapper(
-                self._text_tokenizer,
-                eos_token_ids=eos_ids or None,
+            self._text_tokenizer = hide_boundary_tokens(
+                TokenizerWrapper(
+                    self._text_tokenizer,
+                    eos_token_ids=eos_ids or None,
+                )
             )
             logger.info("Text route stop tokens: %s", sorted(eos_ids))
 
@@ -1309,7 +1356,9 @@ class SimpleEngine(BaseEngine):
         if last_output is None:
             return GenerationOutput(text="", finish_reason="stop")
 
-        text = clean_output_text(last_output.text)
+        text = clean_output_text(
+            last_output.text, bool(kwargs.get("skip_special_tokens", True))
+        )
         return GenerationOutput(
             text=text,
             tokens=list(last_output.tokens),
@@ -1473,7 +1522,7 @@ class SimpleEngine(BaseEngine):
         specprefill_backbone_pct_override = kwargs.pop("specprefill_backbone_pct", None)
         request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
         if self._is_mllm:
-            _reject_ignore_eos_on_mlx_vlm(kwargs)
+            _prepare_mlx_vlm_kwargs(kwargs)
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
         if not self._is_mllm and self._draft_model is not None:
@@ -1586,7 +1635,17 @@ class SimpleEngine(BaseEngine):
                             if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
                             else prompt_tokens
                         )
-                        completion_tokens += 1
+                        # mlx-vlm streams one chunk per token and then a last chunk with
+                        # no new token that flushes the detokenizer (the text of the
+                        # final token(s)) and carries the finish reason. Stopping at
+                        # the cap on the last token chunk dropped that text.
+                        vlm_stream = self._is_mllm and isinstance(
+                            getattr(chunk, "generation_tokens", None), int
+                        )
+                        if vlm_stream:
+                            completion_tokens = chunk.generation_tokens
+                        else:
+                            completion_tokens += 1
                         if request_id in self._active_requests:
                             self._active_requests[request_id].update(
                                 {
@@ -1598,10 +1657,13 @@ class SimpleEngine(BaseEngine):
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                         accumulated_text += new_text
 
-                        finished = (
-                            getattr(chunk, "finished", False)
-                            or completion_tokens >= max_tokens
-                        )
+                        if vlm_stream:
+                            finished = getattr(chunk, "finish_reason", None) is not None
+                        else:
+                            finished = (
+                                getattr(chunk, "finished", False)
+                                or completion_tokens >= max_tokens
+                            )
                         finish_reason = None
                         if finished:
                             finish_reason = getattr(chunk, "finish_reason", None)
@@ -1670,6 +1732,7 @@ class SimpleEngine(BaseEngine):
                             )
                     self._active_requests.pop(request_id, None)
 
+    @reject_template_errors
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -1701,6 +1764,9 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        # Read before an mlx-vlm route consumes it: False means the text is
+        # returned as generated, whichever decoder produced it.
+        skip_special = bool(kwargs.get("skip_special_tokens", True))
 
         async def aggregate_stream_chat() -> GenerationOutput:
             final_output = GenerationOutput(text="")
@@ -1716,7 +1782,7 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ):
                 final_output = output
-            text = clean_output_text(final_output.text)
+            text = clean_output_text(final_output.text, skip_special)
             return GenerationOutput(
                 text=text,
                 tokens=list(final_output.tokens),
@@ -1771,7 +1837,7 @@ class SimpleEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         if self._is_mllm:
-            _reject_ignore_eos_on_mlx_vlm(kwargs)
+            _prepare_mlx_vlm_kwargs(kwargs)
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
             output = await self._run_blocking_serialized(
@@ -1783,7 +1849,7 @@ class SimpleEngine(BaseEngine):
                 tools=template_tools,
                 **kwargs,
             )
-            text = clean_output_text(output.text)
+            text = clean_output_text(output.text, skip_special)
             return GenerationOutput(
                 text=text,
                 prompt_tokens=output.prompt_tokens,
@@ -1803,7 +1869,7 @@ class SimpleEngine(BaseEngine):
                 chat_template_kwargs=chat_template_kwargs,
                 **kwargs,
             )
-            text = clean_output_text(output.text)
+            text = clean_output_text(output.text, skip_special)
             # Preserve upstream prompt accounting while routing the blocking
             # chat call through the cancellation-safe serialized runner.
             tokenizer = self._model.tokenizer
@@ -1892,6 +1958,155 @@ class SimpleEngine(BaseEngine):
             cache_blocking_controls.append("harmony_rendering")
         return cache_blocking_controls
 
+    def _render_llm_chat_prompt(
+        self,
+        tokenizer: Any,
+        messages: list[dict[str, Any]],
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any],
+        enable_thinking: bool | None,
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+        """Render the prompt of a pure-LLM chat request.
+
+        Returns the prompt, the normalized messages it was rendered from and the
+        template kwargs that rendered it (the system-prompt cache probes with
+        them). Shared by ``stream_chat`` and
+        ``validate_chat_template`` so the pre-check cannot disagree with the request.
+        """
+        # Per-request enable_thinking override; default: True unless coder model.
+        if enable_thinking is None:
+            enable_thinking = "coder" not in self._model_name.lower()
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+        if template_tools:
+            template_kwargs["tools"] = template_tools
+        safe_messages = normalize_messages_for_chat_template(messages)
+
+        if getattr(self, "use_harmony_rendering", False):
+            # GPT-OSS / harmony-format models: render via openai-harmony
+            # instead of the Jinja chat_template. Bypasses the
+            # ``extract_multimodal_content`` text-flattening upstream
+            # (which drops structural ``tool_calls`` for non-native
+            # parsers) and uses OpenAI's canonical renderer. See #568.
+            from ..utils.harmony_render import (
+                render_messages as _harmony_render_messages,
+            )
+
+            _reasoning_effort = None
+            if chat_template_kwargs:
+                _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+            prompt = _harmony_render_messages(
+                safe_messages,
+                tools=template_tools,
+                reasoning_effort=_reasoning_effort,
+            )
+        else:
+            try:
+                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+            except TypeError:
+                # Some templates don't support all kwargs
+                for key in [
+                    "tools",
+                    "enable_thinking",
+                    *chat_template_kwargs.keys(),
+                ]:
+                    if key in template_kwargs:
+                        del template_kwargs[key]
+                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+        return prompt, safe_messages, template_kwargs
+
+    def _render_text_route_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any],
+        enable_thinking: bool | None,
+    ) -> str:
+        """Render the prompt of a text-only request on the mlx-lm TextModel route.
+
+        Shared by ``_stream_generate_text`` and ``validate_chat_template``.
+        """
+        # Per-request enable_thinking override; fall back to env var / default True.
+        if enable_thinking is None:
+            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        template_kwargs.update(chat_template_kwargs)
+        if tools:
+            template_kwargs["tools"] = tools
+        safe_messages = normalize_messages_for_chat_template(messages)
+
+        try:
+            return self._text_tokenizer.apply_chat_template(
+                safe_messages, **template_kwargs
+            )
+        except TypeError:
+            # Template doesn't accept tools= or enable_thinking=
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            return self._text_tokenizer.apply_chat_template(
+                safe_messages, **template_kwargs
+            )
+
+    async def validate_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+        mllm_draft: bool | None = None,
+        **_chat_kwargs: Any,
+    ) -> None:
+        """Render the prompt ``stream_chat`` would build for this request, discarding it.
+
+        Raises ``ChatTemplateRejected`` when the template refuses the messages, so
+        a streaming request is answered 400 before its response starts. Follows the
+        route ``_stream_chat_impl`` picks (mlx-lm TextModel, mlx-vlm, pure LLM) and
+        renders with that route's own renderer. A video counts as one placeholder
+        frame: its frames are extracted only while the real prompt is built.
+        """
+        if not self._loaded:
+            await self.start()
+        ctk = dict(chat_template_kwargs or {})
+        template_tools = convert_tools_for_template(tools) if tools else None
+        has_media = has_media_content(messages)
+        draft = self._default_mllm_draft if mllm_draft is None else bool(mllm_draft)
+        await self._ensure_text_model_for_request(mllm_draft_requested=draft)
+
+        with chat_template_rejections():
+            if self._uses_text_model_route(
+                has_media=has_media, mllm_draft_requested=draft
+            ):
+                self._render_text_route_prompt(
+                    messages, template_tools, ctk, enable_thinking
+                )
+            elif self._is_mllm:
+                self._model.render_chat_prompt(
+                    messages,
+                    tools=template_tools,
+                    chat_template_kwargs=ctk,
+                    enable_thinking=enable_thinking,
+                )
+            elif hasattr(self._model.tokenizer, "apply_chat_template"):
+                self._render_llm_chat_prompt(
+                    self._model.tokenizer,
+                    messages,
+                    template_tools,
+                    ctk,
+                    enable_thinking,
+                )
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -1917,9 +2132,10 @@ class SimpleEngine(BaseEngine):
             ),
             max_tokens=max_tokens,
         )
-        async with aclosing(tracked_stream):
-            async for output in tracked_stream:
-                yield output
+        with chat_template_rejections():
+            async with aclosing(tracked_stream):
+                async for output in tracked_stream:
+                    yield output
 
     async def _stream_chat_impl(
         self,
@@ -1995,7 +2211,7 @@ class SimpleEngine(BaseEngine):
 
         # Build prompt using tokenizer
         if self._is_mllm:
-            _reject_ignore_eos_on_mlx_vlm(kwargs)
+            _prepare_mlx_vlm_kwargs(kwargs)
             if self._text_model is not None:
                 route_kind = "Media" if has_media else "Text-only"
                 logger.info("%s request → MLLM path", route_kind)
@@ -2062,7 +2278,7 @@ class SimpleEngine(BaseEngine):
                             if chunk is _STREAM_DONE:
                                 break
 
-                            token_count += 1
+                            token_count = _mllm_completion_tokens(chunk, token_count)
                             new_text = (
                                 chunk.text if hasattr(chunk, "text") else str(chunk)
                             )
@@ -2118,7 +2334,7 @@ class SimpleEngine(BaseEngine):
                 request_id=request_id,
             )
             for chunk in chunks:
-                token_count += 1
+                token_count = _mllm_completion_tokens(chunk, token_count)
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
                 finished = chunk.finish_reason is not None
@@ -2138,56 +2354,13 @@ class SimpleEngine(BaseEngine):
         tokenizer = self._model.tokenizer
         safe_messages: list[dict[str, Any]] | None = None
         if hasattr(tokenizer, "apply_chat_template"):
-            # Per-request enable_thinking override; default: True unless coder model.
-            enable_thinking = kwargs.pop("enable_thinking", None)
-            if enable_thinking is None:
-                enable_thinking = "coder" not in self._model_name.lower()
-            template_kwargs = {
-                "tokenize": False,
-                "add_generation_prompt": True,
-                "enable_thinking": enable_thinking,
-            }
-            if chat_template_kwargs:
-                template_kwargs.update(chat_template_kwargs)
-            if template_tools:
-                template_kwargs["tools"] = template_tools
-            safe_messages = normalize_messages_for_chat_template(messages)
-
-            if getattr(self, "use_harmony_rendering", False):
-                # GPT-OSS / harmony-format models: render via openai-harmony
-                # instead of the Jinja chat_template. Bypasses the
-                # ``extract_multimodal_content`` text-flattening upstream
-                # (which drops structural ``tool_calls`` for non-native
-                # parsers) and uses OpenAI's canonical renderer. See #568.
-                from ..utils.harmony_render import (
-                    render_messages as _harmony_render_messages,
-                )
-
-                _reasoning_effort = None
-                if chat_template_kwargs:
-                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
-                prompt = _harmony_render_messages(
-                    safe_messages,
-                    tools=template_tools,
-                    reasoning_effort=_reasoning_effort,
-                )
-            else:
-                try:
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
-                except TypeError:
-                    # Some templates don't support all kwargs
-                    for key in [
-                        "tools",
-                        "enable_thinking",
-                        *chat_template_kwargs.keys(),
-                    ]:
-                        if key in template_kwargs:
-                            del template_kwargs[key]
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
+            prompt, safe_messages, template_kwargs = self._render_llm_chat_prompt(
+                tokenizer,
+                messages,
+                template_tools,
+                chat_template_kwargs,
+                kwargs.pop("enable_thinking", None),
+            )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
@@ -2459,10 +2632,10 @@ class SimpleEngine(BaseEngine):
                 prompt_arr = mx.array(prompt_tokens_for_decode)
                 for resp in mlx_stream_generate(
                     model,
-                    (
-                        eos_ignoring_tokenizer(tokenizer)
-                        if kwargs.get("ignore_eos")
-                        else tokenizer
+                    _request_tokenizer(
+                        tokenizer,
+                        bool(kwargs.get("ignore_eos")),
+                        bool(kwargs.get("skip_special_tokens", True)),
                     ),
                     prompt=prompt_arr,
                     max_tokens=max_tokens,
@@ -2607,6 +2780,7 @@ class SimpleEngine(BaseEngine):
         n_tokens = len(tokens)
         cancel_requested = Event()
         ignore_eos = bool(kwargs.get("ignore_eos", False))
+        skip_special = bool(kwargs.get("skip_special_tokens", True))
 
         def _request_cancel() -> None:
             cancel_requested.set()
@@ -2697,15 +2871,13 @@ class SimpleEngine(BaseEngine):
                 first_token_id = sampler(logits[:, -1, :]).item()
                 eos_id = tokenizer.eos_token_id
                 if ignore_eos:
-                    # EOS does not end the response, and is not rendered.
-                    first_text = (
-                        ""
-                        if first_token_id in collect_eos_token_ids(tokenizer)
-                        else tokenizer.decode([first_token_id])
-                    )
+                    # EOS does not end the response.
                     eos_id = None
-                else:
-                    first_text = tokenizer.decode([first_token_id])
+                first_text = (
+                    ""
+                    if first_token_id == eos_id
+                    else decode_visible(tokenizer, [first_token_id], skip_special)
+                )
 
                 results = [
                     SimpleNamespace(
@@ -2723,6 +2895,7 @@ class SimpleEngine(BaseEngine):
                         stop=stop,
                         prompt_cache=cache,
                         ignore_eos=ignore_eos,
+                        skip_special_tokens=skip_special,
                     ):
                         _cancel_check()
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
@@ -2818,7 +2991,6 @@ class SimpleEngine(BaseEngine):
         system prompt restore the snapshot and only prefill the suffix tokens.
         """
         import hashlib
-        import os
 
         import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
@@ -2840,41 +3012,19 @@ class SimpleEngine(BaseEngine):
         # ignore_eos: mlx-lm stops when a token is in tokenizer.eos_token_ids,
         # so decode under a view of the tokenizer that reports none.
         ignore_eos = bool(kwargs.pop("ignore_eos", False))
-        generation_tokenizer = (
-            eos_ignoring_tokenizer(self._text_tokenizer)
-            if ignore_eos
-            else self._text_tokenizer
+        skip_special = bool(kwargs.pop("skip_special_tokens", True))
+        generation_tokenizer = _request_tokenizer(
+            self._text_tokenizer, ignore_eos, skip_special
         )
         abort_event = threading.Event()
 
-        # Per-request enable_thinking override; fall back to env var / default True.
-        enable_thinking = kwargs.pop("enable_thinking", None)
-        if enable_thinking is None:
-            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
-            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
-
         # Apply chat template for full prompt
-        template_kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-            "enable_thinking": enable_thinking,
-        }
-        template_kwargs.update(chat_template_kwargs)
-        if tools:
-            template_kwargs["tools"] = tools
-        safe_messages = normalize_messages_for_chat_template(messages)
-
-        try:
-            full_prompt = self._text_tokenizer.apply_chat_template(
-                safe_messages, **template_kwargs
-            )
-        except TypeError:
-            # Template doesn't accept tools= or enable_thinking=
-            template_kwargs.pop("tools", None)
-            template_kwargs.pop("enable_thinking", None)
-            full_prompt = self._text_tokenizer.apply_chat_template(
-                safe_messages, **template_kwargs
-            )
+        full_prompt = self._render_text_route_prompt(
+            messages,
+            tools,
+            chat_template_kwargs,
+            kwargs.pop("enable_thinking", None),
+        )
 
         sampler = make_sampler(
             temp=temperature,
@@ -3377,20 +3527,16 @@ class SimpleEngine(BaseEngine):
                 )
                 mx.eval(y)
 
-                generated_ids = []
-                prev_decoded = ""
-
                 tok_id = y.item()
-                generated_ids.append(tok_id)
 
-                decoded = self._text_tokenizer.decode(generated_ids)
-                new_text = decoded[len(prev_decoded) :]
-                prev_decoded = decoded
-
-                # ignore_eos: an EOS seed token is neither a stop nor text.
+                # An EOS seed ends the request and is not text. Any other seed
+                # is, except BOS/PAD/UNK/EOS unless the request keeps them.
                 is_eos = tok_id == eos_id and not ignore_eos
-                if ignore_eos and tok_id in collect_eos_token_ids(self._text_tokenizer):
-                    new_text = ""
+                new_text = (
+                    ""
+                    if is_eos
+                    else decode_visible(self._text_tokenizer, [tok_id], skip_special)
+                )
                 _emit_response(
                     SimpleNamespace(
                         text=new_text,
