@@ -8,6 +8,7 @@ directly from tokenizer.json.
 """
 
 import copy
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -22,6 +23,58 @@ FALLBACK_MODELS = [
     "nemotron",
     "NVIDIA-Nemotron",
 ]
+
+
+def prompt_adds_special_tokens(tokenizer, prompt: str) -> bool:
+    """Whether ``tokenizer.encode(prompt)`` should add its own special tokens.
+
+    A prompt that was already rendered by the chat template carries the BOS
+    as literal text (Llama-3 ``<|begin_of_text|>``, Gemma ``<bos>``, ...).
+    Tokenizing it with the tokenizer's default ``add_special_tokens=True``
+    prepends a *second* BOS the template never asked for -- the model then sees
+    ``[BOS, BOS, ...]`` instead of the ``[BOS, ...]`` that
+    ``apply_chat_template(tokenize=True)`` (and upstream vLLM, whose chat
+    tokenization uses ``add_special_tokens=False``) produce.
+
+    This is the rule ``mlx_lm.generate.stream_generate`` applies to string
+    prompts, character for character: skip the tokenizer's special tokens iff
+    ``bos_token`` is set and the prompt starts with it (no stripping, so leading
+    whitespace defeats it, and an empty ``bos_token`` matches every prompt).  A
+    raw completion prompt without a leading BOS text still gets one from the
+    tokenizer.  Every tokenization of a prompt string in the engines goes
+    through :func:`encode_prompt` so counts, cache keys and prefix boundaries
+    agree.
+
+    Divergence from upstream vLLM: a chat template that renders *no* BOS on a
+    tokenizer that adds one (TinyLlama, zephyr, OpenHermes) keeps the
+    tokenizer's BOS here and in mlx-lm, where vLLM's chat path adds nothing.
+    """
+    bos_token = getattr(tokenizer, "bos_token", None)
+    return not (isinstance(bos_token, str) and prompt.startswith(bos_token))
+
+
+def _encode_takes_add_special_tokens(encode) -> bool:
+    try:
+        parameters = inspect.signature(encode).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        p.name == "add_special_tokens" or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in parameters
+    )
+
+
+def encode_prompt(tokenizer, prompt: str) -> list[int]:
+    """Tokenize ``prompt`` without duplicating a BOS the prompt already carries.
+
+    A duck-typed tokenizer whose ``encode(text)`` takes no ``add_special_tokens``
+    keyword is encoded with its own defaults.
+    """
+    if not _encode_takes_add_special_tokens(tokenizer.encode):
+        return tokenizer.encode(prompt)
+    return tokenizer.encode(
+        prompt, add_special_tokens=prompt_adds_special_tokens(tokenizer, prompt)
+    )
 
 
 def _needs_tokenizer_fallback(model_name: str) -> bool:

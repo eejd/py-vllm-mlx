@@ -480,14 +480,20 @@ class MLLMScheduler:
 
         # Estimate prompt token count for monitoring (text tokens only;
         # vision tokens are added during prefill but this gives a useful
-        # approximation for the status endpoint).
+        # approximation for the status endpoint).  The batch generator
+        # tokenizes with ``mlx_vlm.utils.prepare_inputs`` which uses
+        # ``add_special_tokens=False`` (the rendered chat template is the sole
+        # source of the BOS), so count the same way: the default encode would
+        # add a second BOS for Gemma-3 and over-report usage.prompt_tokens.
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
             else self.processor
         )
         try:
-            request.num_prompt_tokens = len(tokenizer.encode(prompt))
+            request.num_prompt_tokens = len(
+                tokenizer.encode(prompt, add_special_tokens=False)
+            )
         except Exception:
             pass
 

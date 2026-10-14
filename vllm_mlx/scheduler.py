@@ -46,7 +46,7 @@ from .request import (
     UnsupportedRequestOption,
 )
 from .utils.mamba_cache import ensure_mamba_support
-from .utils.tokenizer import boundary_token_ids, streaming_detokenizer
+from .utils.tokenizer import boundary_token_ids, encode_prompt, streaming_detokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -1623,13 +1623,15 @@ class Scheduler:
             if isinstance(request.prompt, str):
                 # Handle both tokenizers and processors (for MLLM models)
                 if hasattr(self.tokenizer, "encode"):
-                    request.prompt_token_ids = self.tokenizer.encode(request.prompt)
+                    request.prompt_token_ids = encode_prompt(
+                        self.tokenizer, request.prompt
+                    )
                 elif hasattr(self.tokenizer, "tokenizer") and hasattr(
                     self.tokenizer.tokenizer, "encode"
                 ):
                     # Processor wraps tokenizer (e.g., Qwen3VLProcessor)
-                    request.prompt_token_ids = self.tokenizer.tokenizer.encode(
-                        request.prompt
+                    request.prompt_token_ids = encode_prompt(
+                        self.tokenizer.tokenizer, request.prompt
                     )
                 else:
                     raise AttributeError(
