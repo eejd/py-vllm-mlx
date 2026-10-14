@@ -10,13 +10,20 @@
   (https://github.com/vllm-project/vllm, Apache-2.0, Copyright contributors to the vLLM
   project), which is the `tool_use` template NousResearch publishes with
   Hermes-3-Llama-3.1-8B. Changes made in this fork (vllm-mlx):
-    * WITHOUT tools the output is byte-identical to this checkpoint's own template (the
-      branch below is that template, verbatim), so a server started with this template
-      renders requests that carry no tools exactly as it would without it;
-    * no `bos_token` is emitted: vllm-mlx tokenizes the rendered string with special
-      tokens enabled (the model's tokenizer adds `<|begin_of_text|>` itself), and the
-      checkpoint's own template does not emit it either; vLLM tokenizes chat prompts
-      without special tokens, which is why upstream's template starts with it;
+    * the output starts with the tokenizer's `bos_token` (`<|begin_of_text|>` on the
+      Llama-3 base of Hermes-3), with and without tools, as upstream's template and as
+      NousResearch's own Hermes-3-Llama-3.1-8B/70B templates (`default` and `tool_use`)
+      do. The Hermes-3-Llama-3.2-3B checkpoint template omits it, but that tokenizer's
+      post-processor adds it to any string encoded with special tokens, so a client that
+      renders the template and tokenizes the string (the usual transformers round
+      trip) gives the model a BOS. vllm-mlx tokenizes a
+      rendered chat prompt without special tokens, as vLLM does (the template owns
+      every marker), so a template that leaves the BOS off sends the model a prompt
+      with no BOS at all and the 4-bit 3B model degrades (stray words and newlines
+      before a reply, a tool roundtrip that ends in `finish_reason: length`);
+    * WITHOUT tools the output is that checkpoint's own template (the branch below,
+      verbatim) after the BOS, so a server started with this template renders requests
+      that carry no tools exactly as it would without it, plus the BOS;
     * every turn ends `<|im_end|>\n` like the ChatML turns around it (upstream leaves
       the newline off after `tool` and tool-calling assistant turns);
     * an assistant turn that has both content and `tool_calls` keeps its content
@@ -39,6 +46,7 @@
       templates use, and string arguments are passed through unchanged.
   Use with `--tool-call-parser hermes`.
 -#}
+{%- if bos_token is string -%}{{- bos_token -}}{%- endif -%}
 {%- if not tools -%}
 {% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '
 ' + message['content'] + '<|im_end|>' + '

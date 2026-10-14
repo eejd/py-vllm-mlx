@@ -21,6 +21,7 @@ from vllm_mlx.templates import (
     PHI4_MINI_TOOL_TEMPLATE,
 )
 from vllm_mlx.tool_parsers import ToolParserManager
+from vllm_mlx.utils.tokenizer import prompt_adds_special_tokens
 
 TOOLS = [
     {
@@ -45,8 +46,12 @@ TOOLS = [
     }
 ]
 
+BOS = "<|begin_of_text|>"
+
 # The checkpoint's own template, from mlx-community/Hermes-3-Llama-3.2-3B-4bit
-# tokenizer_config.json. Without tools the shipped template must render exactly this.
+# tokenizer_config.json. Without tools the shipped template must render exactly this,
+# after the BOS (the checkpoint's template omits it; the family's 8B/70B templates
+# and upstream's start with ``bos_token``).
 STOCK_TEMPLATE = (
     "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false "
     "%}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + "
@@ -117,7 +122,8 @@ TOOL_LESS_CASES = {
 
 
 class TestToolLessRequestsKeepTheStockLayout:
-    """A server-wide --chat-template must not change prompts that carry no tools."""
+    """A server-wide --chat-template must not change prompts that carry no tools
+    beyond the BOS the checkpoint's own template leaves off."""
 
     @pytest.mark.parametrize("case", sorted(TOOL_LESS_CASES))
     @pytest.mark.parametrize("tools", [None, []])
@@ -127,16 +133,50 @@ class TestToolLessRequestsKeepTheStockLayout:
             STOCK_TEMPLATE, messages, add_generation_prompt=add_generation_prompt
         )
         shipped = render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            bos_token=BOS,
         )
-        assert shipped == stock
+        assert shipped == BOS + stock
         assert "<tools>" not in shipped
 
     def test_default_generation_prompt_matches_when_the_variable_is_absent(self):
         # The stock template defaults add_generation_prompt to False.
         stock = _render(STOCK_TEMPLATE, [_USER])
-        shipped = render([_USER])
-        assert shipped == stock
+        shipped = render([_USER], bos_token=BOS)
+        assert shipped == BOS + stock
+
+
+class TestBos:
+    """The template owns every marker: vllm-mlx tokenizes a rendered chat prompt
+    without special tokens (as vLLM does), so a template that leaves the BOS off
+    sends Hermes-3 a prompt with no BOS, and the 4-bit 3B model degrades."""
+
+    @pytest.mark.parametrize("tools", [None, [], TOOLS], ids=["none", "empty", "tools"])
+    @pytest.mark.parametrize("add_generation_prompt", [True, False])
+    def test_prompt_starts_with_exactly_one_bos(self, tools, add_generation_prompt):
+        prompt = render(
+            [{"role": "system", "content": "Be brief."}, _USER],
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            bos_token=BOS,
+        )
+        assert prompt.startswith(BOS + "<|im_start|>")
+        assert prompt.count(BOS) == 1
+
+    def test_the_bos_comes_from_the_tokenizers_bos_token(self):
+        prompt = render([_USER], tools=TOOLS, bos_token="<s>")
+        assert prompt.startswith("<s><|im_start|>system\nYou are a function calling")
+
+    @pytest.mark.parametrize("bos_token", [None, ""])
+    @pytest.mark.parametrize("tools", [None, TOOLS], ids=["none", "tools"])
+    def test_a_tokenizer_without_a_bos_gets_none(self, bos_token, tools):
+        # Qwen-based Hermes checkpoints have bos_token None: transformers passes it
+        # through and Jinja would render the word "None".
+        prompt = render([_USER], tools=tools, bos_token=bos_token)
+        assert prompt.startswith("<|im_start|>")
+        assert "None" not in prompt
 
 
 class TestRenderTools:
@@ -172,11 +212,6 @@ class TestRenderTools:
             "        days(int): Forecast days\n"
             "        tags(list[str]): Labels"
         ) in head
-
-    def test_no_bos_token_is_rendered(self):
-        # vllm-mlx tokenizes the prompt with special tokens: the tokenizer adds BOS.
-        prompt = render([_USER], tools=TOOLS, bos_token="<|begin_of_text|>")
-        assert "<|begin_of_text|>" not in prompt
 
     def test_arguments_rendered_as_json_not_python_repr(self):
         prompt = render(
@@ -462,14 +497,19 @@ class TestWithTheRealTokenizer:
                 tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
-                == before
+                == tokenizer.bos_token + before
             )
             with_tools = tokenizer.apply_chat_template(
                 messages, tools=TOOLS, tokenize=False, add_generation_prompt=True
             )
             assert "get_weather" in with_tools
-            # One BOS only: the tokenizer adds it, the template must not.
-            ids = tokenizer.encode(with_tools)
-            assert ids[:2] != [tokenizer.bos_token_id] * 2
+            # The template owns the BOS: the engines tokenize a chat prompt without
+            # special tokens, and the prompt must still start with exactly one.
+            ids = tokenizer.encode(with_tools, add_special_tokens=False)
+            assert ids[0] == tokenizer.bos_token_id
+            assert ids[1] != tokenizer.bos_token_id
+            # No path adds a second one: a prompt that starts with the BOS text keeps
+            # that single BOS where the tokenizer's default would prepend another.
+            assert prompt_adds_special_tokens(tokenizer, with_tools) is False
         finally:
             tokenizer.chat_template = stock

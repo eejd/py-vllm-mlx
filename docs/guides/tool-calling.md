@@ -317,11 +317,19 @@ from values (`<ok>` vanished from a string argument) or answers with untagged JS
 unreliable calls (quantbench tool-echo: `object` 3/3 pass, scalars wrong values, `markup_in_value` and
 `code_value` no call).
 
-Requests without tools render byte-for-byte like the checkpoint's own template (tests pin this);
+Requests without tools render like the checkpoint's own template, after the BOS (tests pin this);
 requests with tools get the `<tools>` system prompt and `<tool_call>` instructions. The template
-emits no `<|begin_of_text|>`: the server tokenizes the rendered prompt with special tokens, so the
-tokenizer adds it (vLLM tokenizes chat prompts without special tokens, which is why upstream's
-template starts with it).
+starts with the tokenizer's `bos_token` (`<|begin_of_text|>`), with and without tools, as vLLM's
+template and NousResearch's own Hermes-3-Llama-3.1-8B/70B templates do. The server tokenizes a
+rendered chat prompt without special tokens (as vLLM does: the template owns every marker), so a
+template that leaves the BOS off sends the model a prompt with none, and the 4-bit 3B model degrades
+(stray words before the answer, a tool round trip that never stops). The 3B checkpoint's own template
+omits the BOS, so serve it with this template even when no request carries tools. On
+`mlx-community/Hermes-3-Llama-3.2-3B-4bit` (greedy, 12 tool prompts, 6 tool round trips, 20 plain
+questions) the BOS took correct tool calls from 3 to 7 of 12 and cleanly answered round trips from 1
+to 5 of 6; the model's own errors (wrong values, dropped quotes in a call) remain. The other bundled
+templates follow their checkpoints: Gemma-3's renders `<bos>`, Phi-4-mini's renders none (its
+tokenizer adds none).
 
 ### Templates that ignore tools
 
