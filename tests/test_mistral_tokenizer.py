@@ -14,6 +14,7 @@ tokenizer files from the local Hugging Face cache and skips when they are absent
 """
 
 import base64
+import functools
 import glob
 import json
 import logging
@@ -957,3 +958,174 @@ class TestRealDevstralLoad:
             detok.add_token(token)
         detok.finalize()
         assert detok.text == "café 世界"
+
+
+RAW_PROMPTS = (
+    "Once upon a time",
+    " Once upon a time",
+    "def fibonacci(n):\n    return n if n < 2 else fibonacci(n - 1)",
+    "日本語のテキスト 世界",
+    "12345 6789",
+    "x",
+)
+
+
+class TestRawPromptBos:
+    """A raw completion prompt gets the BOS, as with mistral-common (vLLM).
+
+    vLLM tokenizes a ``/v1/completions`` prompt with mistral-common's
+    ``encode(text, bos=add_special_tokens)``: ``[BOS, *plain_text_ids]``.  The
+    ``tokenizer.json`` of a tekken checkpoint has no BOS post-processor, so the
+    fast tokenizer that replaces mistral-common encoded the same prompt without
+    one on every route (Simple, batched, MLLM): the model saw ``"Once upon a
+    time"`` with nothing in front of it.
+    """
+
+    def test_fast_tokenizer_prepends_the_bos_like_mistral_common(
+        self, checkpoint, reference
+    ):
+        fast = AutoTokenizer.from_pretrained(
+            checkpoint, **mt.fast_tokenizer_config(checkpoint, None)
+        )
+        for prompt in RAW_PROMPTS:
+            expected = reference.encode(prompt, add_special_tokens=True)
+            assert expected[0] == 1 and expected[1:] != [1]
+            assert fast.encode(prompt, add_special_tokens=True) == expected
+            # a rendered chat prompt carries its own <s>: nothing is added
+            assert fast.encode(prompt, add_special_tokens=False) == expected[1:]
+
+    def test_gate_rejects_a_fast_tokenizer_that_drops_the_bos(
+        self, checkpoint, reference, monkeypatch, caplog
+    ):
+        # The equivalence check compares add_special_tokens=True encodings too, so
+        # a tokenizer.json without the BOS post-processor is never adopted silently.
+        monkeypatch.setattr(
+            mt,
+            "FAST_TOKENIZER_KWARGS",
+            {k: v for k, v in mt.FAST_TOKENIZER_KWARGS.items() if k != "add_bos_token"},
+        )
+        with caplog.at_level(logging.WARNING, logger=mt.logger.name):
+            assert mt.equivalent_fast_tokenizer(checkpoint, reference) is None
+        assert "add_special_tokens=True" in caplog.text
+
+    def test_request_kinds_through_encode_prompt(self, checkpoint):
+        from vllm_mlx.utils.tokenizer import encode_prompt
+
+        fast = AutoTokenizer.from_pretrained(
+            checkpoint, **mt.fast_tokenizer_config(checkpoint, None)
+        )
+        raw = "Once upon a time"
+        plain = fast.encode(raw, add_special_tokens=False)
+        assert encode_prompt(fast, raw, None) == [1, *plain]
+        assert encode_prompt(fast, raw, True) == [1, *plain]
+        assert encode_prompt(fast, raw, False) == plain
+        # already opened with <s>: one BOS, never two
+        assert encode_prompt(fast, "<s>" + raw, None) == [1, *plain]
+        # a rendered chat prompt: the template's <s> only
+        chat = fast.apply_chat_template(
+            CONVERSATIONS["plain"], tokenize=False, add_generation_prompt=True
+        )
+        assert encode_prompt(fast, chat, False).count(1) == 1
+        assert encode_prompt(fast, chat, False) == string_pipeline_ids(
+            fast, CONVERSATIONS["plain"]
+        )
+
+    def test_mlx_lm_loaded_tokenizer_has_the_bos(self, checkpoint, monkeypatch):
+        import mlx_lm
+        from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+        from vllm_mlx.utils.tokenizer import load_model_with_fallback
+
+        monkeypatch.setattr(
+            mlx_lm,
+            "load",
+            lambda name, tokenizer_config=None: (
+                None,
+                load_tokenizer(Path(name), tokenizer_config),
+            ),
+        )
+        _, tokenizer = load_model_with_fallback(str(checkpoint))
+        assert tokenizer.encode("hello", add_special_tokens=True)[0] == 1
+        assert 1 not in tokenizer.encode("hello", add_special_tokens=False)
+
+
+_MINISTRAL = "models--mlx-community--Ministral-3-3B-Instruct-2512-4bit"
+
+
+def _tekken_snapshot(model_dir: str, env: str) -> str:
+    candidates = [os.environ.get(env)]
+    for hub in (
+        _HUB,
+        "/hive-cache/models/hub",
+        "/hive-cache/codeagent/models/hub",
+    ):
+        candidates += sorted(glob.glob(os.path.join(hub, model_dir, "snapshots", "*")))
+    for path in candidates:
+        if path and all(
+            os.path.exists(os.path.join(path, name))
+            for name in ("tekken.json", "tokenizer.json", "chat_template.jinja")
+        ):
+            return path
+    pytest.skip(f"{model_dir} tokenizer files not found (set {env} or HF_HOME)")
+
+
+@functools.cache
+def _real_tekken(snapshot: str):
+    from mistral_common.tokens.tokenizers.tekken import Tekkenizer
+
+    return Tekkenizer.from_file(os.path.join(snapshot, "tekken.json"))
+
+
+@functools.cache
+def _real_fast(snapshot: str):
+    reference = mt.reference_tokenizer(snapshot)
+    assert reference is not None
+    fast = mt.equivalent_fast_tokenizer(snapshot, reference)
+    assert fast is not None, "tokenizer.json is not equivalent to tekken.json"
+    return fast
+
+
+@pytest.mark.parametrize(
+    "model_dir,env",
+    [
+        (_MINISTRAL, "VLLM_MLX_MINISTRAL_DIR"),
+        (_DEVSTRAL, "VLLM_MLX_DEVSTRAL_DIR"),
+    ],
+    ids=["ministral-3-3b", "devstral-small-2"],
+)
+class TestRealTekkenRawPromptBos:
+    """The real checkpoints against ``mistral_common``'s ``Tekkenizer`` itself."""
+
+    @pytest.fixture
+    def tekken(self, model_dir, env):
+        return _real_tekken(_tekken_snapshot(model_dir, env))
+
+    @pytest.fixture
+    def fast(self, model_dir, env):
+        return _real_fast(_tekken_snapshot(model_dir, env))
+
+    @pytest.mark.parametrize("prompt", RAW_PROMPTS)
+    def test_raw_prompt_ids_are_mistral_commons(self, tekken, fast, prompt):
+        from vllm_mlx.utils.tokenizer import encode_prompt
+
+        expected = tekken.encode(prompt, bos=True, eos=False)
+        assert expected[0] == tekken.bos_id
+        assert encode_prompt(fast, prompt, None) == expected
+        assert encode_prompt(fast, prompt, False) == expected[1:]
+
+    def test_rendered_chat_prompt_keeps_a_single_bos(self, tekken, fast):
+        from vllm_mlx.utils.tokenizer import encode_prompt
+
+        messages = [{"role": "user", "content": "hi"}]
+        text = fast.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        expected = _ids(
+            fast.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True
+            )
+        )
+        assert expected[0] == tekken.bos_id and expected.count(tekken.bos_id) == 1
+        assert encode_prompt(fast, text, False) == expected
+        # the rule already keeps the template's BOS when the kind is unknown
+        assert encode_prompt(fast, text, None) == expected
