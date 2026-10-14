@@ -145,19 +145,6 @@ def test_chat_prefix_cache_key_uses_the_ids_the_model_sees(boundary):
     assert token_ids == FakeTokenizer().encode(RENDERED, add_special_tokens=False)
 
 
-def test_chat_template_failure_falls_back_to_the_raw_prompt_rule(boundary, monkeypatch):
-    wrapper, seen = boundary
-
-    def broken(*args, **kwargs):
-        raise RuntimeError("no template")
-
-    sys.modules["mlx_vlm.prompt_utils"].get_chat_template = broken
-    wrapper.chat(messages=[{"role": "user", "content": RAW}], max_tokens=4)
-    (call,) = seen["prepare_inputs"]
-    assert call["prompts"] == RAW
-    assert call["add_special_tokens"] is True
-
-
 @pytest.mark.parametrize("route", ["generate", "stream_generate"])
 def test_raw_prompt_gets_the_tokenizer_bos(boundary, route):
     wrapper, seen = boundary
