@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
-from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import (
     MemoryAwarePrefixCache,
@@ -47,6 +46,7 @@ from .request import (
     UnsupportedRequestOption,
 )
 from .utils.mamba_cache import ensure_mamba_support
+from .utils.tokenizer import boundary_token_ids, streaming_detokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -924,6 +924,8 @@ class Scheduler:
         # The model's EOS ids, read from the tokenizer on first use. Needed to
         # keep EOS tokens out of the text of ``ignore_eos`` requests.
         self._eos_token_id_set: Optional[Set[int]] = None
+        # Tokens vLLM never renders (``boundary_token_ids``), same lazy read.
+        self._hidden_token_id_set: Optional[frozenset] = None
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -1033,7 +1035,9 @@ class Scheduler:
     def _get_detokenizer(self, request_id: str) -> Any:
         """Get or create a streaming detokenizer for a request."""
         if request_id not in self._detokenizer_pool:
-            detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
+            detok = streaming_detokenizer(
+                self._actual_tokenizer, self._hidden_token_ids()
+            )
             self._detokenizer_pool[request_id] = detok
         return self._detokenizer_pool[request_id]
 
@@ -1066,6 +1070,12 @@ class Scheduler:
         if self._eos_token_id_set is None:
             self._eos_token_id_set = self._get_stop_tokens()
         return self._eos_token_id_set
+
+    def _hidden_token_ids(self) -> frozenset:
+        """Ids that never reach the text (EOS, BOS, PAD, UNK; cached)."""
+        if self._hidden_token_id_set is None:
+            self._hidden_token_id_set = boundary_token_ids(self._actual_tokenizer)
+        return self._hidden_token_id_set
 
     def _create_batch_generator(
         self, sampling_params: SamplingParams

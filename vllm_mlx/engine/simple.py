@@ -34,7 +34,7 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from ..request import UnsupportedRequestOption
-from ..utils.tokenizer import collect_eos_token_ids, eos_ignoring_tokenizer
+from ..utils.tokenizer import decode_visible, eos_ignoring_tokenizer
 from .base import (
     BaseEngine,
     EngineBusy,
@@ -1113,12 +1113,14 @@ class SimpleEngine(BaseEngine):
             # stop-token handling on the batched path.
             from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-            from ..utils.tokenizer import collect_eos_token_ids
+            from ..utils.tokenizer import collect_eos_token_ids, hide_boundary_tokens
 
             eos_ids = collect_eos_token_ids(self._text_tokenizer)
-            self._text_tokenizer = TokenizerWrapper(
-                self._text_tokenizer,
-                eos_token_ids=eos_ids or None,
+            self._text_tokenizer = hide_boundary_tokens(
+                TokenizerWrapper(
+                    self._text_tokenizer,
+                    eos_token_ids=eos_ids or None,
+                )
             )
             logger.info("Text route stop tokens: %s", sorted(eos_ids))
 
@@ -2684,15 +2686,9 @@ class SimpleEngine(BaseEngine):
                 first_token_id = sampler(logits[:, -1, :]).item()
                 eos_id = tokenizer.eos_token_id
                 if ignore_eos:
-                    # EOS does not end the response, and is not rendered.
-                    first_text = (
-                        ""
-                        if first_token_id in collect_eos_token_ids(tokenizer)
-                        else tokenizer.decode([first_token_id])
-                    )
+                    # EOS does not end the response.
                     eos_id = None
-                else:
-                    first_text = tokenizer.decode([first_token_id])
+                first_text = decode_visible(tokenizer, [first_token_id])
 
                 results = [
                     SimpleNamespace(
@@ -3365,20 +3361,12 @@ class SimpleEngine(BaseEngine):
                 )
                 mx.eval(y)
 
-                generated_ids = []
-                prev_decoded = ""
-
                 tok_id = y.item()
-                generated_ids.append(tok_id)
 
-                decoded = self._text_tokenizer.decode(generated_ids)
-                new_text = decoded[len(prev_decoded) :]
-                prev_decoded = decoded
-
-                # ignore_eos: an EOS seed token is neither a stop nor text.
+                # The seed token is text unless it is EOS/BOS/PAD/UNK (never
+                # rendered; an EOS seed is still a stop unless ignore_eos).
+                new_text = decode_visible(self._text_tokenizer, [tok_id])
                 is_eos = tok_id == eos_id and not ignore_eos
-                if ignore_eos and tok_id in collect_eos_token_ids(self._text_tokenizer):
-                    new_text = ""
                 _emit_response(
                     SimpleNamespace(
                         text=new_text,

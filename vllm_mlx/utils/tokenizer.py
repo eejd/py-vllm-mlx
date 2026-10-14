@@ -84,14 +84,37 @@ def collect_eos_token_ids(tokenizer, model_path=None) -> set:
     return eos_ids
 
 
-class _EosSkippingDetokenizer:
-    """Streaming detokenizer that drops EOS ids instead of rendering them.
+def boundary_token_ids(tokenizer) -> frozenset:
+    """Ids of the tokens that delimit a sequence and are never text.
+
+    The EOS ids (``collect_eos_token_ids``) plus the tokenizer's BOS, PAD and UNK.
+    vLLM renders none of them: it detokenizes with ``skip_special_tokens=True``. A
+    base-style model that ends a document with ``<|end_of_text|>`` where the
+    checkpoint declares another EOS (Hermes-3 on Llama-3.2: EOS ``<|im_end|>``,
+    PAD ``<|end_of_text|>``) goes on generating ``<|begin_of_text|>`` and the next
+    document, and mlx-lm's detokenizers would put both markers into the text.
+
+    The other special tokens (``<|python_tag|>``, ``<|channel|>``, ``[TOOL_CALLS]``,
+    ...) are not here: the tool-call and reasoning parsers read them out of the
+    text.
+    """
+    hidden = set(collect_eos_token_ids(tokenizer))
+    for attr in ("bos_token_id", "pad_token_id", "unk_token_id"):
+        token_id = getattr(tokenizer, attr, None)
+        if isinstance(token_id, int):
+            hidden.add(token_id)
+    return frozenset(hidden)
+
+
+class _TokenSkippingDetokenizer:
+    """Streaming detokenizer that drops some token ids instead of rendering them.
 
     mlx-lm's ``stream_generate`` never feeds EOS to the detokenizer because it
-    stops there. When generation runs past EOS (``ignore_eos``) the EOS tokens
-    would otherwise be decoded into the text (``<|im_end|>`` and friends). vLLM
-    hides them too (``skip_special_tokens`` defaults to true), and a natural
-    stop never shows them, so they are skipped here.
+    stops there. When generation runs past EOS (``ignore_eos``), or past a
+    boundary token the checkpoint does not declare as EOS, those tokens would
+    otherwise be decoded into the text (``<|im_end|>``, ``<|end_of_text|>`` and
+    friends). vLLM hides them (``skip_special_tokens`` defaults to true), so they
+    are skipped here; they are still generated and counted.
     """
 
     def __init__(self, inner, skip_ids):
@@ -112,6 +135,47 @@ class _EosSkippingDetokenizer:
         if name.startswith("__") or name in ("_inner", "_skip_ids"):
             raise AttributeError(name)
         return getattr(self._inner, name)
+
+
+def hide_boundary_tokens(tokenizer):
+    """``tokenizer`` as an mlx-lm ``TokenizerWrapper`` that never renders
+    ``boundary_token_ids`` (see there).
+
+    Every text path that detokenizes through the tokenizer (``mlx_lm.generate``
+    and ``stream_generate``, with or without a prompt cache) picks it up. The
+    wrapper is modified in place, so call it once on the tokenizer the engine
+    owns; a second call is a no-op.
+    """
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+    hidden = boundary_token_ids(tokenizer)
+    if hidden and not isinstance(tokenizer._detokenizer, _TokenSkippingDetokenizer):
+        tokenizer._detokenizer = _TokenSkippingDetokenizer(
+            tokenizer._detokenizer, hidden
+        )
+    return tokenizer
+
+
+def streaming_detokenizer(tokenizer, hidden_ids=None):
+    """A fresh per-request streaming detokenizer for ``tokenizer`` that skips
+    ``hidden_ids`` (default ``boundary_token_ids(tokenizer)``).
+
+    For the batching schedulers, which feed the tokens of many requests through
+    detokenizers they own instead of ``tokenizer.detokenizer``.
+    """
+    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+
+    if hidden_ids is None:
+        hidden_ids = boundary_token_ids(tokenizer)
+    return _TokenSkippingDetokenizer(NaiveStreamingDetokenizer(tokenizer), hidden_ids)
+
+
+def decode_visible(tokenizer, token_ids) -> str:
+    """``tokenizer.decode(token_ids)`` without the ``boundary_token_ids``."""
+    hidden = boundary_token_ids(tokenizer)
+    return tokenizer.decode([t for t in token_ids if t not in hidden])
 
 
 def eos_ignoring_tokenizer(tokenizer):
@@ -135,7 +199,7 @@ def eos_ignoring_tokenizer(tokenizer):
             # which rebuilds the detokenizer token map.
             self.__dict__.update(base.__dict__)
             self._eos_token_ids = set()
-            self._detokenizer = _EosSkippingDetokenizer(
+            self._detokenizer = _TokenSkippingDetokenizer(
                 base._detokenizer, frozenset(base.eos_token_ids)
             )
 
@@ -227,6 +291,7 @@ def load_model_with_fallback(
     model, tokenizer = _load_model_with_fallback(model_name, tokenizer_config)
     tokenizer = _install_custom_chat_template(model_name, tokenizer)
     apply_chat_template_override(tokenizer, chat_template)
+    tokenizer = hide_boundary_tokens(tokenizer)
     return model, tokenizer
 
 
