@@ -33,7 +33,10 @@ from .base import (
     cleanup_startup_cancellation,
     run_blocking_startup_work,
 )
-from .chat_template_safety import normalize_messages_for_chat_template
+from .chat_template_safety import (
+    chat_template_rejections,
+    normalize_messages_for_chat_template,
+)
 from ..request import ERROR_KIND_PREPROCESSING
 
 logger = logging.getLogger(__name__)
@@ -732,6 +735,22 @@ class BatchedEngine(BaseEngine):
         """
         messages = _normalize_tool_call_arguments_for_template(messages)
 
+        # A multimodal template that cannot render tool turns (Gemma-3's knows only
+        # user/model/system and raises "Conversation roles must alternate" on a
+        # ``tool`` message) gets them as Gemma-native text, as the simple engine's
+        # MLLM route has done since #82. Without it a conversation that carries a
+        # tool result cannot be served at all by this engine.
+        if self._is_mllm and self._processor is not None:
+            from ..models.mllm import (
+                _serialize_tool_messages_gemma_native,
+                _template_supports_tool_role,
+            )
+
+            if not _template_supports_tool_role(
+                self._processor, getattr(self._mllm_instance, "config", None)
+            ):
+                messages = _serialize_tool_messages_gemma_native(messages)
+
         # Choose the best template applicator.
         # For MLLM models, the processor handles special vision tokens.
         # For text-only models, the tokenizer is sufficient.
@@ -771,33 +790,36 @@ class BatchedEngine(BaseEngine):
             ):
                 tokenizer_applicator = tokenizer
 
-            try:
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
-            except ValueError as e:
-                # Some HF processors define apply_chat_template but do not carry
-                # a template (e.g. Gemma-3 processor). Retry on tokenizer.
-                if (
-                    tokenizer_applicator is not None
-                    and "does not have a chat template" in str(e)
-                ):
-                    return tokenizer_applicator.apply_chat_template(
+            with chat_template_rejections():
+                try:
+                    return template_applicator.apply_chat_template(
                         messages, **template_kwargs
                     )
-                raise
-            except TypeError as e:
-                # Some templates don't accept extra kwargs; retry without them.
-                logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in [
-                    "tools",
-                    "enable_thinking",
-                    *(chat_template_kwargs or {}).keys(),
-                ]:
-                    template_kwargs.pop(key, None)
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
+                except ValueError as e:
+                    # Some HF processors define apply_chat_template but do not
+                    # carry a template (e.g. Gemma-3 processor). Retry on tokenizer.
+                    if (
+                        tokenizer_applicator is not None
+                        and "does not have a chat template" in str(e)
+                    ):
+                        return tokenizer_applicator.apply_chat_template(
+                            messages, **template_kwargs
+                        )
+                    raise
+                except TypeError as e:
+                    # Some templates don't accept extra kwargs; retry without them.
+                    logger.debug(
+                        f"Chat template TypeError, retrying without extras: {e}"
+                    )
+                    for key in [
+                        "tools",
+                        "enable_thinking",
+                        *(chat_template_kwargs or {}).keys(),
+                    ]:
+                        template_kwargs.pop(key, None)
+                    return template_applicator.apply_chat_template(
+                        messages, **template_kwargs
+                    )
         else:
             # Fallback for models without apply_chat_template
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -1075,6 +1097,34 @@ class BatchedEngine(BaseEngine):
                 mtp_accepted=output.mtp_accepted,
                 cached_tokens=output.cached_tokens,
             )
+
+    async def validate_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+        **_chat_kwargs: Any,
+    ) -> None:
+        """Render the prompt ``chat``/``stream_chat`` would build, discarding it.
+
+        Raises ``ChatTemplateRejected`` when the template refuses the messages, so a
+        streaming request is answered 400 before its response starts. Same inputs,
+        same renderer (``_apply_chat_template``) as the request itself.
+        """
+        if not self._loaded:
+            await self.start()
+        _, extracted_images, _videos, audios = extract_multimodal_content(messages)
+        self._apply_chat_template(
+            messages,
+            convert_tools_for_template(tools) if tools else None,
+            num_images=len(images or []) + len(extracted_images),
+            num_audios=len(audios),
+            chat_template_kwargs=dict(chat_template_kwargs or {}),
+            enable_thinking=enable_thinking,
+        )
 
     async def chat(
         self,

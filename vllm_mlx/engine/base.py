@@ -337,6 +337,24 @@ class BaseEngine(ABC):
         per-request drafter override (``None``: the engine default).
         """
 
+    async def validate_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        **chat_kwargs: Any,
+    ) -> None:
+        """Raise ``ChatTemplateRejected`` if the chat template refuses ``messages``.
+
+        Called by the server before it commits to a streaming response: once the
+        200 and the first SSE frame are out, a template that rejects the messages
+        (a conversation the model's template cannot render) can no longer change
+        the status, so the request would end as an empty 200 instead of the 400
+        vLLM returns. ``chat_kwargs`` is what the request would pass to ``chat`` /
+        ``stream_chat``; an engine reads the template inputs it needs (``tools``,
+        ``chat_template_kwargs``, ``enable_thinking``) and renders exactly as its
+        chat route would. The default accepts everything: an engine that does not
+        implement the pre-check still answers 400 on non-streaming requests.
+        """
+
     @property
     def preserve_native_tool_format(self) -> bool:
         """

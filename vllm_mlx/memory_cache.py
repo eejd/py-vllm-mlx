@@ -701,6 +701,130 @@ def _collect_mx_array_ids(
         _collect_mx_array_ids(v, mx, out, _seen)
 
 
+# The detach helpers below are module-level functions that thread ``mx`` and the
+# ``eval_targets`` list through as arguments, deliberately NOT closures over the
+# caller's locals.  The first implementation nested them inside
+# ``_detach_cache_for_storage``: ``_detach_container`` recursed through its own
+# closure cell, which is a reference cycle, and the cell group captured
+# ``eval_targets`` -- the list holding every freshly copied KV array of the entry.
+# Reference counting never frees a cycle, so each store left its whole snapshot
+# alive until the next cyclic GC pass, *after* the entry itself had been evicted.
+# MLX arrays do not count towards Python's GC allocation thresholds, so that pass
+# can be arbitrarily late: at a 64k context on a 30B model every evicted 6.4 GB
+# entry stayed resident and active memory climbed by one entry per request until
+# Metal ran out of memory.  Plain functions have no cells, hence no cycle, and the
+# list dies with the call frame.
+
+
+def _detach_array(arr: Any, mx: Any, eval_targets: list[Any]) -> Any:
+    # Only real MLX arrays are detached: they alone carry a lazy graph
+    # and Metal buffers.  Duck-typed array-likes (test doubles, numpy)
+    # have nothing to pin and pass through unchanged.
+    if mx is None or not isinstance(arr, mx.array):
+        return arr
+    # ``arr + 0`` guarantees a freshly allocated buffer.  mx.contiguous
+    # is documented to copy only when necessary and may share the input
+    # buffer for an already-row-contiguous input, which would let the
+    # stored snapshot alias live storage.  ``+ 0`` promotes bool to
+    # int32, so cast back — the cast reads the already-fresh buffer, the
+    # allocation guarantee holds either way.
+    out = arr + 0
+    if out.dtype != arr.dtype:
+        out = out.astype(arr.dtype)
+    eval_targets.append(out)
+    return out
+
+
+def _detach_container_value(value: Any, mx: Any, eval_targets: list[Any]) -> Any:
+    if isinstance(value, tuple):
+        return tuple(_detach_container_value(v, mx, eval_targets) for v in value)
+    if isinstance(value, list):
+        return [_detach_container_value(v, mx, eval_targets) for v in value]
+    if isinstance(value, dict):
+        # Nested mapping state (e.g. {"ssm": array}) — rebuild the
+        # mapping so the snapshot owns its container, preserving the
+        # mapping type.  A mapping type whose constructor rejects an
+        # iterable of pairs raises and fails the store closed.
+        return type(value)(
+            (k, _detach_container_value(v, mx, eval_targets)) for k, v in value.items()
+        )
+    if (
+        value is not None
+        and not (hasattr(value, "shape") and hasattr(value, "dtype"))
+        and _bears_arrays(value)
+    ):
+        # A non-array object (or unsupported container, e.g. a set)
+        # smuggling arrays inside a state payload: copying around it
+        # would alias whatever it holds.  Fail closed.
+        raise UndetachableCacheError(
+            f"state payload holds arrays inside an unsupported "
+            f"{type(value).__name__}"
+        )
+    return _detach_array(value, mx, eval_targets)
+
+
+def _detach_layer(layer: Any, mx: Any, eval_targets: list[Any]) -> Any:
+    if layer is None:
+        return layer
+    if isinstance(layer, dict):
+        if "state" in layer:
+            snap_dict = dict(layer)
+            snap_dict["state"] = _detach_container_value(
+                layer["state"], mx, eval_targets
+            )
+            rest = {k: v for k, v in snap_dict.items() if k != "state"}
+            if _bears_arrays(rest):
+                raise UndetachableCacheError(
+                    "dict layer carries arrays outside its 'state' field"
+                )
+            return snap_dict
+        if _bears_arrays(layer):
+            raise UndetachableCacheError("dict layer without 'state' carries arrays")
+        return layer
+    # copy.copy (not __new__ + __dict__.update) so classes using
+    # __slots__ (e.g. _QuantizedCacheWrapper) snapshot correctly too.
+    if hasattr(layer, "keys") and not callable(getattr(layer, "keys")):
+        # KVCache / RotatingKVCache / _QuantizedCacheWrapper style.
+        snap = copy.copy(layer)
+        snap.keys = _detach_container_value(layer.keys, mx, eval_targets)
+        snap.values = _detach_container_value(layer.values, mx, eval_targets)
+        # Batch variants also carry per-row metadata arrays that the
+        # batch generator rebinds (offset is an mx.array there).
+        for attr in ("left_padding", "lengths", "offset"):
+            extra = getattr(snap, attr, None)
+            if extra is not None and hasattr(extra, "shape"):
+                setattr(snap, attr, _detach_array(extra, mx, eval_targets))
+        return snap
+    if hasattr(layer, "caches") and isinstance(getattr(layer, "caches"), (list, tuple)):
+        # Container caches (e.g. ``CacheList``): their ``state`` setter
+        # writes through to the child caches in place, so going through
+        # the setter would mutate the caller's children.  Snapshot the
+        # children recursively instead.
+        snap = copy.copy(layer)
+        children = _detach_cache_for_storage(
+            list(layer.caches), _eval_targets=eval_targets
+        )
+        snap.caches = tuple(children) if isinstance(layer.caches, tuple) else children
+        return snap
+    if hasattr(layer, "state"):
+        # Hybrid state-container layers (e.g. ``ArraysCache``): ``.state``
+        # returns the live mutable list — clone the container and detach
+        # its arrays instead of aliasing it.
+        snap = copy.copy(layer)
+        snap.state = _detach_container_value(layer.state, mx, eval_targets)
+        for attr in ("left_padding", "lengths"):
+            if getattr(snap, attr, None) is not None:
+                setattr(
+                    snap, attr, _detach_array(getattr(snap, attr), mx, eval_targets)
+                )
+        return snap
+    if _bears_arrays(layer):
+        raise UndetachableCacheError(
+            f"unrecognized cache layer type {type(layer).__name__} " "carries arrays"
+        )
+    return layer
+
+
 def _detach_cache_for_storage(
     cache: list[Any], _eval_targets: list[Any] | None = None
 ) -> list[Any]:
@@ -742,117 +866,10 @@ def _detach_cache_for_storage(
     is_root = _eval_targets is None
     eval_targets: list[Any] = [] if is_root else _eval_targets
 
-    def _detach(arr: Any) -> Any:
-        # Only real MLX arrays are detached: they alone carry a lazy graph
-        # and Metal buffers.  Duck-typed array-likes (test doubles, numpy)
-        # have nothing to pin and pass through unchanged.
-        if mx is None or not isinstance(arr, mx.array):
-            return arr
-        # ``arr + 0`` guarantees a freshly allocated buffer.  mx.contiguous
-        # is documented to copy only when necessary and may share the input
-        # buffer for an already-row-contiguous input, which would let the
-        # stored snapshot alias live storage.  ``+ 0`` promotes bool to
-        # int32, so cast back — the cast reads the already-fresh buffer, the
-        # allocation guarantee holds either way.
-        out = arr + 0
-        if out.dtype != arr.dtype:
-            out = out.astype(arr.dtype)
-        eval_targets.append(out)
-        return out
-
-    def _detach_container(value: Any) -> Any:
-        if isinstance(value, tuple):
-            return tuple(_detach_container(v) for v in value)
-        if isinstance(value, list):
-            return [_detach_container(v) for v in value]
-        if isinstance(value, dict):
-            # Nested mapping state (e.g. {"ssm": array}) — rebuild the
-            # mapping so the snapshot owns its container, preserving the
-            # mapping type.  A mapping type whose constructor rejects an
-            # iterable of pairs raises and fails the store closed.
-            return type(value)((k, _detach_container(v)) for k, v in value.items())
-        if (
-            value is not None
-            and not (hasattr(value, "shape") and hasattr(value, "dtype"))
-            and _bears_arrays(value)
-        ):
-            # A non-array object (or unsupported container, e.g. a set)
-            # smuggling arrays inside a state payload: copying around it
-            # would alias whatever it holds.  Fail closed.
-            raise UndetachableCacheError(
-                f"state payload holds arrays inside an unsupported "
-                f"{type(value).__name__}"
-            )
-        return _detach(value)
-
-    def _detach_layer(layer: Any) -> Any:
-        if layer is None:
-            return layer
-        if isinstance(layer, dict):
-            if "state" in layer:
-                snap_dict = dict(layer)
-                snap_dict["state"] = _detach_container(layer["state"])
-                rest = {k: v for k, v in snap_dict.items() if k != "state"}
-                if _bears_arrays(rest):
-                    raise UndetachableCacheError(
-                        "dict layer carries arrays outside its 'state' field"
-                    )
-                return snap_dict
-            if _bears_arrays(layer):
-                raise UndetachableCacheError(
-                    "dict layer without 'state' carries arrays"
-                )
-            return layer
-        # copy.copy (not __new__ + __dict__.update) so classes using
-        # __slots__ (e.g. _QuantizedCacheWrapper) snapshot correctly too.
-        if hasattr(layer, "keys") and not callable(getattr(layer, "keys")):
-            # KVCache / RotatingKVCache / _QuantizedCacheWrapper style.
-            snap = copy.copy(layer)
-            snap.keys = _detach_container(layer.keys)
-            snap.values = _detach_container(layer.values)
-            # Batch variants also carry per-row metadata arrays that the
-            # batch generator rebinds (offset is an mx.array there).
-            for attr in ("left_padding", "lengths", "offset"):
-                extra = getattr(snap, attr, None)
-                if extra is not None and hasattr(extra, "shape"):
-                    setattr(snap, attr, _detach(extra))
-            return snap
-        if hasattr(layer, "caches") and isinstance(
-            getattr(layer, "caches"), (list, tuple)
-        ):
-            # Container caches (e.g. ``CacheList``): their ``state`` setter
-            # writes through to the child caches in place, so going through
-            # the setter would mutate the caller's children.  Snapshot the
-            # children recursively instead.
-            snap = copy.copy(layer)
-            children = _detach_cache_for_storage(
-                list(layer.caches), _eval_targets=eval_targets
-            )
-            snap.caches = (
-                tuple(children) if isinstance(layer.caches, tuple) else children
-            )
-            return snap
-        if hasattr(layer, "state"):
-            # Hybrid state-container layers (e.g. ``ArraysCache``): ``.state``
-            # returns the live mutable list — clone the container and detach
-            # its arrays instead of aliasing it.
-            snap = copy.copy(layer)
-            snap.state = _detach_container(layer.state)
-            for attr in ("left_padding", "lengths"):
-                if getattr(snap, attr, None) is not None:
-                    setattr(snap, attr, _detach(getattr(snap, attr)))
-            return snap
-        if _bears_arrays(layer):
-            raise UndetachableCacheError(
-                f"unrecognized cache layer type {type(layer).__name__} "
-                "carries arrays"
-            )
-        return layer
-
     detached: list[Any] = []
     for layer in cache:
         try:
-            detached.append(_detach_layer(layer))
+            detached.append(_detach_layer(layer, mx, eval_targets))
         except UndetachableCacheError:
             raise
         except Exception as e:

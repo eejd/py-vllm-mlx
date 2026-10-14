@@ -45,6 +45,108 @@ def _is_plain_tool_name(name: str) -> bool:
     return bool(_TOOL_NAME_PATTERN.match(name))
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _json_prefix_end(text: str) -> int | None:
+    """Length of the first complete JSON value at the start of ``text``.
+
+    ``text`` must already be stripped of leading whitespace. Returns None when it does
+    not begin with a complete JSON value (empty, malformed, or cut off).
+
+    A v11+ call (``name[ARGS]{...}``) has no terminator of its own, so a model may add
+    ordinary text after the closing brace. That text is not part of the arguments:
+    taking the whole remainder as the arguments (or rejecting the call because the
+    remainder is not JSON) breaks the call. Upstream vLLM does the same since
+    vllm-project/vllm#48975.
+    """
+    try:
+        return _JSON_DECODER.raw_decode(text)[1]
+    except json.JSONDecodeError:
+        return None
+
+
+class _ArgsScanner:
+    """Follows one call's JSON arguments value through text that arrives in pieces.
+
+    Used by the streaming path (one delta at a time) and by the marker splitter of the
+    complete-output path, so both agree on where a call's arguments end and where the
+    next call begins:
+
+    - a ``[TOOL_CALLS]`` marker inside a quoted string is argument data, not a new
+      call (untrusted model output must not forge a second dispatchable call);
+    - the arguments end where the outermost object/array (or a top-level string)
+      closes. A bare scalar (a number, ``true``: not valid arguments, but what a model
+      may write) ends at the first whitespace, as with ``raw_decode``. That is known
+      once the arguments start: from the start of the text when ``scalars`` is set
+      (the stream, which sees the arguments alone), after the ``[ARGS]`` separator
+      otherwise (the splitter, which also sees the tool name, and in the legacy
+      ``name{...}`` format the value is an object anyway);
+    - once the value has ended, quotes in whatever the model wrote next are prose, not
+      JSON, so they cannot hide the next call's marker.
+
+    The ``[ARGS]`` separator ahead of the value (``name[ARGS]{...}``) is skipped
+    rather than counted as an array.
+    """
+
+    __slots__ = ("in_string", "escaped", "depth", "done", "scalars", "in_scalar")
+
+    BOT_TOKEN = "[TOOL_CALLS]"
+    ARGS_TOKEN = "[ARGS]"
+
+    def __init__(self, scalars: bool = False) -> None:
+        self.in_string = False
+        self.escaped = False
+        self.depth = 0
+        self.done = False
+        self.scalars = scalars
+        self.in_scalar = False
+
+    def scan(self, text: str, i: int = 0) -> tuple[int, int]:
+        """Scan ``text`` from ``i``; return ``(args_end, marker)``.
+
+        ``text[i:args_end]`` is arguments text (or the name/``[ARGS]`` that precedes
+        it); ``marker`` is the position of the ``[TOOL_CALLS]`` marker that opens the
+        next call, -1 when there is none. Text between ``args_end`` and ``marker`` (or
+        the end) follows a complete arguments value.
+        """
+        n = len(text)
+        while i < n:
+            if self.done:
+                return i, text.find(self.BOT_TOKEN, i)
+            ch = text[i]
+            if self.escaped:
+                self.escaped = False
+            elif self.in_string:
+                if ch == "\\":
+                    self.escaped = True
+                elif ch == '"':
+                    self.in_string = False
+                    self.done = self.depth == 0
+            elif ch == '"':
+                self.in_string = True
+            elif text.startswith(self.BOT_TOKEN, i):
+                return i, i
+            elif self.depth == 0 and text.startswith(self.ARGS_TOKEN, i):
+                i += len(self.ARGS_TOKEN)
+                self.scalars = True
+                continue
+            elif ch in "{[":
+                self.depth += 1
+            elif ch in "}]":
+                if self.depth > 0:
+                    self.depth -= 1
+                    self.done = self.depth == 0
+            elif self.scalars and self.depth == 0:
+                if not ch.isspace():
+                    self.in_scalar = True
+                elif self.in_scalar:
+                    self.done = True
+                    continue
+            i += 1
+        return n, -1
+
+
 @ToolParserManager.register_module("mistral")
 class MistralToolParser(ToolParser):
     """
@@ -69,14 +171,12 @@ class MistralToolParser(ToolParser):
         super().__init__(tokenizer)
         self.bot_token_id = self.vocab.get(self.BOT_TOKEN) if self.vocab else None
         # Streaming state for the name/arguments boundary within the current
-        # tool call. See _parse_streaming_tool_delta.
+        # tool call. See _feed_name.
         self._args_started: bool = False
-        # Quote state carried across argument deltas, used to tell a
-        # [TOOL_CALLS] marker inside a JSON string (argument data) from a
-        # marker between two calls (a new index). See
-        # _scan_args_for_new_call.
-        self._args_in_string: bool = False
-        self._args_escaped: bool = False
+        # Where the current call's JSON arguments end, carried across deltas so
+        # text the model adds after them is not streamed as arguments and a
+        # [TOOL_CALLS] marker inside a JSON string stays argument data.
+        self._scanner = _ArgsScanner(scalars=True)
         self._name_buffer: str = ""
         # Set when the boundary marker never arrives and the withheld text
         # was flushed as content; subsequent deltas pass through as content.
@@ -85,75 +185,52 @@ class MistralToolParser(ToolParser):
         # attached to whichever delta is the first to carry real content
         # (name and/or arguments) — that may not be the delta containing
         # BOT_TOKEN itself, since the name can still be buffered pending the
-        # [ARGS]/`{` boundary. See _parse_streaming_tool_delta.
+        # [ARGS]/`{` boundary. See _append_call_delta.
         self._current_tool_call_id: str | None = None
         self._tool_call_id_emitted: bool = False
+        # A call extract_tool_calls would not dispatch (see _feed_name) is read
+        # through and never sent. The index a call is sent under counts the calls
+        # sent so far, so a skipped call leaves no gap.
+        self._call_dropped: bool = False
+        self._call_index: int | None = None
+        self._calls_sent: int = 0
 
     def reset(self) -> None:
         super().reset()
+        self._reset_call_state()
+        self._current_tool_call_id = None
+        self._calls_sent = 0
+
+    def _reset_call_state(self) -> None:
+        """Forget the name/arguments/id state of the current streaming call."""
         self._args_started = False
-        self._args_in_string = False
-        self._args_escaped = False
+        self._scanner = _ArgsScanner(scalars=True)
         self._name_buffer = ""
         self._name_buffer_overflow = False
-        self._current_tool_call_id = None
         self._tool_call_id_emitted = False
+        self._call_dropped = False
+        self._call_index = None
 
     def _start_new_tool_call(self) -> None:
         """Begin a new streaming tool call: bump the index and reset the
         per-call name/arguments and id state."""
         self.current_tool_id += 1
-        self._args_started = False
-        self._args_in_string = False
-        self._args_escaped = False
-        self._name_buffer = ""
-        self._name_buffer_overflow = False
+        self._reset_call_state()
         self._current_tool_call_id = generate_mistral_tool_id()
-        self._tool_call_id_emitted = False
-
-    def _scan_args_for_new_call(self, text: str) -> int:
-        """Scan an argument delta, updating the persistent JSON string state,
-        and return the position of the first [TOOL_CALLS] marker that sits
-        outside a string (a new call), or -1 when there is none.
-
-        Quote state is carried across deltas so a marker inside a quoted
-        value (e.g. ``{"city": "[TOOL_CALLS]rm"}``) stays argument data while
-        a marker between two calls opens the next index.
-        """
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            if self._args_escaped:
-                self._args_escaped = False
-                i += 1
-                continue
-            if self._args_in_string:
-                if ch == "\\":
-                    self._args_escaped = True
-                elif ch == '"':
-                    self._args_in_string = False
-                i += 1
-                continue
-            if ch == '"':
-                self._args_in_string = True
-                i += 1
-                continue
-            if text.startswith(self.BOT_TOKEN, i):
-                return i
-            i += 1
-        return -1
 
     def _split_on_tool_call_markers(self, text: str) -> list[str]:
-        """Split on [TOOL_CALLS] occurrences that are outside JSON strings.
+        """Split on [TOOL_CALLS] occurrences that are not argument data.
 
         A marker appearing inside a quoted string value is argument data,
         not a new call — splitting there would let untrusted model output
         forge a second dispatchable call.
 
-        The quote-state scan starts at the first marker, not at index 0: the
-        text before the first marker is prose, not JSON, so an odd number of
-        double quotes there must not leave ``in_string`` set when the marker
-        arrives (that would hide the call entirely).
+        The scan starts at the first marker, not at index 0: the text before
+        the first marker is prose, not JSON, so an odd number of double quotes
+        there must not leave a string open when the marker arrives (that would
+        hide the call entirely). For the same reason each call is scanned with
+        its own state, so quotes in text the model writes after one call's
+        arguments cannot hide the next call's marker either.
         """
         token = self.BOT_TOKEN
         first = text.find(token)
@@ -162,30 +239,15 @@ class MistralToolParser(ToolParser):
 
         parts: list[str] = [text[:first]]
         start = first + len(token)
-        in_string = False
-        escaped = False
-        i = start
-        while i < len(text):
-            ch = text[i]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                i += 1
-                continue
-            if ch == '"':
-                in_string = True
-                i += 1
-                continue
-            if text.startswith(token, i):
-                parts.append(text[start:i])
-                start = i + len(token)
-                i += len(token)
-                continue
-            i += 1
+        scanner = _ArgsScanner()
+        pos = start
+        while True:
+            _, marker = scanner.scan(text, pos)
+            if marker == -1:
+                break
+            parts.append(text[start:marker])
+            start = pos = marker + len(token)
+            scanner = _ArgsScanner()
         parts.append(text[start:])
         return parts
 
@@ -231,20 +293,20 @@ class MistralToolParser(ToolParser):
                 and (brace_idx == -1 or args_idx < brace_idx)
             ):
                 tool_name = raw_tool_call[:args_idx].strip()
-                args_str = raw_tool_call[args_idx + len(self.ARGS_TOKEN) :]
+                args_str = raw_tool_call[args_idx + len(self.ARGS_TOKEN) :].strip()
 
                 if tool_name and _is_plain_tool_name(tool_name):
-                    try:
-                        json.loads(args_str)
-                    except json.JSONDecodeError:
+                    args_end = _json_prefix_end(args_str)
+                    if args_end is None:
                         # Malformed arguments — reject rather than emit a
                         # corrupted or forged call.
                         continue
+                    # Text after the arguments is not part of the call.
                     tool_calls.append(
                         {
                             "id": generate_mistral_tool_id(),
                             "name": tool_name,
-                            "arguments": args_str,
+                            "arguments": args_str[:args_end],
                         }
                     )
                 continue
@@ -254,6 +316,12 @@ class MistralToolParser(ToolParser):
                 end_name = raw_tool_call.find("{")
                 tool_name = raw_tool_call[:end_name].strip()
                 args_str = raw_tool_call[end_name:]
+                # Drop text after the arguments. A value that does not parse
+                # (generation cut off) stays as it is: the server completes
+                # its closing braces.
+                args_end = _json_prefix_end(args_str)
+                if args_end is not None:
+                    args_str = args_str[:args_end]
 
                 if tool_name:
                     tool_calls.append(
@@ -267,7 +335,7 @@ class MistralToolParser(ToolParser):
 
             # Try old format: [{"name": "func", "arguments": {...}}]
             try:
-                parsed = json.loads(raw_tool_call)
+                parsed, _ = _JSON_DECODER.raw_decode(raw_tool_call)
                 if isinstance(parsed, list):
                     for item in parsed:
                         if isinstance(item, dict) and "name" in item:
@@ -345,166 +413,172 @@ class MistralToolParser(ToolParser):
         For streaming, we detect when [TOOL_CALLS] appears and start
         accumulating tool call data.
         """
-        # Everything after the name/arguments boundary is arguments text.
-        # A [TOOL_CALLS] marker inside a quoted JSON string value is argument
-        # data, not a new call; a marker outside a string starts the next
-        # call (its own index). The end-of-stream non-streaming re-parse
-        # recovers calls that arrive inside a shared delta.
+        # Text of a call that is past its name/arguments boundary is arguments
+        # text (see _feed_args): a [TOOL_CALLS] marker inside a quoted JSON
+        # string value is argument data, not a new call; a marker outside a
+        # string starts the next call (its own index), and text after a
+        # complete arguments value is dropped, as in extract_tool_calls.
+        result: dict[str, Any] = {}
         if self._args_started:
-            new_call_pos = self._scan_args_for_new_call(delta_text)
-            if new_call_pos == -1:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": self.current_tool_id,
-                            "type": "function",
-                            "function": {"arguments": delta_text},
-                        }
-                    ]
-                }
-            # A new call begins inside this delta: close the current call with
-            # the pre-marker text, then start the next one.
-            result: dict[str, Any] = {}
-            pre = delta_text[:new_call_pos]
-            if pre:
-                result["tool_calls"] = [
-                    {
-                        "index": self.current_tool_id,
-                        "type": "function",
-                        "function": {"arguments": pre},
-                    }
-                ]
-            self._start_new_tool_call()
-            tool_delta = self._parse_streaming_tool_delta(
-                delta_text[new_call_pos + len(self.BOT_TOKEN) :]
-            )
-            if tool_delta:
-                tool_call: dict[str, Any] = {
-                    "index": self.current_tool_id,
-                    "type": "function",
-                    "function": tool_delta,
-                }
-                tool_call["id"] = self._current_tool_call_id
-                self._tool_call_id_emitted = True
-                result["tool_calls"] = (result.get("tool_calls") or []) + [tool_call]
-            return result if result else None
+            self._feed_call(delta_text, result)
+            return result or None
 
         # Check if tool call token is in current output
         if self.BOT_TOKEN not in current_text:
             # Not a tool call yet, return content delta
             return {"content": delta_text}
 
+        # A call still waiting for its name/arguments boundary takes the whole delta:
+        # a marker in it ends that call and opens the next (see _feed_name), and the
+        # text before the marker belongs to the abandoned name, not to the content.
+        if self.current_tool_id >= 0 and not self._name_buffer_overflow:
+            self._feed_call(delta_text, result)
+            return result or None
+
         # Tool call detected
         if self.BOT_TOKEN in delta_text:
             # This delta contains the start of tool calls
-            parts = delta_text.split(self.BOT_TOKEN)
-            content_part = parts[0]
-            tool_part = self.BOT_TOKEN.join(parts[1:])
-
-            result: dict[str, Any] = {}
+            content_part, _, tool_part = delta_text.partition(self.BOT_TOKEN)
             if content_part:
                 result["content"] = content_part
-
-            # Start tracking tool call
             self._start_new_tool_call()
+            self._feed_call(tool_part, result)
+            return result or None
 
-            if tool_part:
-                # Try to parse the tool part
-                tool_delta = self._parse_streaming_tool_delta(tool_part)
-                if tool_delta:
-                    tool_call: dict[str, Any] = {
-                        "index": self.current_tool_id,
-                        "type": "function",
-                        "function": tool_delta,
-                    }
-                    tool_call["id"] = self._current_tool_call_id
-                    self._tool_call_id_emitted = True
-                    result["tool_calls"] = [tool_call]
-
-            return result if result else None
-
-        # We're in the middle of a tool call
+        # The boundary never arrived (see _feed_name): everything is plain text now
         if self.current_tool_id >= 0:
-            if self._name_buffer_overflow:
-                # The boundary never arrived; everything is plain text now.
-                return {"content": delta_text}
-            tool_delta = self._parse_streaming_tool_delta(delta_text)
-            if tool_delta:
-                if self._name_buffer_overflow:
-                    # The withheld name text was flushed as content instead
-                    # of a tool call — pass it through unlabeled.
-                    return {"content": tool_delta["content"]}
-                tool_call = {
-                    "index": self.current_tool_id,
-                    "type": "function",
-                    "function": tool_delta,
-                }
-                # The name may still have been buffered pending the
-                # [ARGS]/`{` boundary when the BOT_TOKEN delta arrived, so
-                # this may be the first delta with real content — attach the
-                # id exactly once, whichever delta that turns out to be.
-                if not self._tool_call_id_emitted:
-                    tool_call["id"] = self._current_tool_call_id
-                    self._tool_call_id_emitted = True
-                return {"tool_calls": [tool_call]}
+            self._feed_call(delta_text, result)
+            return result or None
 
         return None
 
-    def _parse_streaming_tool_delta(self, text: str) -> dict[str, str] | None:
-        """Parse a streaming delta for tool call information.
+    def _feed_call(self, text: str, result: dict[str, Any]) -> None:
+        """Feed ``text`` of the current tool call into the streaming state.
 
-        Once the name/arguments boundary (the `[ARGS]` marker, or a bare `{`
-        for older checkpoints) has been seen for the current tool call, every
-        subsequent delta is argument text and is never re-classified — JSON
-        string content (bare keys/values like `city` or `Paris`) has no
-        distinguishing leading punctuation, so re-evaluating each delta in
-        isolation (the previous approach) misclassified mid-argument
-        fragments as more of the function name.
+        The tool-call deltas (and content, when the call turns out to be prose)
+        it yields are collected in ``result``. A [TOOL_CALLS] marker inside
+        ``text`` that opens the next call moves the rest of ``text`` to that
+        call, however many calls the delta carries.
         """
-        if not text:
-            return None
+        while text:
+            if self._name_buffer_overflow:
+                # The boundary never arrived; everything is plain text now.
+                result["content"] = result.get("content", "") + text
+                return
+            if self._args_started:
+                text = self._feed_args(text, result)
+            else:
+                text = self._feed_name(text, result)
 
-        if self._args_started:
-            return {"arguments": text}
+    def _feed_name(self, text: str, result: dict[str, Any]) -> str:
+        """Feed text of a call that has not reached its name/arguments boundary.
 
+        Once the boundary (the `[ARGS]` marker, or a bare `{` for older
+        checkpoints) has been seen, every later delta is argument text and is
+        never re-classified — JSON string content (bare keys/values like `city`
+        or `Paris`) has no distinguishing leading punctuation, so re-evaluating
+        each delta in isolation (the previous approach) misclassified
+        mid-argument fragments as more of the function name.
+
+        Returns the part of the text that follows the boundary (argument text),
+        or "" while the boundary has not arrived.
+        """
         # Buffer until we can find the boundary marker — it may itself be
         # split across two deltas (e.g. "...[AR" / "GS]...").
         self._name_buffer += text
-        args_idx = self._name_buffer.find(self.ARGS_TOKEN)
-        brace_idx = self._name_buffer.find("{")
+        buffer = self._name_buffer
+        args_idx = buffer.find(self.ARGS_TOKEN)
+        brace_idx = buffer.find("{")
         if args_idx != -1 and (brace_idx == -1 or args_idx < brace_idx):
             # The [ARGS] marker is the boundary when it precedes the first
             # `{`. A legacy call whose JSON arguments contain the literal
             # "[ARGS]" substring must keep the `{` boundary.
-            boundary = self.ARGS_TOKEN
-            idx = args_idx
-            args_start = idx + len(boundary)
+            name_end = args_idx
+            args_start = args_idx + len(self.ARGS_TOKEN)
         elif brace_idx != -1:
-            boundary = "{"
-            idx = brace_idx
-            args_start = idx
+            name_end = args_start = brace_idx
         else:
-            boundary = None
-            idx = -1
-            args_start = -1
+            name_end = args_start = -1
 
-        if boundary is not None:
-            name = self._name_buffer[:idx].strip()
-            args = self._name_buffer[args_start:]
-            self._args_started = True
-            result: dict[str, str] = {}
-            if name:
-                result["name"] = name
-            if args:
-                result["arguments"] = args
-            return result if result else None
+        # A [TOOL_CALLS] marker before the boundary ends this call: its name never
+        # got a boundary, so nothing of it was sent, and the text after the marker
+        # is the next call (a name is never part of another call's name).
+        marker = buffer.find(self.BOT_TOKEN)
+        if marker != -1 and (name_end == -1 or marker < name_end):
+            self._start_new_tool_call()
+            return buffer[marker + len(self.BOT_TOKEN) :]
 
-        # Marker not seen yet — withhold rather than guess. If it never
-        # arrives (truncation, or the model deviating into prose), flush the
-        # withheld text as content so the response is not silently lost.
-        if len(self._name_buffer) > self._NAME_BUFFER_LIMIT:
-            overflowed = self._name_buffer
-            self._name_buffer = ""
-            self._name_buffer_overflow = True
-            return {"content": overflowed}
-        return None
+        if name_end == -1:
+            # Marker not seen yet — withhold rather than guess. If it never
+            # arrives (truncation, or the model deviating into prose), flush
+            # the withheld text as content so the response is not silently
+            # lost.
+            if len(buffer) > self._NAME_BUFFER_LIMIT:
+                self._name_buffer = ""
+                self._name_buffer_overflow = True
+                result["content"] = result.get("content", "") + buffer
+            return ""
+
+        self._name_buffer = ""
+        self._args_started = True
+        name = buffer[:name_end].strip()
+        # extract_tool_calls dispatches no call without a name, nor, after [ARGS],
+        # one whose name is not a plain identifier: such a call is read through (its
+        # end still matters) and never sent.
+        after_args_marker = args_start != name_end
+        self._call_dropped = not name or (
+            after_args_marker and not _is_plain_tool_name(name)
+        )
+        if not self._call_dropped:
+            self._append_call_delta(result, {"name": name})
+        return buffer[args_start:]
+
+    def _feed_args(self, text: str, result: dict[str, Any]) -> str:
+        """Feed argument text of the current call.
+
+        Whitespace ahead of the value is not arguments text (extract_tool_calls strips
+        it too). Returns the text of the next call when a [TOOL_CALLS] marker opens
+        one (that call is started), else "".
+        """
+        scanner = self._scanner
+        if scanner.depth == 0 and not (
+            scanner.in_string or scanner.in_scalar or scanner.done
+        ):
+            text = text.lstrip()
+        args_end, marker = scanner.scan(text)
+        if args_end and not self._call_dropped:
+            self._append_call_delta(result, {"arguments": text[:args_end]})
+        if marker == -1:
+            return ""
+        self._start_new_tool_call()
+        return text[marker + len(self.BOT_TOKEN) :]
+
+    def _append_call_delta(
+        self, result: dict[str, Any], function: dict[str, str]
+    ) -> None:
+        """Add a name/arguments delta of the current call to ``result``.
+
+        Deltas of one call within one result are merged into a single entry.
+        The call's id goes on the first entry that carries real content (the
+        name may still have been buffered pending the [ARGS]/`{` boundary when
+        the BOT_TOKEN delta arrived, so that need not be the BOT_TOKEN delta),
+        exactly once.
+        """
+        if self._call_index is None:
+            self._call_index = self._calls_sent
+            self._calls_sent += 1
+        calls = result.setdefault("tool_calls", [])
+        if calls and calls[-1]["index"] == self._call_index:
+            merged = calls[-1]["function"]
+            for key, value in function.items():
+                merged[key] = merged.get(key, "") + value
+            return
+        call: dict[str, Any] = {
+            "index": self._call_index,
+            "type": "function",
+            "function": dict(function),
+        }
+        if not self._tool_call_id_emitted:
+            call["id"] = self._current_tool_call_id
+            self._tool_call_id_emitted = True
+        calls.append(call)

@@ -49,8 +49,9 @@ def test_tools_branch_strips_analysis_block_before_parser(monkeypatch):
     assert tool_calls is None
     assert len(seen) == 1
     assert "<|channel|>analysis" not in seen[0]
+    # the analysis message goes whole, its terminator with it
     assert seen[0] == (
-        "<|end|><|channel|>commentary to=functions.get_weather" '<|message|>{"city": "S'
+        "<|channel|>commentary to=functions.get_weather" '<|message|>{"city": "S'
     )
 
 
