@@ -60,6 +60,7 @@ def _mock_engine(*outputs):
     engine.model_name = "test-model"
     engine.preserve_native_tool_format = False
     engine.chat = AsyncMock(side_effect=list(outputs))
+    engine.validate_chat_template = AsyncMock(return_value=None)
     stream_calls = []
 
     async def _stream_chat(**kwargs):

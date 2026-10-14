@@ -28,11 +28,17 @@ from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_m
 from ..utils.tokenizer import encode_prompt
 from .base import (
     BaseEngine,
+    GenerationError,
     GenerationOutput,
+    RequestPreprocessingError,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
 )
-from .chat_template_safety import normalize_messages_for_chat_template
+from .chat_template_safety import (
+    chat_template_rejections,
+    normalize_messages_for_chat_template,
+)
+from ..request import ERROR_KIND_PREPROCESSING
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,22 @@ def _resolve_metal_buffer_cache_limit(
             )
 
     return int(max_recommended * gpu_memory_utilization), "device-scaled"
+
+
+def _raise_if_request_failed(output: Any) -> None:
+    """Turn a scheduler's ``finish_reason="error"`` into an :class:`EngineRequestError`.
+
+    The scheduler finishes the requests that were running when a step failed
+    (Metal out-of-memory, command-buffer error) with that reason and no text.
+    Passed on as output it reads as a normal, empty completion.  A request whose
+    inputs the multimodal scheduler could not preprocess says so in
+    ``error_kind`` and is the client's error (400), not a generation failure.
+    """
+    if getattr(output, "finish_reason", None) != "error":
+        return
+    if getattr(output, "error_kind", None) == ERROR_KIND_PREPROCESSING:
+        raise RequestPreprocessingError()
+    raise GenerationError()
 
 
 def _normalize_tool_call_arguments_for_template(messages: list[dict]) -> list[dict]:
@@ -714,6 +736,22 @@ class BatchedEngine(BaseEngine):
         """
         messages = _normalize_tool_call_arguments_for_template(messages)
 
+        # A multimodal template that cannot render tool turns (Gemma-3's knows only
+        # user/model/system and raises "Conversation roles must alternate" on a
+        # ``tool`` message) gets them as Gemma-native text, as the simple engine's
+        # MLLM route has done since #82. Without it a conversation that carries a
+        # tool result cannot be served at all by this engine.
+        if self._is_mllm and self._processor is not None:
+            from ..models.mllm import (
+                _serialize_tool_messages_gemma_native,
+                _template_supports_tool_role,
+            )
+
+            if not _template_supports_tool_role(
+                self._processor, getattr(self._mllm_instance, "config", None)
+            ):
+                messages = _serialize_tool_messages_gemma_native(messages)
+
         # Choose the best template applicator.
         # For MLLM models, the processor handles special vision tokens.
         # For text-only models, the tokenizer is sufficient.
@@ -753,33 +791,36 @@ class BatchedEngine(BaseEngine):
             ):
                 tokenizer_applicator = tokenizer
 
-            try:
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
-            except ValueError as e:
-                # Some HF processors define apply_chat_template but do not carry
-                # a template (e.g. Gemma-3 processor). Retry on tokenizer.
-                if (
-                    tokenizer_applicator is not None
-                    and "does not have a chat template" in str(e)
-                ):
-                    return tokenizer_applicator.apply_chat_template(
+            with chat_template_rejections():
+                try:
+                    return template_applicator.apply_chat_template(
                         messages, **template_kwargs
                     )
-                raise
-            except TypeError as e:
-                # Some templates don't accept extra kwargs; retry without them.
-                logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in [
-                    "tools",
-                    "enable_thinking",
-                    *(chat_template_kwargs or {}).keys(),
-                ]:
-                    template_kwargs.pop(key, None)
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
+                except ValueError as e:
+                    # Some HF processors define apply_chat_template but do not
+                    # carry a template (e.g. Gemma-3 processor). Retry on tokenizer.
+                    if (
+                        tokenizer_applicator is not None
+                        and "does not have a chat template" in str(e)
+                    ):
+                        return tokenizer_applicator.apply_chat_template(
+                            messages, **template_kwargs
+                        )
+                    raise
+                except TypeError as e:
+                    # Some templates don't accept extra kwargs; retry without them.
+                    logger.debug(
+                        f"Chat template TypeError, retrying without extras: {e}"
+                    )
+                    for key in [
+                        "tools",
+                        "enable_thinking",
+                        *(chat_template_kwargs or {}).keys(),
+                    ]:
+                        template_kwargs.pop(key, None)
+                    return template_applicator.apply_chat_template(
+                        messages, **template_kwargs
+                    )
         else:
             # Fallback for models without apply_chat_template
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -876,6 +917,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        skip_special = bool(kwargs.get("skip_special_tokens", True))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -898,10 +941,13 @@ class BatchedEngine(BaseEngine):
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
                 ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+                skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
             )
 
+            _raise_if_request_failed(output)
+
             return GenerationOutput(
-                text=clean_output_text(output.output_text),
+                text=clean_output_text(output.output_text, skip_special),
                 tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -926,14 +972,16 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
             ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+            skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
         )
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
         )
+        _raise_if_request_failed(output)
 
-        text = clean_output_text(output.output_text)
+        text = clean_output_text(output.output_text, skip_special)
 
         return GenerationOutput(
             text=text,
@@ -978,6 +1026,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        skip_special = bool(kwargs.get("skip_special_tokens", True))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
             request_id = await self._mllm_scheduler.add_request_async(
@@ -998,11 +1048,13 @@ class BatchedEngine(BaseEngine):
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
                 ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+                skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
+                _raise_if_request_failed(output)
                 yield GenerationOutput(
-                    text=clean_output_text(output.output_text),
+                    text=clean_output_text(output.output_text, skip_special),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -1029,6 +1081,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
             ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+            skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
@@ -1039,7 +1092,8 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
-            text = clean_output_text(output.output_text)
+            _raise_if_request_failed(output)
+            text = clean_output_text(output.output_text, skip_special)
 
             yield GenerationOutput(
                 text=text,
@@ -1052,6 +1106,34 @@ class BatchedEngine(BaseEngine):
                 mtp_accepted=output.mtp_accepted,
                 cached_tokens=output.cached_tokens,
             )
+
+    async def validate_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+        **_chat_kwargs: Any,
+    ) -> None:
+        """Render the prompt ``chat``/``stream_chat`` would build, discarding it.
+
+        Raises ``ChatTemplateRejected`` when the template refuses the messages, so a
+        streaming request is answered 400 before its response starts. Same inputs,
+        same renderer (``_apply_chat_template``) as the request itself.
+        """
+        if not self._loaded:
+            await self.start()
+        _, extracted_images, _videos, audios = extract_multimodal_content(messages)
+        self._apply_chat_template(
+            messages,
+            convert_tools_for_template(tools) if tools else None,
+            num_images=len(images or []) + len(extracted_images),
+            num_audios=len(audios),
+            chat_template_kwargs=dict(chat_template_kwargs or {}),
+            enable_thinking=enable_thinking,
+        )
 
     async def chat(
         self,

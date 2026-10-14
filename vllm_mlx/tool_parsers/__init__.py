@@ -26,6 +26,7 @@ Available parsers:
 - minicpm/minicpm5: MiniCPM5 models (<function name=".."><param name="..">..</param></function>)
 - step3p5/step: Step3p5/Step 3.7 Flash XML function calls
 - phi4_mini_json/phi4_mini/phi4: Microsoft Phi-4-mini (functools[{...}] JSON list; needs --chat-template)
+- pythonic/gemma3_pythonic: Python list of keyword-only calls, `[fn(k=v), ...]` (Llama 3.2/4, ToolACE, Gemma 3; gemma3_pythonic goes with the shipped Gemma 3 template)
 
 Usage:
     from vllm_mlx.tool_parsers import ToolParserManager
@@ -72,6 +73,7 @@ from .harmony_tool_parser import HarmonyToolParser
 from .minimax_tool_parser import MiniMaxToolParser
 from .qwen3_xml_tool_parser import Qwen3XMLToolParser
 from .phi4_mini_tool_parser import Phi4MiniToolParser
+from .pythonic_tool_parser import PythonicToolParser
 from .step3p5_tool_parser import Step3p5ToolParser
 
 
@@ -128,4 +130,5 @@ __all__ = [
     "MiniMaxToolParser",
     "Step3p5ToolParser",
     "Phi4MiniToolParser",
+    "PythonicToolParser",
 ]

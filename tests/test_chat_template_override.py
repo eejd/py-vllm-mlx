@@ -360,9 +360,7 @@ class TestEntryPointsPassTheTemplate:
         assert loaded["chat_template"] == OVERRIDE
 
         loaded.clear()
-        cli.serve_command(
-            cli.create_parser().parse_args(["serve", "local-test-model"])
-        )
+        cli.serve_command(cli.create_parser().parse_args(["serve", "local-test-model"]))
         assert loaded["chat_template"] is None
 
     def test_server_main(self, clean_server_state, monkeypatch, tmp_path):
