@@ -62,6 +62,7 @@ def _mock_engine(*outputs):
     engine.use_harmony_rendering = False
     engine.preserve_native_tool_format = False
     engine.chat = AsyncMock(side_effect=list(outputs))
+    engine.validate_chat_template = AsyncMock(return_value=None)
     stream_calls = []
 
     async def _stream_chat(**kwargs):

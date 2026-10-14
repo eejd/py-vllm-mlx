@@ -266,7 +266,7 @@ async def test_existing_exact_snapshot_hit_wins_before_prefix_trie_lookup():
     boundary = next(i for i, (a, b) in enumerate(zip(rendered_a, rendered_b)) if a != b)
     prefix = rendered_a[:boundary]
     system_hash = hashlib.sha256(prefix.encode()).hexdigest()[:16]
-    system_token_count = len(tokenizer.encode(prefix, add_special_tokens=True))
+    system_token_count = len(tokenizer.encode(prefix, add_special_tokens=False))
     engine._system_kv_cache[system_hash] = (
         [FakeCache().state],
         system_token_count,

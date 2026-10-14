@@ -121,8 +121,9 @@ def test_realistic_deterministic_production_stream():
     reasoning, content = stream_parse(parser, None, tokens)
     assert "<|channel>" not in reasoning, f"Marker leaked: {reasoning!r}"
     assert "<|channel>" not in content, f"Marker leaked: {content!r}"
+    # the reasoning is stripped, as extract_reasoning() returns it
     assert (
-        reasoning == 'The user said "hi". Plan: greet politely.\n'
+        reasoning == 'The user said "hi". Plan: greet politely.'
     ), f"Got: {reasoning!r}"
     assert content == "Hello! How can I help you today?", f"Got: {content!r}"
     print("[PASS] test_realistic_deterministic_production_stream")
@@ -182,23 +183,28 @@ def test_finalize_stream_fallback():
 
 
 def test_partial_marker_at_end_flushed():
-    """If stream ends with buffered partial marker, finalize emits it."""
+    """If the stream ends right after a marker, finalize reads it as the whole text does."""
     parser = Gemma4ReasoningParser()
     tokens = [
         "<|channel>",
         "thought",
         "\n",
         "text",
-        "<|channel>",  # partial — could be transition or just end
+        "<|channel>",  # partial: it could still become <|channel>response
     ]
     reasoning, content = stream_parse(parser, None, tokens)
-    # At this point, "<|channel>" should be buffered, not emitted
+    # At this point, "<|channel>" is buffered, not emitted
     assert "<|channel>" not in reasoning, f"Leaked: {reasoning!r}"
-    # Finalize flushes the buffered marker as reasoning (it wasn't transition)
+    # The cut-off marker is a marker, not text: extract_reasoning drops it too
     msg = parser.finalize_stream()
     if msg and msg.reasoning:
         reasoning += msg.reasoning
-    assert reasoning == "text<|channel>", f"Got: {reasoning!r}"
+    whole = "".join(tokens)
+    assert (reasoning, content) == (
+        Gemma4ReasoningParser().extract_reasoning(whole)[0],
+        "",
+    ), f"Got: {reasoning!r}"
+    assert reasoning == "text"
     print("[PASS] test_partial_marker_at_end_flushed")
 
 

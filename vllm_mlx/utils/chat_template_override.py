@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """``--chat-template``: replace the chat template a model ships with.
 
-Some models cannot be served as shipped. Phi-4-mini's own template ignores the
-OpenAI ``tools=`` argument, so the model is never told which tools exist. vLLM
-solves this with ``--chat-template``; this module is the same option here.
+Some models cannot be served as shipped. Phi-4-mini's and Hermes-3-3B's own
+templates ignore the OpenAI ``tools=`` argument, so the model is never told which
+tools exist. vLLM solves this with ``--chat-template``; this module is the same
+option here.
 
 The override is installed on the tokenizer (and the processor and its tokenizer for
 multimodal models) right after the model loads. Every prompt-building path reads the
@@ -34,10 +35,10 @@ _JINJA_CHARS = ("{", "}", "\n")
 CHAT_TEMPLATE_HELP = (
     "Replace the chat template the model ships with: a path to a Jinja template "
     "file, or the template itself on one line (\\n, \\t and \\r are decoded). "
-    "Applies to text and multimodal models. Needed for Phi-4-mini tool calling, "
-    "whose own template ignores tools: use the template shipped in the package, "
-    "vllm_mlx/templates/tool_chat_template_phi4_mini.jinja. Not supported with "
-    "--models-config."
+    "Applies to text and multimodal models. Needed for tool calling with models "
+    "whose own template ignores tools (Phi-4-mini, Hermes-3-3B): the package ships "
+    "vllm_mlx/templates/tool_chat_template_phi4_mini.jinja and "
+    "tool_chat_template_hermes.jinja. Not supported with --models-config."
 )
 
 
