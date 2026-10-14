@@ -192,3 +192,30 @@ def test_validate_request_rejects_pooling():
 
     with pytest.raises(VLLMValidationError):
         MLXPlatform.validate_request(None, PoolingParams())
+
+
+def _config(prefix_caching):
+    from types import SimpleNamespace
+
+    from vllm.config import CacheConfig
+
+    cache = CacheConfig(enable_prefix_caching=prefix_caching)
+    return SimpleNamespace(
+        cache_config=cache,
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1]),
+        parallel_config=SimpleNamespace(worker_cls="auto", enable_dbo=False),
+    )
+
+
+@needs_vllm_and_torch
+@pytest.mark.parametrize("requested", [True, False])
+def test_vllm_prefix_caching_is_off_whatever_was_requested(requested):
+    """MLX keeps its own KV cache: a vLLM cache hit would tell the scheduler a
+    prefix is computed that the runner still has to feed, in one oversized step."""
+    from vllm_mlx_plugin.vllm_platform import MLXPlatform
+
+    config = _config(requested)
+    MLXPlatform.check_and_update_config(config)
+
+    assert config.cache_config.enable_prefix_caching is False
+    assert config.parallel_config.worker_cls == "vllm_mlx_plugin.worker.MLXWorker"

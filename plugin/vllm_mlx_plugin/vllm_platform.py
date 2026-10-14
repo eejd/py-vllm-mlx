@@ -341,6 +341,22 @@ class MLXPlatform(Platform):
             if cache_config.block_size is None:
                 cache_config.block_size = 16  # Default for MLX
 
+            # vLLM's prefix cache hands out hits on blocks of ITS kv cache,
+            # which MLX does not have: each request's cache lives in mlx-lm.
+            # A hit would make the scheduler count the shared prefix as already
+            # computed and schedule only the rest, while the runner still has
+            # to feed the whole prompt from token 0 -- all of it in the one step
+            # that completes the prompt, i.e. a step far longer than the
+            # scheduler's token budget (a re-sent 9.8k-token prompt stalled a
+            # concurrent decode for 0.9 s against 0.08 s cold).  Without hits
+            # the scheduler's chunking is the runner's chunking.
+            if cache_config.enable_prefix_caching:
+                logger.info(
+                    "Disabling vLLM prefix caching: MLX keeps its own KV cache "
+                    "per request, so a vLLM cache hit cannot be used"
+                )
+                cache_config.enable_prefix_caching = False
+
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
         """Verify model architecture is supported on MLX."""

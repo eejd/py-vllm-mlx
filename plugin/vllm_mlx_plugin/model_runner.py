@@ -555,9 +555,7 @@ class MLXModelRunner:
     def _eos_token_id(self) -> int | None:
         return getattr(self.tokenizer, "eos_token_id", None)
 
-    def _new_state(
-        self, token_ids: list[int], sampling_params: Any
-    ) -> "_RequestState":
+    def _new_state(self, token_ids: list[int], sampling_params: Any) -> "_RequestState":
         """Create the model state for one request from its sampling params."""
         from mlx_lm.sample_utils import make_logits_processors
 

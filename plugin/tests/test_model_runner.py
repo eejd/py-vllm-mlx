@@ -570,9 +570,7 @@ def test_a_prefix_cache_hit_is_still_fed_from_the_first_token(structured):
 
 def test_a_prefix_cache_hit_that_still_has_chunks_to_go_samples_nothing_yet():
     d = _Driver()
-    out = d.step(
-        new=[("a", LONG_PROMPT, _plain())], prefix={"a": 4}, chunk={"a": 3}
-    )
+    out = d.step(new=[("a", LONG_PROMPT, _plain())], prefix={"a": 4}, chunk={"a": 3})
     assert out == {"a": []}
     assert d.runner._requests["a"].fed == 7
 
