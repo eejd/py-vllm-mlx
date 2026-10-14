@@ -4092,6 +4092,9 @@ class TestStreamChatCompletion:
         class FakeEngine:
             model_name = "fake-engine"
 
+            async def validate_chat_template(self, messages, **kwargs):
+                return None
+
             async def stream_chat(self, messages, **kwargs):
                 yield GenerationOutput(
                     text="",

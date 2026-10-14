@@ -46,7 +46,9 @@ from .base import (
 )
 from .chat_template_safety import (
     build_system_prompt_cache_prefix,
+    chat_template_rejections,
     normalize_messages_for_chat_template,
+    reject_template_errors,
 )
 from ..mlx_streams import (
     bind_generation_streams,
@@ -1685,6 +1687,7 @@ class SimpleEngine(BaseEngine):
                             )
                     self._active_requests.pop(request_id, None)
 
+    @reject_template_errors
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -1907,6 +1910,155 @@ class SimpleEngine(BaseEngine):
             cache_blocking_controls.append("harmony_rendering")
         return cache_blocking_controls
 
+    def _render_llm_chat_prompt(
+        self,
+        tokenizer: Any,
+        messages: list[dict[str, Any]],
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any],
+        enable_thinking: bool | None,
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+        """Render the prompt of a pure-LLM chat request.
+
+        Returns the prompt, the normalized messages it was rendered from and the
+        template kwargs that rendered it (the system-prompt cache probes with
+        them). Shared by ``stream_chat`` and
+        ``validate_chat_template`` so the pre-check cannot disagree with the request.
+        """
+        # Per-request enable_thinking override; default: True unless coder model.
+        if enable_thinking is None:
+            enable_thinking = "coder" not in self._model_name.lower()
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+        if template_tools:
+            template_kwargs["tools"] = template_tools
+        safe_messages = normalize_messages_for_chat_template(messages)
+
+        if getattr(self, "use_harmony_rendering", False):
+            # GPT-OSS / harmony-format models: render via openai-harmony
+            # instead of the Jinja chat_template. Bypasses the
+            # ``extract_multimodal_content`` text-flattening upstream
+            # (which drops structural ``tool_calls`` for non-native
+            # parsers) and uses OpenAI's canonical renderer. See #568.
+            from ..utils.harmony_render import (
+                render_messages as _harmony_render_messages,
+            )
+
+            _reasoning_effort = None
+            if chat_template_kwargs:
+                _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+            prompt = _harmony_render_messages(
+                safe_messages,
+                tools=template_tools,
+                reasoning_effort=_reasoning_effort,
+            )
+        else:
+            try:
+                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+            except TypeError:
+                # Some templates don't support all kwargs
+                for key in [
+                    "tools",
+                    "enable_thinking",
+                    *chat_template_kwargs.keys(),
+                ]:
+                    if key in template_kwargs:
+                        del template_kwargs[key]
+                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+        return prompt, safe_messages, template_kwargs
+
+    def _render_text_route_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any],
+        enable_thinking: bool | None,
+    ) -> str:
+        """Render the prompt of a text-only request on the mlx-lm TextModel route.
+
+        Shared by ``_stream_generate_text`` and ``validate_chat_template``.
+        """
+        # Per-request enable_thinking override; fall back to env var / default True.
+        if enable_thinking is None:
+            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        template_kwargs.update(chat_template_kwargs)
+        if tools:
+            template_kwargs["tools"] = tools
+        safe_messages = normalize_messages_for_chat_template(messages)
+
+        try:
+            return self._text_tokenizer.apply_chat_template(
+                safe_messages, **template_kwargs
+            )
+        except TypeError:
+            # Template doesn't accept tools= or enable_thinking=
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            return self._text_tokenizer.apply_chat_template(
+                safe_messages, **template_kwargs
+            )
+
+    async def validate_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+        mllm_draft: bool | None = None,
+        **_chat_kwargs: Any,
+    ) -> None:
+        """Render the prompt ``stream_chat`` would build for this request, discarding it.
+
+        Raises ``ChatTemplateRejected`` when the template refuses the messages, so
+        a streaming request is answered 400 before its response starts. Follows the
+        route ``_stream_chat_impl`` picks (mlx-lm TextModel, mlx-vlm, pure LLM) and
+        renders with that route's own renderer. A video counts as one placeholder
+        frame: its frames are extracted only while the real prompt is built.
+        """
+        if not self._loaded:
+            await self.start()
+        ctk = dict(chat_template_kwargs or {})
+        template_tools = convert_tools_for_template(tools) if tools else None
+        has_media = has_media_content(messages)
+        draft = self._default_mllm_draft if mllm_draft is None else bool(mllm_draft)
+        await self._ensure_text_model_for_request(mllm_draft_requested=draft)
+
+        with chat_template_rejections():
+            if self._uses_text_model_route(
+                has_media=has_media, mllm_draft_requested=draft
+            ):
+                self._render_text_route_prompt(
+                    messages, template_tools, ctk, enable_thinking
+                )
+            elif self._is_mllm:
+                self._model.render_chat_prompt(
+                    messages,
+                    tools=template_tools,
+                    chat_template_kwargs=ctk,
+                    enable_thinking=enable_thinking,
+                )
+            elif hasattr(self._model.tokenizer, "apply_chat_template"):
+                self._render_llm_chat_prompt(
+                    self._model.tokenizer,
+                    messages,
+                    template_tools,
+                    ctk,
+                    enable_thinking,
+                )
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -1932,9 +2084,10 @@ class SimpleEngine(BaseEngine):
             ),
             max_tokens=max_tokens,
         )
-        async with aclosing(tracked_stream):
-            async for output in tracked_stream:
-                yield output
+        with chat_template_rejections():
+            async with aclosing(tracked_stream):
+                async for output in tracked_stream:
+                    yield output
 
     async def _stream_chat_impl(
         self,
@@ -2153,56 +2306,13 @@ class SimpleEngine(BaseEngine):
         tokenizer = self._model.tokenizer
         safe_messages: list[dict[str, Any]] | None = None
         if hasattr(tokenizer, "apply_chat_template"):
-            # Per-request enable_thinking override; default: True unless coder model.
-            enable_thinking = kwargs.pop("enable_thinking", None)
-            if enable_thinking is None:
-                enable_thinking = "coder" not in self._model_name.lower()
-            template_kwargs = {
-                "tokenize": False,
-                "add_generation_prompt": True,
-                "enable_thinking": enable_thinking,
-            }
-            if chat_template_kwargs:
-                template_kwargs.update(chat_template_kwargs)
-            if template_tools:
-                template_kwargs["tools"] = template_tools
-            safe_messages = normalize_messages_for_chat_template(messages)
-
-            if getattr(self, "use_harmony_rendering", False):
-                # GPT-OSS / harmony-format models: render via openai-harmony
-                # instead of the Jinja chat_template. Bypasses the
-                # ``extract_multimodal_content`` text-flattening upstream
-                # (which drops structural ``tool_calls`` for non-native
-                # parsers) and uses OpenAI's canonical renderer. See #568.
-                from ..utils.harmony_render import (
-                    render_messages as _harmony_render_messages,
-                )
-
-                _reasoning_effort = None
-                if chat_template_kwargs:
-                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
-                prompt = _harmony_render_messages(
-                    safe_messages,
-                    tools=template_tools,
-                    reasoning_effort=_reasoning_effort,
-                )
-            else:
-                try:
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
-                except TypeError:
-                    # Some templates don't support all kwargs
-                    for key in [
-                        "tools",
-                        "enable_thinking",
-                        *chat_template_kwargs.keys(),
-                    ]:
-                        if key in template_kwargs:
-                            del template_kwargs[key]
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
+            prompt, safe_messages, template_kwargs = self._render_llm_chat_prompt(
+                tokenizer,
+                messages,
+                template_tools,
+                chat_template_kwargs,
+                kwargs.pop("enable_thinking", None),
+            )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
@@ -2832,7 +2942,6 @@ class SimpleEngine(BaseEngine):
         system prompt restore the snapshot and only prefill the suffix tokens.
         """
         import hashlib
-        import os
 
         import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
@@ -2861,34 +2970,13 @@ class SimpleEngine(BaseEngine):
         )
         abort_event = threading.Event()
 
-        # Per-request enable_thinking override; fall back to env var / default True.
-        enable_thinking = kwargs.pop("enable_thinking", None)
-        if enable_thinking is None:
-            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
-            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
-
         # Apply chat template for full prompt
-        template_kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-            "enable_thinking": enable_thinking,
-        }
-        template_kwargs.update(chat_template_kwargs)
-        if tools:
-            template_kwargs["tools"] = tools
-        safe_messages = normalize_messages_for_chat_template(messages)
-
-        try:
-            full_prompt = self._text_tokenizer.apply_chat_template(
-                safe_messages, **template_kwargs
-            )
-        except TypeError:
-            # Template doesn't accept tools= or enable_thinking=
-            template_kwargs.pop("tools", None)
-            template_kwargs.pop("enable_thinking", None)
-            full_prompt = self._text_tokenizer.apply_chat_template(
-                safe_messages, **template_kwargs
-            )
+        full_prompt = self._render_text_route_prompt(
+            messages,
+            tools,
+            chat_template_kwargs,
+            kwargs.pop("enable_thinking", None),
+        )
 
         sampler = make_sampler(
             temp=temperature,

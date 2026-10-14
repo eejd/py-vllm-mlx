@@ -64,6 +64,60 @@ class EngineStopped(RuntimeError):
     code = "engine_stopped"
 
 
+class EngineRequestError(RuntimeError):
+    """The engine failed a request it had already accepted.
+
+    A scheduler that recovers from a failed step (a Metal out-of-memory, a
+    crashed command buffer) finishes every request that was running with
+    ``finish_reason="error"``.  Handed on as ordinary output that is a
+    successful, empty completion: HTTP 200, no error anywhere a client looks.
+    The engines raise a subclass instead, as vLLM does for the same finish
+    reason, so the API layer can answer with an HTTP error or, once a stream
+    has sent its 200 header, an error event.  The subclass fixes how the
+    failure is reported on each API; the message is deliberately generic, the
+    cause is in the engine log.
+    """
+
+    #: HTTP status of the answer (non-stream) and ``code`` of OpenAI's error body.
+    status_code = 500
+    #: ``error.type`` of OpenAI-style bodies and stream frames.
+    openai_type = "InternalServerError"
+    #: ``error.type`` of Anthropic's error envelope.
+    anthropic_type = "api_error"
+    #: ``error.code`` of a Responses API failure.
+    responses_code = "server_error"
+
+    def __init__(self, message: str = "Internal server error"):
+        super().__init__(message)
+
+
+class GenerationError(EngineRequestError):
+    """The engine aborted a request while generating (finish reason ``error``): 500."""
+
+    code = "generation_error"
+
+
+class RequestPreprocessingError(EngineRequestError):
+    """The engine could not preprocess the request's inputs (undecodable media): 400.
+
+    vLLM answers 400 for an input its processor rejects; the multimodal
+    scheduler preprocesses after admission, so the failure arrives as an
+    aborted request and is told apart from a generation failure by the
+    ``error_kind`` the scheduler puts on it.
+    """
+
+    code = "request_preprocessing_error"
+    status_code = 400
+    openai_type = "BadRequestError"
+    anthropic_type = "invalid_request_error"
+    responses_code = "invalid_prompt"
+
+    def __init__(
+        self, message: str = "The request's multimodal inputs could not be processed"
+    ):
+        super().__init__(message)
+
+
 @contextmanager
 def suspend_cancellation():
     """Temporarily clear task cancellation so cleanup can finish deterministically."""
@@ -281,6 +335,24 @@ class BaseEngine(ABC):
         accepts everything. ``completion`` marks /v1/completions, which some
         engines route differently from chat; ``mllm_draft`` is the request's
         per-request drafter override (``None``: the engine default).
+        """
+
+    async def validate_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        **chat_kwargs: Any,
+    ) -> None:
+        """Raise ``ChatTemplateRejected`` if the chat template refuses ``messages``.
+
+        Called by the server before it commits to a streaming response: once the
+        200 and the first SSE frame are out, a template that rejects the messages
+        (a conversation the model's template cannot render) can no longer change
+        the status, so the request would end as an empty 200 instead of the 400
+        vLLM returns. ``chat_kwargs`` is what the request would pass to ``chat`` /
+        ``stream_chat``; an engine reads the template inputs it needs (``tools``,
+        ``chat_template_kwargs``, ``enable_thinking``) and renders exactly as its
+        chat route would. The default accepts everything: an engine that does not
+        implement the pre-check still answers 400 on non-streaming requests.
         """
 
     @property
