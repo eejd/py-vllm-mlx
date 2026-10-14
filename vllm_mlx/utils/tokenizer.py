@@ -61,7 +61,8 @@ def collect_eos_token_ids(tokenizer, model_path=None) -> set:
         if value is None:
             continue
         if isinstance(value, (list, set, tuple)):
-            eos_ids.update(int(v) for v in value)
+            # mlx-lm 0.31 reports {None} for a tokenizer without an EOS id.
+            eos_ids.update(int(v) for v in value if v is not None)
         else:
             eos_ids.add(int(value))
 
@@ -77,7 +78,7 @@ def collect_eos_token_ids(tokenizer, model_path=None) -> set:
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 continue
             if isinstance(config_eos, list):
-                eos_ids.update(int(v) for v in config_eos)
+                eos_ids.update(int(v) for v in config_eos if v is not None)
             elif config_eos is not None:
                 eos_ids.add(int(config_eos))
 
