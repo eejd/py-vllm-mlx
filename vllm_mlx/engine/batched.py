@@ -716,6 +716,22 @@ class BatchedEngine(BaseEngine):
         """
         messages = _normalize_tool_call_arguments_for_template(messages)
 
+        # A multimodal template that cannot render tool turns (Gemma-3's knows only
+        # user/model/system and raises "Conversation roles must alternate" on a
+        # ``tool`` message) gets them as Gemma-native text, as the simple engine's
+        # MLLM route has done since #82. Without it a conversation that carries a
+        # tool result cannot be served at all by this engine.
+        if self._is_mllm and self._processor is not None:
+            from ..models.mllm import (
+                _serialize_tool_messages_gemma_native,
+                _template_supports_tool_role,
+            )
+
+            if not _template_supports_tool_role(
+                self._processor, getattr(self._mllm_instance, "config", None)
+            ):
+                messages = _serialize_tool_messages_gemma_native(messages)
+
         # Choose the best template applicator.
         # For MLLM models, the processor handles special vision tokens.
         # For text-only models, the tokenizer is sufficient.
