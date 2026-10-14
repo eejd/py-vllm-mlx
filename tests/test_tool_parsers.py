@@ -1054,6 +1054,9 @@ class TestLlamaToolParser:
         assert parser.finalize_streaming(text) is None
 
     def test_the_finalizer_hook_is_a_no_op_for_other_parsers(self):
+        # vllm_mlx.server imports mlx_lm through the scheduler; the Linux unit-test job has
+        # no MLX, the Apple Silicon job runs this file with it.
+        pytest.importorskip("mlx_lm")
         from vllm_mlx import server
 
         for name in ("hermes", "qwen", "mistral", "deepseek"):

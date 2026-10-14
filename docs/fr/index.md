@@ -63,7 +63,7 @@ vllm-mlx apporte l'accélération GPU native d'Apple Silicon à vLLM en intégra
 ## Prérequis
 
 - macOS sur Apple Silicon (M1/M2/M3/M4/M5)
-- Python 3.10+
+- Python 3.14+
 - 8 Go de RAM recommandés
 
 ## Licence

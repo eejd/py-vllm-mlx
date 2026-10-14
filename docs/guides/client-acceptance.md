@@ -2,7 +2,7 @@
 
 The opt-in acceptance runner checks installed coding clients against a running
 vllm-mlx server. It checks a complete tool interaction and a file edit through
-the client's normal API adapter. It requires Python 3.10 or later on macOS or
+the client's normal API adapter. It requires Python 3.14 or later on macOS or
 Linux and uses only the Python standard library.
 
 Run it from a repository checkout:
