@@ -30,24 +30,23 @@ Degenerate cycling:
     both sides.
 """
 
+import re
+
 from .base import DeltaMessage
 from .think_parser import BaseThinkingReasoningParser
 
 # Channel names that follow <|channel> — stripped from output
-_THOUGHT_PREFIX = "thought"
+_CHANNEL_NAMES = ("thought", "response")
 _RESPONSE_MARKER = "<|channel>response"
-# Full "open-thinking" marker. Kept as a buffering target so that partial
-# prefixes arriving mid-stream (e.g. "<|channel>th", "<|channel>thoug") are
-# held back until the label completes, instead of leaking 'th', 'tho', etc.
-# into the reasoning output.
-_THOUGHT_MARKER = "<|channel>thought"
-
-
-def _strip_channel_name(text: str, prefix: str) -> str:
-    """Strip channel name and leading whitespace/newline from text start."""
-    if text.startswith(prefix):
-        text = text[len(prefix) :]
-    return text.lstrip("\n")
+# "<|channel>response" is the marker only when no letter follows: "<|channel>responses"
+# is "<|channel>" and the word "responses".
+_RESPONSE_RE = re.compile(r"<\|channel>response(?!\w)")
+# Everything the scanner recognises, longest first so the response marker wins
+# over the bare start marker it begins with.
+_MARKER_RE = re.compile(r"<\|channel>response(?!\w)|<\|channel>|<channel\|>")
+# Markers whose proper prefixes are withheld at a delta boundary. A complete
+# "<|channel>" is withheld too: it may still become "<|channel>response".
+_PARTIAL_MARKERS = (_RESPONSE_MARKER, "<channel|>", "<|channel>")
 
 
 def _strip_channel_tokens(text: str) -> str:
@@ -80,6 +79,96 @@ def _strip_channel_tokens(text: str) -> str:
             text = text[len(name) :]
             break
     return text.strip()
+
+
+class _SegmentFilter:
+    """Streaming form of ``_strip_channel_tokens`` for the text of one channel segment.
+
+    The text between two markers is read the way the whole-text extraction reads it:
+    lines that are only a channel name ("thought", "response") are dropped, a leading
+    channel name is dropped when a non-letter follows it ("thought, so" but not
+    "thoughtful"), and the ends are stripped. Text that could still turn out to be a
+    channel name (a line start, the first word) is held until the next characters
+    decide it, whatever the delta boundaries; whitespace at the end is held until more
+    text follows in the segment and dropped when the segment ends.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._line = ""  # the current line, held while it may still be a lone name
+        self._line_free = False  # it cannot be one: stream it as it comes
+        self._head = ""  # leading text, held until the first word is decided
+        self._head_done = False
+        self._tail = ""  # trailing whitespace, held
+
+    @staticmethod
+    def _may_be_name(text: str) -> bool:
+        word = text.strip()
+        return not word or any(name.startswith(word) for name in _CHANNEL_NAMES)
+
+    def feed(self, text: str) -> str:
+        out: list[str] = []
+        for i, part in enumerate(text.split("\n")):
+            if i:
+                out.append(self._end_line())
+            out.append(self._extend_line(part))
+        return self._trim("".join(out))
+
+    def flush(self) -> str:
+        """The segment ends: whatever is held is decided now. The filter is reset."""
+        piece = ""
+        if not self._line_free and self._line.strip() not in _CHANNEL_NAMES:
+            piece = self._line
+        self._line = ""
+        out = self._trim(piece)
+        self.reset()
+        return out
+
+    def _extend_line(self, part: str) -> str:
+        if self._line_free:
+            return part
+        self._line += part
+        if self._may_be_name(self._line):
+            return ""
+        self._line_free = True
+        line, self._line = self._line, ""
+        return line
+
+    def _end_line(self) -> str:
+        """A newline ended the line: a lone channel name goes, with its newline."""
+        free, line = self._line_free, self._line
+        self._line_free, self._line = False, ""
+        if free:
+            return "\n"
+        return "" if line.strip() in _CHANNEL_NAMES else line + "\n"
+
+    @staticmethod
+    def _strip_name(text: str) -> str:
+        """Drop a leading channel name that a non-letter follows; text is lstripped."""
+        for name in _CHANNEL_NAMES:
+            if text.startswith(name):
+                rest = text[len(name) :]
+                if not rest or not rest[0].isalpha():
+                    return rest.lstrip()
+        return text
+
+    def _trim(self, text: str) -> str:
+        """Strip the segment: the leading end once the first word is decided, the
+        trailing end as whitespace is held back until text follows it."""
+        if not self._head_done:
+            self._head += text
+            head = self._head.lstrip()
+            if not head:
+                return ""  # nothing but whitespace yet
+            self._head_done = True
+            self._head = ""
+            text = self._strip_name(head)
+        joined = self._tail + text
+        body = joined.rstrip()
+        self._tail = joined[len(body) :]
+        return body
 
 
 class Gemma4ReasoningParser(BaseThinkingReasoningParser):
@@ -124,57 +213,53 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         # Trailing text withheld because it could complete into a marker
         # (e.g. "<|channel>" that might become "<|channel>response" next delta).
         self._pending: str = ""
-        # Tracks whether we have emitted the first content delta past the
-        # <|channel>response transition — used to strip the leading newline.
-        self._content_seen: bool = False
+        self._filter = _SegmentFilter()
+        self._seen_start = False  # a "<|channel>" has opened a channel in this stream
 
     def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
         super().reset_state()
         self._pending = ""
-        self._content_seen = False
+        self._filter.reset()
+        self._seen_start = False
 
-    def _trailing_partial_marker_len(self, text: str) -> int:
+    @staticmethod
+    def _trailing_partial_marker_len(text: str) -> int:
         """
         Return length of trailing substring of `text` that is a proper prefix
-        of any transition marker (<channel|>, <|channel>response, <|channel>).
+        of any marker (<channel|>, <|channel>response, <|channel>).
 
-        Only counts PROPER prefixes — if the marker is already complete in
-        `text`, no buffering is needed. Returns 0 if no partial match.
-
-        We must never buffer legitimate content. For <|channel>, only buffer
-        when it appears AT THE END and is not followed by more text (i.e.,
-        `response` or `thought` hasn't arrived yet).
+        Only counts PROPER prefixes: a marker that is already complete in
+        `text` needs no buffering. Returns 0 if no partial match.
         """
-        markers = (_RESPONSE_MARKER, _THOUGHT_MARKER, self.end_token, self.start_token)
-        max_len = 0
-        for marker in markers:
-            # Scan from longest proper prefix downwards
-            for i in range(min(len(marker) - 1, len(text)), 0, -1):
+        # a complete "<|channel>response" may still continue into a word
+        max_len = len(_RESPONSE_MARKER) if text.endswith(_RESPONSE_MARKER) else 0
+        for marker in _PARTIAL_MARKERS:
+            for i in range(min(len(marker) - 1, len(text)), max_len, -1):
                 if text.endswith(marker[:i]):
-                    # Proper prefix match; ensure we're not inside a completed
-                    # marker (which would already be handled by other logic).
-                    if not text.endswith(marker):
-                        if i > max_len:
-                            max_len = i
-                        break
+                    max_len = i
+                    break
         return max_len
 
     def finalize_stream(self) -> DeltaMessage | None:
         """
-        Flush any buffered partial marker at the end of stream.
+        End of stream: decide whatever is still held back.
 
-        If the stream ends while we have a partial marker buffered (e.g.
-        model emitted "<|channel>" as its last token and got truncated by
-        max_tokens), emit it as reasoning so the client doesn't lose the
-        text. Content phase flushes as content.
+        A partial marker withheld at the end (the model was cut off after
+        "<|channel>" or "<|channel>respo") is read as the whole-text extraction
+        reads it: a complete marker is a marker, anything else is text of the
+        open channel. Text held while it could still have been a channel name,
+        and trailing whitespace, are settled the same way.
         """
-        if not self._pending:
+        pending, self._pending = self._pending, ""
+        reasoning: list[str] = []
+        content: list[str] = []
+        self._scan(pending, reasoning, content)
+        self._route(self._filter.flush(), reasoning, content)
+        if not reasoning and not content:
             return None
-        pending = self._pending
-        self._pending = ""
-        if self._phase == "content":
-            return DeltaMessage(content=pending)
-        return DeltaMessage(reasoning=pending)
+        return DeltaMessage(
+            reasoning="".join(reasoning) or None, content="".join(content) or None
+        )
 
     def extract_reasoning(
         self,
@@ -201,11 +286,14 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
 
         # Alternative format: <|channel>thought...<|channel>response...
         # Use rfind for the LAST <|channel>response marker
-        if text.count(self.start_token) >= 2 and _RESPONSE_MARKER in text:
-            _, _, after_start = text.partition(self.start_token)
-            last_resp = after_start.rfind(_RESPONSE_MARKER)
-            reasoning = after_start[:last_resp]
-            content = after_start[last_resp + len(_RESPONSE_MARKER) :]
+        # The first "<|channel>" opens a channel whatever its name is, so only a
+        # response marker after it is the switch to the answer.
+        _, _, after_start = text.partition(self.start_token)
+        switches = list(_RESPONSE_RE.finditer(after_start))
+        if switches:
+            last_resp = switches[-1]
+            reasoning = after_start[: last_resp.start()]
+            content = after_start[last_resp.end() :]
             reasoning = _strip_channel_tokens(reasoning)
             content = _strip_channel_tokens(content)
             return reasoning or None, content or None
@@ -228,153 +316,82 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
 
     def extract_reasoning_streaming(
         self,
-        previous_text: str,
-        current_text: str,
+        previous_text: str,  # noqa: ARG002
+        current_text: str,  # noqa: ARG002
         delta_text: str,
     ) -> DeltaMessage | None:
         """
-        Extract reasoning from streaming delta.
+        Extract reasoning from a streaming delta.
 
-        Handles:
-        - No tags: treat as content (Gemma 4 doesn't inject tags in prompt)
-        - <|channel>thought: enter reasoning mode, strip channel name
-        - <channel|> or <|channel>response: transition to content mode
-        - Re-entry into thought from content (degenerate cycling): back to reasoning
+        Only ``delta_text`` is read; the parser keeps its own state, so the
+        cost per delta does not depend on how much has been generated. The
+        delta is scanned marker by marker, so it may carry any mix of text and
+        markers (several tokens at once, as with speculative decoding):
 
-        Partial markers at delta boundaries are buffered internally to
-        prevent leaking them as reasoning/content.
+        - No markers yet: content (Gemma 4 doesn't inject tags in the prompt)
+        - <|channel>: enter reasoning (the "thought" channel name is stripped)
+        - <channel|> or <|channel>response: switch to content
+        - <|channel> from content (degenerate cycling): back to reasoning
+
+        The text of a channel comes out as ``extract_reasoning()`` returns it
+        for one thought/response cycle: channel names stripped, ends stripped.
+        A partial marker, text that could still be a channel name, and trailing
+        whitespace are held back until the next delta decides them (or
+        finalize_stream() does).
         """
-        # Buffer trailing partial marker so it doesn't leak into output.
-        # Process only the "safe" portion (without the partial trailing bytes).
-        trailing = self._trailing_partial_marker_len(current_text)
-        safe_current = current_text[:-trailing] if trailing else current_text
-        prev_trailing = self._trailing_partial_marker_len(previous_text)
-        safe_previous = (
-            previous_text[:-prev_trailing] if prev_trailing else previous_text
+        text = self._pending + delta_text
+        hold = self._trailing_partial_marker_len(text)
+        self._pending = text[len(text) - hold :] if hold else ""
+        if hold:
+            text = text[: len(text) - hold]
+        if not text:
+            return None
+
+        reasoning: list[str] = []
+        content: list[str] = []
+        self._scan(text, reasoning, content)
+        if not reasoning and not content:
+            return None
+        return DeltaMessage(
+            reasoning="".join(reasoning) or None, content="".join(content) or None
         )
 
-        # Update buffered pending text for external flush (finalize_stream).
-        self._pending = current_text[len(safe_current) :]
-
-        # If no new safe text this delta, suppress emission — everything
-        # new is buffered as a potential marker prefix.
-        if len(safe_current) <= len(safe_previous):
-            return None
-
-        safe_delta = safe_current[len(safe_previous) :]
-
-        return self._extract_from_safe_text(safe_previous, safe_current, safe_delta)
-
-    @staticmethod
-    def _strip_channel_tokens_from_delta(
-        msg: DeltaMessage | None,
-    ) -> DeltaMessage | None:
-        """Strip channel special tokens from content and reasoning in a delta."""
-        if msg is None:
-            return None
-        c = msg.content
-        r = msg.reasoning
-        if c is not None:
-            c = c.replace("<channel|>", "").replace("<|channel>", "")
-        if r is not None:
-            r = r.replace("<channel|>", "").replace("<|channel>", "")
-        if not c and not r:
-            return None
-        if c == msg.content and r == msg.reasoning:
-            return msg
-        return DeltaMessage(reasoning=r or None, content=c or None)
-
-    def _extract_from_safe_text(
-        self,
-        previous_text: str,
-        current_text: str,
-        delta_text: str,
-    ) -> DeltaMessage | None:
-        """Parse safe (non-buffered) text.
-
-        Uses count-based detection for channel tokens so that multiple
-        thought/response cycles (degenerate model behaviour) are handled
-        correctly — each NEW <|channel> re-enters reasoning, each NEW
-        <channel|> transitions to content.
-        """
-        # No channel tokens at all — plain content
-        if self.start_token not in current_text and self.end_token not in current_text:
-            return DeltaMessage(content=delta_text)
-
-        # ── Alternative transition: <|channel>response ──
-        # Check BEFORE generic <|channel> count — <|channel>response contains
-        # <|channel> but is a content transition, not a re-entry to reasoning.
-        if _RESPONSE_MARKER in current_text and _RESPONSE_MARKER not in previous_text:
-            self._phase = "content"
-            self._content_seen = False
-            marker_pos = current_text.find(_RESPONSE_MARKER)
-            after_marker = current_text[marker_pos + len(_RESPONSE_MARKER) :]
-            after_marker = after_marker.lstrip("\n")
-            if after_marker:
-                self._content_seen = True
-                return self._strip_channel_tokens_from_delta(
-                    DeltaMessage(content=after_marker)
-                )
-            return None
-
-        cur_starts = current_text.count(self.start_token)
-        prev_starts = previous_text.count(self.start_token)
-        cur_ends = current_text.count(self.end_token)
-        prev_ends = previous_text.count(self.end_token)
-
-        # ── NEW <|channel> (enter / re-enter reasoning) ──
-        if cur_starts > prev_starts:
-            if self._phase != "thinking":
+    def _scan(self, text: str, reasoning: list[str], content: list[str]) -> None:
+        """Route ``text`` (no partial marker at its end) marker by marker."""
+        pos = 0
+        for marker in _MARKER_RE.finditer(text):
+            self._segment(text[pos : marker.start()], reasoning, content)
+            # the open channel ends here: whatever it held back is decided now
+            self._route(self._filter.flush(), reasoning, content)
+            pos = marker.end()
+            token = marker.group()
+            if token == self.start_token:
+                self._seen_start = True
                 self._phase = "thinking"
-                self._content_seen = False
-            return None  # suppress marker + channel name
+            elif token == "<channel|>" or self._seen_start:
+                self._phase = "content"
+            else:
+                # a lone "<|channel>response" is the start of a channel like any other,
+                # as extract_reasoning() reads it; it is the switch to the answer only
+                # after a channel was opened (<|channel>thought...<|channel>response)
+                self._seen_start = True
+                self._phase = "thinking"
+                self._segment("response", reasoning, content)
+        self._segment(text[pos:], reasoning, content)
 
-        # ── NEW <channel|> (transition to content) ──
-        if cur_ends > prev_ends:
-            self._phase = "content"
-            self._content_seen = False
-            # Text after the last <channel|> in this delta is content
-            last_end = delta_text.rfind(self.end_token)
-            if last_end >= 0:
-                after = delta_text[last_end + len(self.end_token) :]
-                after = _strip_channel_name(after.lstrip("\n"), _THOUGHT_PREFIX)
-                after = _strip_channel_name(after, "response")
-                if after:
-                    self._content_seen = True
-                    return DeltaMessage(content=after)
-            return None
+    def _segment(self, text: str, reasoning: list[str], content: list[str]) -> None:
+        """Text of the open channel. Before any marker it is plain content, as is."""
+        if self._phase == "pre_think":
+            if text:
+                content.append(text)
+        else:
+            self._route(self._filter.feed(text), reasoning, content)
 
-        # ── Content phase ──
-        if self._phase == "content":
-            if not self._content_seen:
-                stripped = delta_text.lstrip("\n")
-                stripped = _strip_channel_name(stripped, _THOUGHT_PREFIX)
-                stripped = _strip_channel_name(stripped, "response")
-                self._content_seen = bool(stripped)
-                if not stripped:
-                    return None
-                return self._strip_channel_tokens_from_delta(
-                    DeltaMessage(content=stripped)
-                )
-            return self._strip_channel_tokens_from_delta(
-                DeltaMessage(content=delta_text)
-            )
-
-        # ── Thinking phase: emit as reasoning ──
+    def _route(self, text: str, reasoning: list[str], content: list[str]) -> None:
+        """Hand text that has been through the segment filter to the open channel."""
+        if not text:
+            return
         if self._phase == "thinking":
-            # Strip "thought" channel name from initial reasoning delta
-            if cur_starts > 0:
-                after_ch = current_text.split(self.start_token, 1)[1]
-                if after_ch.startswith(_THOUGHT_PREFIX):
-                    clean = after_ch[len(_THOUGHT_PREFIX) :].lstrip("\n")
-                    prev_after = ""
-                    if self.start_token in previous_text:
-                        prev_after = previous_text.split(self.start_token, 1)[1]
-                        if prev_after.startswith(_THOUGHT_PREFIX):
-                            prev_after = prev_after[len(_THOUGHT_PREFIX) :].lstrip("\n")
-                    r = clean[len(prev_after) :]
-                    return DeltaMessage(reasoning=r) if r else None
-            return DeltaMessage(reasoning=delta_text) if delta_text else None
-
-        # ── pre_think: first delta has no markers yet — emit as reasoning ──
-        return DeltaMessage(reasoning=delta_text) if delta_text else None
+            reasoning.append(text)
+        else:
+            content.append(text)
