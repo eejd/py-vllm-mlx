@@ -609,9 +609,9 @@ class TestMLLMSchedulerCountForTemplatesWithoutBos:
 
 
 class TestSimpleEngineSwallowsTheKind:
-    """``prompt_warmup`` passes the kind to every engine; Simple must not forward it."""
+    """``prompt_warmup`` passes the kind to every engine; Simple hands it to the model."""
 
-    def test_the_hint_does_not_leak_into_the_model_call(self):
+    def test_the_hint_reaches_the_model_call(self):
         from vllm_mlx.engine.simple import SimpleEngine
 
         seen = []
@@ -639,4 +639,4 @@ class TestSimpleEngineSwallowsTheKind:
         outputs = _run(run())
         assert outputs
         (kwargs,) = seen
-        assert "add_special_tokens" not in kwargs
+        assert kwargs["add_special_tokens"] is False

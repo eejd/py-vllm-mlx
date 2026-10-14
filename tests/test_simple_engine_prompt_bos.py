@@ -226,7 +226,7 @@ class BoslessTemplateTokenizer(BosTokenizer):
 
 
 class TestTemplateWithoutBos:
-    """The mlx-lm rule keeps the tokenizer's BOS when the prompt carries none."""
+    """A rendered chat prompt owns its BOS: a template that renders none gets none (vLLM)."""
 
     async def test_text_route(self):
         engine = SimpleEngine("test-model", force_mllm=True)
@@ -249,7 +249,7 @@ class TestTemplateWithoutBos:
                 )
             ]
 
-        assert chunks[-1].prompt_tokens == len(_reference_ids(prompt)) + 1
+        assert chunks[-1].prompt_tokens == len(_reference_ids(prompt))
 
     async def test_llm_stream_chat_prefix_trie_path(self):
         engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
@@ -264,4 +264,4 @@ class TestTemplateWithoutBos:
         ):
             await _chat(engine, MESSAGES)
 
-        assert stream.prompts == [[BOS_ID, *_reference_ids(prompt)]]
+        assert stream.prompts == [_reference_ids(prompt)]
