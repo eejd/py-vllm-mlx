@@ -3210,7 +3210,11 @@ async def _run_responses_request(
 
     # Reasoning is separated first; the tool parser sees the content part only.
     reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
-        output.text, chat_request, engine=engine, chat_kwargs=chat_kwargs
+        output.text,
+        chat_request,
+        allow_reasoning=not _thinking_disabled(chat_request, chat_kwargs),
+        engine=engine,
+        chat_kwargs=chat_kwargs,
     )
 
     output_items = _build_responses_output_items(
@@ -7940,7 +7944,10 @@ async def stream_chat_completion(
                     # The request disabled thinking — surface only parsed
                     # content; drop reasoning the model emitted anyway.
                     reasoning = None
-                    if not content:
+                    if not content and not tool_input:
+                        # (a parser that reads the raw stream still has to see a delta
+                        # whose only visible part was reasoning: its state is made of
+                        # those control tokens)
                         continue
 
                 # Tool call parsing on content portion

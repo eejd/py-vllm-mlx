@@ -393,61 +393,126 @@ async def test_messages_stream_feeds_a_harmony_reasoning_parser_the_control_toke
     assert (seen.reasoning.strip(), seen.content.strip()) == (analysis, final)
 
 
+def _read_endpoint(path, response, stream):
+    """(content, reasoning, number of calls, finish reason) as a client assembles them."""
+    content = reasoning = ""
+    calls = 0
+    finish = None
+    if not stream:
+        body = response.json()
+        if path == "/v1/chat/completions":
+            message = body["choices"][0]["message"]
+            return (
+                message.get("content") or "",
+                message.get("reasoning") or message.get("reasoning_content") or "",
+                len(message.get("tool_calls") or []),
+                body["choices"][0]["finish_reason"],
+            )
+        if path == "/v1/messages":
+            for block in body["content"]:
+                content += block.get("text", "") if block["type"] == "text" else ""
+                reasoning += block["thinking"] if block["type"] == "thinking" else ""
+                calls += block["type"] == "tool_use"
+            return content, reasoning, calls, "tool_calls" if calls else "stop"
+        for item in body["output"]:
+            calls += item["type"] == "function_call"
+            if item["type"] == "reasoning":
+                reasoning += "".join(
+                    part.get("text", "")
+                    for part in (item.get("summary") or [])
+                    + (item.get("content") or [])
+                )
+            if item["type"] == "message":
+                content += "".join(part.get("text", "") for part in item["content"])
+        return content, reasoning, calls, "tool_calls" if calls else "stop"
+    events = [
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line[6:].strip() != "[DONE]"
+    ]
+    if path == "/v1/chat/completions":
+        indexes = set()
+        for event in events:
+            for choice in event.get("choices") or []:
+                delta = choice["delta"]
+                content += delta.get("content") or ""
+                reasoning += (
+                    delta.get("reasoning") or delta.get("reasoning_content") or ""
+                )
+                indexes |= {t["index"] for t in delta.get("tool_calls") or []}
+                finish = choice.get("finish_reason") or finish
+        return content, reasoning, len(indexes), finish
+    if path == "/v1/messages":
+        for event in events:
+            if event["type"] == "content_block_delta":
+                delta = event["delta"]
+                content += (
+                    delta.get("text", "") if delta["type"] == "text_delta" else ""
+                )
+                reasoning += (
+                    delta["thinking"] if delta["type"] == "thinking_delta" else ""
+                )
+            calls += (
+                event["type"] == "content_block_start"
+                and event["content_block"]["type"] == "tool_use"
+            )
+            if event["type"] == "message_delta":
+                finish = (
+                    "tool_calls"
+                    if event["delta"]["stop_reason"] == "tool_use"
+                    else "stop"
+                )
+        return content, reasoning, calls, finish
+    for event in events:
+        kind = event.get("type", "")
+        if kind == "response.output_text.delta":
+            content += event["delta"]
+        if "reasoning" in kind and "delta" in kind:
+            reasoning += event.get("delta", "")
+        calls += (
+            kind == "response.output_item.done"
+            and event["item"]["type"] == "function_call"
+        )
+    return content, reasoning, calls, "tool_calls" if calls else "stop"
+
+
+THINKING_OFF_CHUNKINGS = ["whole", "tokens", "x3", "x4", "x5"]
+
+
+@pytest.mark.parametrize("chunking", THINKING_OFF_CHUNKINGS)
 @pytest.mark.parametrize("with_tools", [True, False], ids=["tools", "no-tools"])
-@pytest.mark.parametrize("stream", [False, True], ids=["whole", "stream"])
-@pytest.mark.parametrize(
-    "name",
-    ["analysis-call-final", "analysis-into-call-at-eos", "final-at-eos", "call-only"],
-)
+@pytest.mark.parametrize("path", list(ENDPOINT_BODIES))
+@pytest.mark.parametrize("name", list(RAW))
 def test_thinking_disabled_never_shows_the_analysis_or_a_control_token(
-    monkeypatch, harmony_parsers, name, stream, with_tools
+    monkeypatch, harmony_parsers, name, path, with_tools, chunking
 ):
-    """enable_thinking=false: the model may still open an analysis channel. With or
-    without tools the answer comes out clean, a declared tool's call is returned and the
-    analysis is dropped, not shown as content."""
+    """enable_thinking=false: the model may still open an analysis channel. On every
+    endpoint, streaming or not, in any chunking, with or without tools: the analysis is
+    dropped (never reasoning, never content), no control token and no ``assistant``
+    role word reaches the client, and a declared tool's call is returned exactly once.
+    (The streaming sites used to stop feeding the harmony tool parser on a delta whose
+    only visible part was reasoning: calls lost, and ``assistant`` shown as content.)"""
     raw, _analysis_text, final, calls = RAW[name]
+    stream = chunking != "whole"
     monkeypatch.setattr(
-        srv, "_engine", _engine(raw, "tokens", thinking_open_in_prompt=False)
+        srv, "_engine", _engine(raw, chunking, thinking_open_in_prompt=False)
     )
     monkeypatch.setattr(srv, "_model_name", "test-model")
-    body = {
-        **ENDPOINT_BODIES["/v1/chat/completions"](),
-        "stream": stream,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
+    body = ENDPOINT_BODIES[path]()
+    body.update(stream=stream, chat_template_kwargs={"enable_thinking": False})
     if not with_tools:
-        del body["tools"]
+        body.pop("tools")
 
-    response = TestClient(srv.app).post("/v1/chat/completions", json=body)
+    response = TestClient(srv.app).post(path, json=body)
 
     assert response.status_code == 200, response.text
-    if stream:
-        payloads = [
-            p for p in _sse_payloads(response.text.splitlines(True)) if p.get("choices")
-        ]
-        deltas = [p["choices"][0]["delta"] for p in payloads]
-        content = "".join(d.get("content") or "" for d in deltas)
-        reasoning = "".join(
-            d.get("reasoning") or d.get("reasoning_content") or "" for d in deltas
-        )
-        indexes = {t["index"] for d in deltas for t in d.get("tool_calls") or []}
-        finish = [
-            p["choices"][0]["finish_reason"]
-            for p in payloads
-            if p["choices"][0]["finish_reason"]
-        ]
-    else:
-        choice = response.json()["choices"][0]
-        content = choice["message"].get("content") or ""
-        reasoning = choice["message"].get("reasoning") or ""
-        indexes = set(range(len(choice["message"].get("tool_calls") or [])))
-        finish = [choice["finish_reason"]]
-    expected_calls = calls if with_tools else 0
+    content, reasoning, n_calls, finish = _read_endpoint(path, response, stream)
+    expected = calls if with_tools else 0
     assert content.strip() == final
-    assert not reasoning
+    assert not reasoning.strip()
     assert re.findall(r"<\|[a-z]+\|>|to=functions", content) == []
-    assert len(indexes) == expected_calls
-    assert finish == ["tool_calls" if expected_calls else "stop"]
+    assert n_calls == expected
+    assert finish == ("tool_calls" if expected else "stop")
 
 
 @pytest.mark.parametrize(
@@ -500,3 +565,54 @@ def _request_with_or_without_tools(with_tools):
 
     request = _request(False)
     return request if with_tools else request.model_copy(update={"tools": None})
+
+
+@pytest.mark.anyio
+async def test_responses_stream_final_calls_are_parsed_with_thinking_disabled(
+    monkeypatch,
+):
+    """With thinking disabled the end-of-stream extraction of /v1/responses reads the
+    output as an answer: a call in an output that carries no reasoning marker at all is a
+    call, even when the template would have opened the thinking (the engine's prompt
+    ends in ``<think>``), exactly as for the other endpoints."""
+    from tests.test_reasoning_tool_call_contract import (
+        _json_call,
+        _request,
+        _sse_payloads,
+    )
+    from vllm_mlx.api.responses_models import ResponsesRequest
+
+    monkeypatch.setattr(srv, "_max_request_tokens", 32768)
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+    monkeypatch.setattr(srv, "_tool_call_parser", "hermes")
+    monkeypatch.setattr(
+        srv, "_tool_parser_instance", ToolParserManager.get_tool_parser("hermes")()
+    )
+    monkeypatch.setattr(srv, "_reasoning_parser", get_parser("qwen3")())
+    monkeypatch.setattr(srv, "_reasoning_parser_name", "qwen3")
+    raw = "Calling it.\n" + _json_call()
+    engine = _engine(raw, "whole", thinking_open_in_prompt=True)
+    request = _request(True)
+    off = {"chat_template_kwargs": {"enable_thinking": False}}
+    monkeypatch.setattr(
+        srv,
+        "_prepare_streaming_responses_request",
+        lambda req, engine=None: (engine_obj, request, request.messages, off),
+    )
+    engine_obj = engine
+
+    chunks = [
+        c
+        async for c in srv._stream_responses_request(
+            ResponsesRequest(model="test-model", input="call it", stream=True)
+        )
+    ]
+
+    completed = next(
+        e["response"]
+        for e in _sse_payloads(chunks)
+        if e["type"] == "response.completed"
+    )
+    assert [i["name"] for i in completed["output"] if i["type"] == "function_call"] == [
+        "echo_args"
+    ]
