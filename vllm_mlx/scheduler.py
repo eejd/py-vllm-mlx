@@ -921,10 +921,8 @@ class Scheduler:
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
         self._detokenizer_pool: Dict[str, Any] = {}
-        # The model's EOS ids, read from the tokenizer on first use. Needed to
-        # keep EOS tokens out of the text of ``ignore_eos`` requests.
-        self._eos_token_id_set: Optional[Set[int]] = None
-        # Tokens vLLM never renders (``boundary_token_ids``), same lazy read.
+        # Tokens vLLM never renders (``boundary_token_ids`` and the stop ids),
+        # read from the tokenizer on first use.
         self._hidden_token_id_set: Optional[frozenset] = None
 
         # Request management - following vLLM's design
@@ -1065,17 +1063,16 @@ class Scheduler:
                     stop_tokens.add(tok.eos_token_ids)
         return stop_tokens
 
-    def _eos_token_ids(self) -> Set[int]:
-        """The model's EOS token ids (cached; the tokenizer does not change)."""
-        if self._eos_token_id_set is None:
-            self._eos_token_id_set = self._get_stop_tokens()
-        return self._eos_token_id_set
-
     def _hidden_token_ids(self) -> frozenset:
-        """Ids that never reach the text (EOS, BOS, PAD, UNK; cached)."""
+        """Ids that never reach the text (cached; the tokenizer does not change).
+
+        BOS/PAD/UNK and every id the scheduler stops on, which includes the EOS
+        ids the processor of a multimodal model declares.
+        """
         if self._hidden_token_id_set is None:
-            self._hidden_token_id_set = (
-                boundary_token_ids(self._actual_tokenizer) | self._eos_token_ids()
+            self._hidden_token_id_set = frozenset(
+                boundary_token_ids(self._actual_tokenizer)
+                | {t for t in self._get_stop_tokens() if t is not None}
             )
         return self._hidden_token_id_set
 
@@ -2436,17 +2433,20 @@ class Scheduler:
                 request.first_token_time = _time.time()
 
             # Decode the new token using streaming detokenizer (UTF-8 safe).
-            # A stop-finishing token is the terminator, not content. Other
-            # tokens go through the request's detokenizer, which leaves out
+            # The request always owns a detokenizer from its first token on, so
+            # the final text never has to be rebuilt from the raw ids (which
+            # would render a terminator that is the only token generated).
+            # A stop-finishing token is the terminator, not content. Every
+            # other token goes through that detokenizer, which leaves out
             # BOS/PAD/UNK/EOS (``boundary_token_ids``) unless the request set
             # ``skip_special_tokens=False``: under ignore_eos an EOS token is
             # generated and counted but never finishes the request, and is
             # dropped there -- the same text a natural stop would have
             # produced for it.
+            detok = self._get_detokenizer(request_id)
             if response.finish_reason == "stop":
                 new_text = ""
             else:
-                detok = self._get_detokenizer(request_id)
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
@@ -2474,15 +2474,9 @@ class Scheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                # Finalize streaming detokenizer and get full output. No
-                # detokenizer means the request ended on its first token, the
-                # terminator: there is no text.
-                detok = self._detokenizer_pool.get(request_id)
-                if detok is not None:
-                    detok.finalize()
-                    output.output_text = detok.text
-                else:
-                    output.output_text = ""
+                # Finalize streaming detokenizer and get full output
+                detok.finalize()
+                output.output_text = detok.text
                 request.output_text = output.output_text
                 self._cleanup_detokenizer(request_id)
 

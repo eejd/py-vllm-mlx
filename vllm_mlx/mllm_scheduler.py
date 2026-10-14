@@ -727,26 +727,29 @@ class MLLMScheduler:
                 request.first_token_time = time.time()
 
             # Decode the new token using streaming detokenizer (UTF-8 safe).
-            # A stop-finishing token is the terminator, not content. Other
-            # tokens go through the request's detokenizer, which leaves out
+            # The request always owns a detokenizer from its first token on, so
+            # the final text never has to be rebuilt from the raw ids (which
+            # would render a terminator that is the only token generated).
+            # A stop-finishing token is the terminator, not content. Every
+            # other token goes through that detokenizer, which leaves out
             # BOS/PAD/UNK/EOS (``boundary_token_ids``) unless the request set
             # ``skip_special_tokens=False``: under ignore_eos an EOS token is
             # generated and counted but does not finish the request, and is
             # dropped there, the same text a natural stop gives.
+            detok = self._detokenizer_pool.get(request_id)
+            if detok is None:
+                detok = streaming_detokenizer(
+                    tokenizer,
+                    (
+                        boundary_token_ids(tokenizer)
+                        if request.sampling_params.skip_special_tokens
+                        else frozenset()
+                    ),
+                )
+                self._detokenizer_pool[request_id] = detok
             if response.finish_reason == "stop":
                 new_text = ""
             else:
-                detok = self._detokenizer_pool.get(request_id)
-                if detok is None:
-                    detok = streaming_detokenizer(
-                        tokenizer,
-                        (
-                            boundary_token_ids(tokenizer)
-                            if request.sampling_params.skip_special_tokens
-                            else frozenset()
-                        ),
-                    )
-                    self._detokenizer_pool[request_id] = detok
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
@@ -775,15 +778,10 @@ class MLLMScheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                # Finalize streaming detokenizer and get full output. No
-                # detokenizer means the request ended on its first token, the
-                # terminator: there is no text.
-                detok = self._detokenizer_pool.pop(request_id, None)
-                if detok is not None:
-                    detok.finalize()
-                    output.output_text = detok.text
-                else:
-                    output.output_text = ""
+                # Finalize streaming detokenizer and get full output
+                self._detokenizer_pool.pop(request_id, None)
+                detok.finalize()
+                output.output_text = detok.text
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
 
