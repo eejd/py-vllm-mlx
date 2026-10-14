@@ -305,9 +305,19 @@ class MLXLanguageModel:
         if penalty_processors or logits_processors:
             all_processors = (logits_processors or []) + (penalty_processors or [])
 
-        # Count prompt tokens once upfront
+        # Count prompt tokens once upfront, encoding the way mlx-lm does when it
+        # tokenizes the prompt itself: a rendered chat prompt that already starts
+        # with the BOS text must not get a second one from the tokenizer.
+        # Inline copy of ``prompt_adds_special_tokens`` (PR #90,
+        # ``utils/tokenizer.py``); switch to ``encode_prompt`` once #90 is merged.
         if isinstance(prompt, str):
-            num_prompt_tokens = len(self.tokenizer.encode(prompt))
+            bos_token = getattr(self.tokenizer, "bos_token", None)
+            add_special_tokens = not (
+                isinstance(bos_token, str) and prompt.startswith(bos_token)
+            )
+            num_prompt_tokens = len(
+                self.tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+            )
         else:
             num_prompt_tokens = len(prompt)
 

@@ -704,6 +704,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    error_kind=response.error_kind,
                     specprefill_outcome=request.specprefill_outcome,
                 )
                 request.status = RequestStatus.FINISHED_ABORTED

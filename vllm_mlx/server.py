@@ -55,12 +55,12 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing, suppress
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.routing import Match
@@ -121,9 +121,12 @@ from .api.models import (
 from .api.prompt_canonicalize import canonicalize_system_messages
 from .api.responses_models import (
     ResponseCompletedEvent,
+    ResponseError,
+    ResponseErrorEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
+    ResponseFailedEvent,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallItem,
     ResponseFunctionCallOutputItem,
@@ -175,12 +178,22 @@ from .cli_arg_types import (
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .utils.chat_template_override import CHAT_TEMPLATE_HELP, chat_template_arg
+from .utils.chat_template_tools import (
+    engine_template_renderer,
+    template_renders_tools,
+    tools_ignored_warning,
+)
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import EngineBusy, suspend_cancellation
+from .engine.base import (
+    EngineBusy,
+    EngineRequestError,
+    GenerationError,
+    suspend_cancellation,
+)
 from .request import UnsupportedRequestOption
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
@@ -194,6 +207,7 @@ from .model_registry import (
 from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
+from .reasoning.harmony_channels import strip_reasoning_messages
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
@@ -2033,6 +2047,10 @@ async def lifespan(app: FastAPI):
         ):
             await _load_prefix_cache_from_disk()
 
+        # A template that never reads `tools` leaves tool calling silently dead.
+        if _residency_manager is None and _model_manager is None:
+            _warn_if_template_ignores_tools(_engine)
+
         # Warm up prefix cache with user-provided prompts (AFTER disk cache load,
         # so any already-persisted entries are preserved and warm-up only fills
         # gaps).
@@ -2146,6 +2164,55 @@ app = FastAPI(
 security = HTTPBearer(auto_error=False)
 
 
+_INTERNAL_ERROR = "Internal server error"
+
+
+def _as_engine_error(exc: Exception) -> EngineRequestError:
+    """The error to report for *exc*: itself when the engine classified it, else a 500."""
+    if isinstance(exc, EngineRequestError):
+        return exc
+    return GenerationError(_INTERNAL_ERROR)
+
+
+def _openai_error_body(exc: EngineRequestError) -> dict:
+    """OpenAI/vLLM error body (``ErrorResponse``) for *exc*."""
+    return {
+        "error": {
+            "message": str(exc),
+            "type": exc.openai_type,
+            "param": None,
+            "code": exc.status_code,
+        }
+    }
+
+
+def _anthropic_error_body(exc: EngineRequestError) -> dict:
+    """Anthropic error envelope for *exc*."""
+    return {"type": "error", "error": {"type": exc.anthropic_type, "message": str(exc)}}
+
+
+@app.exception_handler(EngineRequestError)
+async def _engine_request_error_handler(request: Request, exc: EngineRequestError):
+    """Answer a request the engine failed with its HTTP error and a JSON error body.
+
+    A generation failure (``finish_reason == "error"``) is HTTP 500, not a 200
+    with an empty completion: the same mapping vLLM applies.  Inputs the engine
+    could not preprocess are HTTP 400, as in vLLM.  ``/v1/messages`` gets
+    Anthropic's error envelope, every other route OpenAI's.
+    """
+    logger.error(
+        "Request failed in the engine (%s): %s %s",
+        type(exc).__name__,
+        request.method,
+        request.url.path,
+    )
+    if request.url.path.rstrip("/") == "/v1/messages":
+        content = _anthropic_error_body(exc)
+    else:
+        content = _openai_error_body(exc)
+    return JSONResponse(status_code=exc.status_code, content=content)
+
+
 def _metrics_result_from_status(status_code: int) -> str:
     """Map HTTP-ish status codes to low-cardinality inference results."""
     if status_code == 499:
@@ -2155,6 +2222,13 @@ def _metrics_result_from_status(status_code: int) -> str:
     if status_code >= 500:
         return "error"
     return "success"
+
+
+def _engine_error_result(exc: Exception) -> str:
+    """Inference result label for a failed request: the client's fault, or ours."""
+    if isinstance(exc, EngineRequestError) and exc.status_code < 500:
+        return "client_error"
+    return "error"
 
 
 def _metrics_path_for_request(request: Request) -> str:
@@ -3222,7 +3296,11 @@ async def _run_responses_request(
 
     # Reasoning is separated first; the tool parser sees the content part only.
     reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
-        output.text, chat_request, engine=engine, chat_kwargs=chat_kwargs
+        output.text,
+        chat_request,
+        allow_reasoning=not _thinking_disabled(chat_request, chat_kwargs),
+        engine=engine,
+        chat_kwargs=chat_kwargs,
     )
 
     output_items = _build_responses_output_items(
@@ -3256,14 +3334,82 @@ async def _run_responses_request(
     return response_object, persisted_messages
 
 
+async def _capture_stream_failure(
+    stream: AsyncIterator, failures: list[Exception]
+) -> AsyncIterator:
+    """Pass *stream* through; a failure ends it quietly and is left in *failures*.
+
+    For a stream whose caller reports failures as events of its own protocol
+    rather than by letting the exception end the response.  Cancellation and
+    generator exit are not failures and propagate.
+    """
+    try:
+        async with aclosing(stream) as items:
+            async for item in items:
+                yield item
+    except Exception as exc:
+        logger.error("Streaming error, reporting it in-band: %s", exc)
+        failures.append(exc)
+
+
+def _responses_failure_events(
+    request: ResponsesRequest,
+    response_id: str,
+    exc: Exception,
+    sequence: int,
+) -> list[str]:
+    """The events that end a Responses stream the engine failed.
+
+    An ``error`` event (``code``/``message``/``param``) followed by
+    ``response.failed`` carrying the response with ``status: "failed"`` and its
+    ``error`` object, as the OpenAI Responses API sends.  vLLM 0.31 intends the
+    same (it catches ``GenerationError`` around its stream) but hands its
+    ``ErrorResponse`` JSON to a validator of Responses events, which rejects it.
+    The message is generic; the cause is in the server log.
+    """
+    err = _as_engine_error(exc)
+    failed = _build_response_object(
+        request=request,
+        output_items=[],
+        prompt_tokens=0,
+        completion_tokens=0,
+        finish_reason=None,
+        response_id=response_id,
+    )
+    failed.status = "failed"
+    failed.usage = None
+    failed.error = ResponseError(code=err.responses_code, message=str(err))
+    return [
+        _responses_sse_event(
+            "error",
+            ResponseErrorEvent(
+                sequence_number=sequence, code=err.responses_code, message=str(err)
+            ),
+        ),
+        _responses_sse_event(
+            "response.failed",
+            ResponseFailedEvent(sequence_number=sequence + 1, response=failed),
+        ),
+    ]
+
+
 async def _stream_responses_request(
-    request: ResponsesRequest, engine: BaseEngine | None = None
+    request: ResponsesRequest,
+    engine: BaseEngine | None = None,
+    prepared: tuple[BaseEngine, ChatCompletionRequest, list[dict], dict] | None = None,
+    metrics_tracker=None,
 ) -> AsyncIterator[str]:
-    """Execute a Responses API request and stream SSE events incrementally."""
-    if engine is None:
-        prepared = _prepare_streaming_responses_request(request)
-    else:
-        prepared = _prepare_streaming_responses_request(request, engine=engine)
+    """Execute a Responses API request and stream SSE events incrementally.
+
+    ``prepared`` is the result of ``_prepare_streaming_responses_request`` when the
+    endpoint already built it (to pre-check the chat template before the stream
+    starts); without it the request is prepared here.
+    """
+    if prepared is None:
+        if engine is None:
+            prepared = _prepare_streaming_responses_request(request)
+        else:
+            prepared = _prepare_streaming_responses_request(request, engine=engine)
     engine, chat_request, messages, chat_kwargs = prepared
     tool_request_context = chat_request.model_dump()
 
@@ -3400,6 +3546,7 @@ async def _stream_responses_request(
     tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    raw_tool_parser = _tool_parser_reads_raw_output(tool_parser)
     tool_calls_detected = False
     drop_post_call_text = _parser_drops_text_after_tool_call(tool_parser)
 
@@ -3419,7 +3566,10 @@ async def _stream_responses_request(
                 )
         return content
 
-    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+    failures: list[Exception] = []
+    async for output in _capture_stream_failure(
+        engine.stream_chat(messages=messages, **chat_kwargs), failures
+    ):
         last_output = output
         finish_reason = output.finish_reason
         if hasattr(output, "prompt_tokens") and output.prompt_tokens:
@@ -3467,7 +3617,11 @@ async def _stream_responses_request(
                 finished=output_finished,
             )
             if delta_msg is None:
-                if output_finished and tool_parser and tool_markup_possible:
+                if tool_parser and (
+                    raw_tool_parser or (output_finished and tool_markup_possible)
+                ):
+                    # The tool parser reads every raw delta, including the ones the
+                    # reasoning parser has nothing to say about.
                     delta_msg = DeltaMessage()
                 else:
                     continue
@@ -3489,21 +3643,24 @@ async def _stream_responses_request(
                 sequence += 1
 
             content = delta_msg.content or ""
-            if tool_parser and (content or (output_finished and tool_markup_possible)):
+            tool_input = _streaming_tool_input(tool_parser, delta_text, content)
+            if tool_parser and (
+                tool_input or (output_finished and tool_markup_possible)
+            ):
                 # This branch feeds every delta to the parser, so the other branches'
                 # "markup seen" latch is set here too: without it the empty output that
                 # ends the stream never reaches the parser or its end-of-stream hook, and
                 # a call still pending at the end is dropped.
                 if not tool_markup_possible and (
                     _streaming_tool_markup_possible_after_delta(
-                        tool_accumulated_text, content, tool_parser
+                        tool_accumulated_text, tool_input, tool_parser
                     )
                 ):
                     tool_markup_possible = True
                 tool_accumulated_text, tool_result = _extract_streaming_tool_delta(
                     tool_parser,
                     tool_accumulated_text,
-                    content,
+                    tool_input,
                     tool_request_context,
                 )
                 if output_finished and _should_finalize_tool_stream(
@@ -3579,6 +3736,18 @@ async def _stream_responses_request(
             ),
         )
         sequence += 1
+
+    if failures:
+        # The 200 header is long gone: the failure can only be an in-band
+        # event.  Nothing after the loop runs, so no completed response is
+        # stored and no ``response.completed`` follows.
+        if metrics_tracker is not None:
+            metrics_tracker.finish(result=_engine_error_result(failures[0]))
+        for event in _responses_failure_events(
+            request, response_id, failures[0], sequence
+        ):
+            yield event
+        return
 
     # The final calls come from the content part only, as in the non-streaming
     # path: the tool parser never sees the reasoning.
@@ -3744,6 +3913,12 @@ async def _stream_responses_request(
         while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
             _responses_store.popitem(last=False)
 
+    if metrics_tracker is not None:
+        metrics_tracker.finish(
+            result="success",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
     yield _responses_sse_event(
         "response.completed",
         ResponseCompletedEvent(sequence_number=sequence, response=response_object),
@@ -3786,18 +3961,11 @@ def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
     return bool(end and end != "<channel|>" and end in text)
 
 
-_HARMONY_ANALYSIS_BLOCK_RE = re.compile(
-    r"<\|channel\|>analysis[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>.*?"
-    r"(?=<\|channel\|>|<\|end\|>|\Z)",
-    re.DOTALL,
-)
-
-
 def _strip_harmony_analysis_blocks(text: str) -> str:
-    """Remove harmony analysis-channel blocks (and their content) so reasoning
-    text is never handed to the tool parser, while commentary/final text is
-    preserved."""
-    return _HARMONY_ANALYSIS_BLOCK_RE.sub("", text)
+    """Remove harmony analysis-channel messages (and their content) so reasoning
+    text is never handed to the tool parser, while commentary/final text, and a call
+    addressed to a function whatever its channel, are preserved."""
+    return strip_reasoning_messages(text)
 
 
 def _reasoning_has_tool_markup(text: str, tool_parser=None) -> bool:
@@ -3921,7 +4089,11 @@ def _extract_reasoning_and_tool_calls(
             cleaned_reasoning_text = None
         if cleaned_reasoning_text is not None:
             text_for_tool_parse = cleaned_reasoning_text
-        elif reasoning_text is not None:
+        elif reasoning_text is not None or (
+            _reasoning_parser_reads_control_tokens(_reasoning_parser)
+            and "<|channel|>" in output_text
+        ):
+            # (a harmony output with nothing to separate, only calls, lands here too)
             # Reasoning extracted but no final content channel - gpt-oss
             # jumped from <|channel|>analysis straight into
             # <|channel|>commentary to=functions.*. Hand the tool parser the
@@ -3939,6 +4111,17 @@ def _extract_reasoning_and_tool_calls(
                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""
+        if (
+            request is not None
+            and getattr(request, "tools", None)
+            and "<|channel|>" in output_text
+            and _configured_tool_parser_reads_raw_output()
+        ):
+            # A harmony output keeps its calls in the commentary channel, which the
+            # reasoning parser's content (the final channel) does not include: the
+            # tool parser reads everything but the analysis, a call before a final
+            # message included.
+            text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
         thinking_text = reasoning_text
         if suppress_reasoning:
             # Keep the cleaned answer, but do not expose thoughts emitted
@@ -4007,6 +4190,26 @@ def _detect_native_tool_support() -> bool:
             _sanitize_log_text(e, limit=500),
         )
         return False
+
+
+def _warn_if_template_ignores_tools(engine: BaseEngine | None) -> None:
+    """Warn at startup when tool calling is on but the chat template drops ``tools``.
+
+    The parser only reads what the model writes; the template is what tells the model
+    which tools exist. With a template that never reads ``tools`` every request ends
+    in prose and nothing in the log says why (Phi-4-mini, Hermes-3-3B, Gemma-3 as
+    converted). Probed once with a throwaway message; never fails startup.
+    """
+    if engine is None or not _enable_auto_tool_choice or not _tool_call_parser:
+        return
+    # Harmony renders its own prompt; it does not go through a Jinja template.
+    if getattr(engine, "use_harmony_rendering", False):
+        return
+    render = engine_template_renderer(engine)
+    if render is None:
+        return
+    if template_renders_tools(render) is False:
+        logger.warning(tools_ignored_warning(_tool_call_parser))
 
 
 def _detect_harmony_rendering() -> bool:
@@ -4094,6 +4297,40 @@ def _get_streaming_tool_parser(
     except Exception as e:
         logger.warning(f"Failed to init generic streaming tool parser: {e}")
         return None
+
+
+def _tool_parser_reads_raw_output(tool_parser) -> bool:
+    """Whether the tool parser separates the channels itself.
+
+    A parser that does (harmony: analysis, commentary calls and the final answer are
+    channels of one stream) is handed the raw output with a reasoning parser too: the
+    calls live in a channel the reasoning parser keeps out of its content, and the
+    parser itself never reads the analysis channel as content or as a call.
+    """
+    return bool(getattr(tool_parser, "READS_RAW_OUTPUT", False))
+
+
+def _configured_tool_parser_reads_raw_output() -> bool:
+    """``_tool_parser_reads_raw_output`` for the parser the server was launched with."""
+    if not _enable_auto_tool_choice or not _tool_call_parser:
+        return False
+    try:
+        return _tool_parser_reads_raw_output(
+            ToolParserManager.get_tool_parser(_tool_call_parser)
+        )
+    except KeyError:
+        return False
+
+
+def _reasoning_parser_reads_control_tokens(reasoning_parser) -> bool:
+    """Whether the reasoning parser's markers are control tokens that the shared special
+    token filter would remove (the harmony channels), so it must be fed unfiltered."""
+    return bool(getattr(reasoning_parser, "READS_CONTROL_TOKENS", False))
+
+
+def _streaming_tool_input(tool_parser, raw_delta: str, content: str) -> str:
+    """The delta the tool parser is fed when a reasoning parser splits the stream."""
+    return raw_delta if _tool_parser_reads_raw_output(tool_parser) else content
 
 
 def _extract_streaming_tool_delta(
@@ -5652,9 +5889,26 @@ async def list_voices(model: str = "kokoro"):
 # =============================================================================
 
 
+def _openai_stream_error_frame(exc: Exception) -> str:
+    """OpenAI-style in-band error for a stream that already sent its 200 header.
+
+    Same shape vLLM sends.  The message is generic on purpose: the cause is in
+    the server log, not for the client.
+    """
+    return f"data: {json.dumps(_openai_error_body(_as_engine_error(exc)))}\n\n"
+
+
+def _anthropic_stream_error_frame(exc: Exception) -> str:
+    """Anthropic-style ``error`` event, for ``/v1/messages`` streams."""
+    payload = _anthropic_error_body(_as_engine_error(exc))
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
 async def _ensure_sse_terminal(
     generator: AsyncIterator[str],
     terminal_frame: str,
+    *,
+    error_frame: Callable[[Exception], str] | None = None,
 ) -> AsyncIterator[str]:
     """Guarantee that *terminal_frame* is emitted exactly once at the end of
     *generator*, even if the generator raises mid-stream.
@@ -5662,16 +5916,25 @@ async def _ensure_sse_terminal(
     If the inner generator already yields the terminal frame on its happy path,
     the wrapper detects it and avoids double-emission.  If the generator raises
     before reaching the terminal, the wrapper emits it in the ``finally`` block.
+
+    The response is already a 200 by then, so a failure can only be reported
+    in-band.  With *error_frame* the wrapper sends that frame (built from the
+    exception) ahead of the terminal one; without it the stream just ends, which
+    a client cannot tell from a completion.
     """
     emitted = False
+    failure: Exception | None = None
     try:
         async for chunk in generator:
             if chunk == terminal_frame:
                 emitted = True
             yield chunk
     except Exception as e:
+        failure = e
         logger.error(f"Streaming error, ensuring terminal frame: {e}")
     finally:
+        if failure is not None and error_frame is not None:
+            yield error_frame(failure)
         if not emitted:
             yield terminal_frame
 
@@ -5718,7 +5981,11 @@ async def _build_chat_streaming_response(
 
     response = StreamingResponse(
         _disconnect_guard(
-            _ensure_sse_terminal(stream_generator, "data: [DONE]\n\n"),
+            _ensure_sse_terminal(
+                stream_generator,
+                "data: [DONE]\n\n",
+                error_frame=_openai_stream_error_frame,
+            ),
             raw_request,
             cleanup=_make_release_cleanup(raw_request),
             timeout=total_timeout,
@@ -6263,6 +6530,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                             metrics_tracker=tracker,
                         ),
                         "data: [DONE]\n\n",
+                        error_frame=_openai_stream_error_frame,
                     ),
                     raw_request,
                     cleanup=_make_release_cleanup(raw_request),
@@ -6327,6 +6595,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except UnsupportedRequestOption as exc:
                 tracker.finish(result="client_error")
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except EngineRequestError as exc:
+                tracker.finish(result=_engine_error_result(exc))
+                raise
             if output is None:
                 tracker.finish(
                     result="client_closed",
@@ -6495,6 +6766,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _raise_remote_media_http_error(exc)
 
         if request.stream:
+            try:
+                await engine.validate_chat_template(
+                    prepared.messages, **prepared.chat_kwargs
+                )
+            except (UnsupportedRequestOption, EngineBusy) as exc:
+                _raise_preflight_error(exc, tracker)
             response, release_on_exit = await _build_chat_streaming_response(
                 engine,
                 prepared.messages,
@@ -6526,6 +6803,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except UnsupportedRequestOption as exc:
             tracker.finish(result="client_error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except EngineRequestError as exc:
+            tracker.finish(result=_engine_error_result(exc))
+            raise
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
@@ -6680,6 +6960,22 @@ def _get_engine_tokenizer(engine) -> object | None:
     return None
 
 
+async def _track_responses_stream(
+    stream: AsyncIterator[str], tracker
+) -> AsyncIterator[str]:
+    """Pass a Responses stream through; a stream that ended without recording its
+    outcome (the client left, or something unforeseen raised) is accounted for here."""
+    try:
+        async for chunk in stream:
+            yield chunk
+    except (asyncio.CancelledError, GeneratorExit):
+        tracker.finish(result="cancelled")
+        raise
+    except Exception as exc:
+        tracker.finish(result=_engine_error_result(exc))
+        raise
+
+
 @app.post(
     "/v1/responses",
     dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
@@ -6710,6 +7006,7 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             return Response(status_code=499)
         release_on_exit = True
 
+    tracker = _metrics.track_inference("responses", stream=request.stream)
     try:
         if request.stream:
             chat_request = _responses_request_to_chat_request(request)
@@ -6721,9 +7018,19 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
                     ignore_eos=True,
                     has_media=has_media_content(chat_request.messages),
                 )
+            prepared = _prepare_streaming_responses_request(request, engine=engine)
+            await prepared[0].validate_chat_template(prepared[2], **prepared[3])
             response = StreamingResponse(
                 _disconnect_guard(
-                    _stream_responses_request(request, engine=engine),
+                    _track_responses_stream(
+                        _stream_responses_request(
+                            request,
+                            engine=engine,
+                            prepared=prepared,
+                            metrics_tracker=tracker,
+                        ),
+                        tracker,
+                    ),
                     raw_request,
                     cleanup=(
                         _make_release_cleanup(raw_request)
@@ -6740,16 +7047,30 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             request, raw_request, engine=engine
         )
     except UnsafeRemoteURLError as exc:
+        tracker.finish(result="client_error")
         _raise_remote_media_http_error(exc)
     except (UnsupportedRequestOption, EngineBusy) as exc:
-        _raise_preflight_error(exc)
+        _raise_preflight_error(exc, tracker)
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
+    except Exception as exc:
+        tracker.finish(result=_engine_error_result(exc))
+        raise
     finally:
         if release_on_exit:
             await _release_engine_for_request(raw_request)
 
     if response_object is None:
+        tracker.finish(result="client_closed")
         return Response(status_code=499)
 
+    usage = response_object.usage
+    tracker.finish(
+        result="success",
+        prompt_tokens=usage.input_tokens if usage else 0,
+        completion_tokens=usage.output_tokens if usage else 0,
+    )
     return response_object
 
 
@@ -6974,6 +7295,12 @@ async def create_anthropic_message(
             effective_max_tokens,
         )
         if anthropic_request.stream:
+            try:
+                await engine.validate_chat_template(
+                    prepared.messages, **prepared.chat_kwargs
+                )
+            except (UnsupportedRequestOption, EngineBusy) as exc:
+                _raise_preflight_error(exc, tracker)
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             )
@@ -6988,6 +7315,7 @@ async def create_anthropic_message(
                             metrics_tracker=tracker,
                         ),
                         anthropic_terminal,
+                        error_frame=_anthropic_stream_error_frame,
                     ),
                     request,
                     cleanup=_make_release_cleanup(request),
@@ -7012,6 +7340,12 @@ async def create_anthropic_message(
             )
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
+        except UnsupportedRequestOption as exc:
+            tracker.finish(result="client_error")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except EngineRequestError as exc:
+            tracker.finish(result=_engine_error_result(exc))
             raise
         if output is None:
             tracker.finish(result="client_closed")
@@ -7356,6 +7690,10 @@ async def _stream_anthropic_messages(
     tool_parser = _get_streaming_tool_parser(openai_request, engine)
     reasoning_watch = _ReasoningMarkupWatch(tool_parser if reasoning_parser else None)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    raw_tool_parser = _tool_parser_reads_raw_output(tool_parser)
+    reads_raw_stream = raw_tool_parser or _reasoning_parser_reads_control_tokens(
+        reasoning_parser
+    )
     tool_request_context = openai_request.model_dump()
 
     try:
@@ -7378,11 +7716,19 @@ async def _stream_anthropic_messages(
             ):
                 continue
 
-            # Filter special tokens
+            # Filter special tokens. A harmony stream is made of control tokens, so its
+            # parsers read the raw delta (a delta that is nothing else still has to
+            # reach them) and only what is shown is filtered; every other parser reads
+            # the filtered delta, and a delta that is only special tokens is skipped.
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-            if not filtered and not (
-                (use_reasoning and output_finished)
-                or (tool_parser and tool_markup_possible and output_finished)
+            parse_text = delta_text if reads_raw_stream else filtered
+            if (
+                not filtered
+                and not reads_raw_stream
+                and not (
+                    (use_reasoning and output_finished)
+                    or (tool_parser and tool_markup_possible and output_finished)
+                )
             ):
                 continue
 
@@ -7391,14 +7737,14 @@ async def _stream_anthropic_messages(
                 and thinking_off
                 and not disabled_reasoning_latched
                 and _explicit_reasoning_markers_present(
-                    accumulated_text + filtered, reasoning_parser
+                    accumulated_text + parse_text, reasoning_parser
                 )
             ):
                 disabled_reasoning_latched = True
 
             if not (use_reasoning or disabled_reasoning_latched):
                 # Simple path — no reasoning parsing
-                accumulated_text += filtered
+                accumulated_text += parse_text
                 content_text += filtered
                 content_to_emit = filtered
 
@@ -7442,6 +7788,11 @@ async def _stream_anthropic_messages(
                             content_to_emit = _TOOL_MARKUP_PATTERN.sub(
                                 "", content_to_emit
                             )
+                            if reads_raw_stream:
+                                # the parser saw the raw delta: show it filtered
+                                content_to_emit = SPECIAL_TOKENS_PATTERN.sub(
+                                    "", content_to_emit
+                                )
                         if not content_to_emit:
                             continue
 
@@ -7450,18 +7801,34 @@ async def _stream_anthropic_messages(
 
             # Reasoning parser path
             previous_text = accumulated_text
-            accumulated_text += filtered
+            accumulated_text += parse_text
             assert reasoning_parser is not None
             delta_msg = _extract_streaming_reasoning_delta(
                 reasoning_parser,
                 previous_text,
                 accumulated_text,
-                filtered,
+                parse_text,
                 finished=output_finished,
             )
+            if delta_msg is not None and reads_raw_stream:
+                # the parsers saw the raw delta: what is shown is filtered
+                delta_msg = DeltaMessage(
+                    reasoning=SPECIAL_TOKENS_PATTERN.sub(
+                        "", getattr(delta_msg, "reasoning", None) or ""
+                    )
+                    or None,
+                    content=SPECIAL_TOKENS_PATTERN.sub(
+                        "", getattr(delta_msg, "content", None) or ""
+                    )
+                    or None,
+                )
 
             if delta_msg is None:
-                if output_finished and tool_parser and tool_markup_possible:
+                if tool_parser and (
+                    raw_tool_parser or (output_finished and tool_markup_possible)
+                ):
+                    # The tool parser reads every raw delta, including the ones the
+                    # reasoning parser has nothing to say about.
                     delta_msg = DeltaMessage()
                 else:
                     continue
@@ -7475,20 +7842,23 @@ async def _stream_anthropic_messages(
 
             content_text += delta_msg.content or ""
             content_to_emit = delta_msg.content or ""
-            if content_to_emit or (
-                tool_parser and output_finished and tool_markup_possible
+            tool_input = _streaming_tool_input(tool_parser, delta_text, content_to_emit)
+            if (
+                content_to_emit
+                or tool_input
+                or (tool_parser and output_finished and tool_markup_possible)
             ):
                 # Filter tool call markup during streaming
                 if tool_parser and (
-                    content_to_emit or (output.finished and tool_markup_possible)
+                    tool_input or (output.finished and tool_markup_possible)
                 ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content_to_emit, tool_parser
+                            tool_accumulated_text, tool_input, tool_parser
                         )
                     ):
-                        tool_accumulated_text += content_to_emit
+                        tool_accumulated_text += tool_input
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
@@ -7496,7 +7866,7 @@ async def _stream_anthropic_messages(
                             _parse_streaming_tool_content(
                                 tool_parser,
                                 tool_accumulated_text,
-                                content_to_emit,
+                                tool_input,
                                 tool_request_context,
                             )
                         )
@@ -7515,6 +7885,11 @@ async def _stream_anthropic_messages(
                             content_to_emit = _TOOL_MARKUP_PATTERN.sub(
                                 "", content_to_emit
                             )
+                            if reads_raw_stream:
+                                # the parser saw the raw delta: show it filtered
+                                content_to_emit = SPECIAL_TOKENS_PATTERN.sub(
+                                    "", content_to_emit
+                                )
                         if not content_to_emit:
                             continue
 
@@ -7593,8 +7968,8 @@ async def _stream_anthropic_messages(
     except (asyncio.CancelledError, GeneratorExit):
         result_label = "cancelled"
         raise
-    except Exception:
-        result_label = "error"
+    except Exception as exc:
+        result_label = _engine_error_result(exc)
         raise
     finally:
         if metrics_tracker is not None:
@@ -7681,17 +8056,17 @@ async def stream_completion(
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
             yield f"data: {json.dumps(data)}\n\n"
+        yield "data: [DONE]\n\n"
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
         raise
     except (asyncio.CancelledError, GeneratorExit):
         result = "cancelled"
         raise
-    except Exception:
-        result = "error"
+    except Exception as exc:
+        result = _engine_error_result(exc)
         raise
     finally:
-        yield "data: [DONE]\n\n"
         if metrics_tracker is not None:
             metrics_tracker.finish(
                 result=result,
@@ -7785,6 +8160,7 @@ async def stream_chat_completion(
     tool_parser = _get_streaming_tool_parser(request, engine)
     reasoning_watch = _ReasoningMarkupWatch(tool_parser if reasoning_parser else None)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    raw_tool_parser = _tool_parser_reads_raw_output(tool_parser)
     buffer_typed_tool_calls = request.tool_argument_recovery == "buffered"
     buffered_tool_calls: dict[int, dict] = {}
     # Whether any emitted chunk carried a terminal finish_reason. The engine's
@@ -7842,7 +8218,11 @@ async def stream_chat_completion(
                 )
 
                 if delta_msg is None:
-                    if output_finished and tool_parser and tool_markup_possible:
+                    if tool_parser and (
+                        raw_tool_parser or (output_finished and tool_markup_possible)
+                    ):
+                        # The tool parser reads every raw delta, including the ones
+                        # the reasoning parser has nothing to say about.
                         delta_msg = DeltaMessage()
                     else:
                         # Skip this chunk (e.g., <think> token itself)
@@ -7856,24 +8236,31 @@ async def stream_chat_completion(
                 )
                 content = content or ""
 
+                # What the tool parser reads: the content part, or for a parser that
+                # reads the channels itself (harmony) the raw output.
+                tool_input = _streaming_tool_input(tool_parser, delta_text, content)
+
                 if thinking_off and reasoning:
                     # The request disabled thinking — surface only parsed
                     # content; drop reasoning the model emitted anyway.
                     reasoning = None
-                    if not content:
+                    if not content and not tool_input:
+                        # (a parser that reads the raw stream still has to see a delta
+                        # whose only visible part was reasoning: its state is made of
+                        # those control tokens)
                         continue
 
                 # Tool call parsing on content portion
                 if tool_parser and (
-                    content or (output_finished and tool_markup_possible)
+                    tool_input or (output_finished and tool_markup_possible)
                 ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content, tool_parser
+                            tool_accumulated_text, tool_input, tool_parser
                         )
                     ):
-                        tool_accumulated_text += content
+                        tool_accumulated_text += tool_input
                         # Emit as-is; no tool markup is even possible yet.
                     else:
                         if not tool_markup_possible:
@@ -7882,7 +8269,7 @@ async def stream_chat_completion(
                             _extract_streaming_tool_delta(
                                 tool_parser,
                                 tool_accumulated_text,
-                                content,
+                                tool_input,
                                 tool_request_context,
                             )
                         )
@@ -8266,6 +8653,17 @@ async def stream_chat_completion(
                 finish_reason_emitted = True
                 fallback_call_emitted = True
 
+        if (
+            tool_parser
+            and tool_accumulated_text
+            and tool_calls_detected
+            and hasattr(tool_parser, "log_incomplete_call")
+        ):
+            # The re-parse above runs only when no call went out; a parser that logs a
+            # call cut off at the end of generation does it here too, so a complete call
+            # followed by a cut-off one is reported on every path.
+            tool_parser.log_incomplete_call(tool_accumulated_text)
+
         reasoning_watch.warn_if_no_call(tool_calls_detected or fallback_call_emitted)
 
         # Terminal-chunk guard: if the engine's finished output was swallowed
@@ -8338,8 +8736,8 @@ async def stream_chat_completion(
     except (asyncio.CancelledError, GeneratorExit):
         result_label = "cancelled"
         raise
-    except Exception:
-        result_label = "error"
+    except Exception as exc:
+        result_label = _engine_error_result(exc)
         raise
     finally:
         if metrics_tracker is not None:

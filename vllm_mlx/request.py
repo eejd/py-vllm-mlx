@@ -49,11 +49,28 @@ class RequestStatus(enum.IntEnum):
         return None
 
 
+# ``RequestOutput.error_kind`` of a request whose inputs could not be preprocessed.
+ERROR_KIND_PREPROCESSING = "preprocessing"
+
+
 class UnsupportedRequestOption(ValueError):
     """Raised when the route chosen for a request cannot honour one of its options.
 
     The server maps it to HTTP 400. Silently dropping an option such as
     ``ignore_eos`` would make a client believe it got semantics it did not.
+    """
+
+
+class ChatTemplateRejected(UnsupportedRequestOption):
+    """The chat template refused the request's messages (HTTP 400).
+
+    Templates validate their input by raising from inside the template
+    (``raise_exception("Conversation roles must alternate ...")``: Gemma, Mistral,
+    Llama-2 and many others), which surfaces as ``jinja2.TemplateError``. That is the
+    template saying the *request* is malformed for this model, the case vLLM answers
+    with a 400 carrying the template's message. Raised by the engines through
+    ``chat_template_rejections``; a template that cannot be compiled, or any other
+    exception, is a server problem and keeps its own type.
     """
 
 
@@ -237,6 +254,10 @@ class RequestOutput:
     # Status
     finished: bool = False
     finish_reason: Optional[str] = None
+    # Why a request that finished with ``finish_reason="error"`` failed, when the
+    # scheduler can tell: ERROR_KIND_PREPROCESSING for inputs it could not
+    # preprocess (the client's fault), None for a failure while generating.
+    error_kind: Optional[str] = None
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0

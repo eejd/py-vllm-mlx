@@ -624,7 +624,13 @@ def extract_multimodal_content(
                 tool_call_id = msg.get("tool_call_id", "") or ""
             else:
                 tool_call_id = getattr(msg, "tool_call_id", None) or ""
-            tool_content = content if content else ""
+            if isinstance(content, list):
+                # OpenAI allows a tool result as a list of text parts. Templates
+                # concatenate it as a string (``'' + message.content``), which raises
+                # on a list; vLLM flattens the text parts for such templates too.
+                tool_content = _content_to_text(content)
+            else:
+                tool_content = content if content else ""
 
             if preserve_native_format:
                 # Preserve native tool format for models that support it
