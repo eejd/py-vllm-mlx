@@ -34,7 +34,11 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from ..request import UnsupportedRequestOption
-from ..utils.tokenizer import decode_visible, eos_ignoring_tokenizer
+from ..utils.tokenizer import (
+    decode_visible,
+    eos_ignoring_tokenizer,
+    unfiltered_tokenizer,
+)
 from .base import (
     BaseEngine,
     EngineBusy,
@@ -72,6 +76,34 @@ def _reject_ignore_eos_on_mlx_vlm(kwargs: dict[str, Any]) -> None:
             "on the simple engine); use --continuous-batching or a text-only "
             "chat request"
         )
+
+
+def _prepare_mlx_vlm_kwargs(kwargs: dict[str, Any]) -> None:
+    """Check the request options of a route that decodes through mlx-vlm.
+
+    ``ignore_eos`` is refused (see ``_reject_ignore_eos_on_mlx_vlm``).
+    ``skip_special_tokens`` is not an mlx-vlm argument: its detokenizer renders
+    whatever it is fed and stops on its own EOS, so the field is consumed here
+    and ``False`` is what that route does anyway.
+    """
+    _reject_ignore_eos_on_mlx_vlm(kwargs)
+    kwargs.pop("skip_special_tokens", None)
+
+
+def _request_tokenizer(tokenizer, ignore_eos: bool, skip_special_tokens: bool):
+    """The tokenizer a mlx-lm decode of this request runs under.
+
+    The engine's tokenizer already stops on EOS and leaves BOS/PAD/UNK/EOS out of
+    the text; ``ignore_eos`` and ``skip_special_tokens=False`` change that per
+    request, through a view that does not touch the shared tokenizer.
+    """
+    if ignore_eos:
+        return eos_ignoring_tokenizer(
+            tokenizer, skip_special_tokens=skip_special_tokens
+        )
+    if not skip_special_tokens:
+        return unfiltered_tokenizer(tokenizer)
+    return tokenizer
 
 
 def _bind_worker_generation_streams(stream: object | None = None) -> object:
@@ -1307,7 +1339,9 @@ class SimpleEngine(BaseEngine):
         if last_output is None:
             return GenerationOutput(text="", finish_reason="stop")
 
-        text = clean_output_text(last_output.text)
+        text = clean_output_text(
+            last_output.text, bool(kwargs.get("skip_special_tokens", True))
+        )
         return GenerationOutput(
             text=text,
             tokens=list(last_output.tokens),
@@ -1466,7 +1500,7 @@ class SimpleEngine(BaseEngine):
         specprefill_backbone_pct_override = kwargs.pop("specprefill_backbone_pct", None)
         request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
         if self._is_mllm:
-            _reject_ignore_eos_on_mlx_vlm(kwargs)
+            _prepare_mlx_vlm_kwargs(kwargs)
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
         if not self._is_mllm and self._draft_model is not None:
@@ -1691,6 +1725,9 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        # Read before an mlx-vlm route consumes it: False means the text is
+        # returned as generated, whichever decoder produced it.
+        skip_special = bool(kwargs.get("skip_special_tokens", True))
 
         async def aggregate_stream_chat() -> GenerationOutput:
             final_output = GenerationOutput(text="")
@@ -1706,7 +1743,7 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ):
                 final_output = output
-            text = clean_output_text(final_output.text)
+            text = clean_output_text(final_output.text, skip_special)
             return GenerationOutput(
                 text=text,
                 tokens=list(final_output.tokens),
@@ -1761,7 +1798,7 @@ class SimpleEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         if self._is_mllm:
-            _reject_ignore_eos_on_mlx_vlm(kwargs)
+            _prepare_mlx_vlm_kwargs(kwargs)
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
             output = await self._run_blocking_serialized(
@@ -1773,7 +1810,7 @@ class SimpleEngine(BaseEngine):
                 tools=template_tools,
                 **kwargs,
             )
-            text = clean_output_text(output.text)
+            text = clean_output_text(output.text, skip_special)
             return GenerationOutput(
                 text=text,
                 prompt_tokens=output.prompt_tokens,
@@ -1793,7 +1830,7 @@ class SimpleEngine(BaseEngine):
                 chat_template_kwargs=chat_template_kwargs,
                 **kwargs,
             )
-            text = clean_output_text(output.text)
+            text = clean_output_text(output.text, skip_special)
             # Preserve upstream prompt accounting while routing the blocking
             # chat call through the cancellation-safe serialized runner.
             tokenizer = self._model.tokenizer
@@ -1985,7 +2022,7 @@ class SimpleEngine(BaseEngine):
 
         # Build prompt using tokenizer
         if self._is_mllm:
-            _reject_ignore_eos_on_mlx_vlm(kwargs)
+            _prepare_mlx_vlm_kwargs(kwargs)
             if self._text_model is not None:
                 route_kind = "Media" if has_media else "Text-only"
                 logger.info("%s request → MLLM path", route_kind)
@@ -2450,10 +2487,10 @@ class SimpleEngine(BaseEngine):
                 prompt_arr = mx.array(prompt_tokens_for_decode)
                 for resp in mlx_stream_generate(
                     model,
-                    (
-                        eos_ignoring_tokenizer(tokenizer)
-                        if kwargs.get("ignore_eos")
-                        else tokenizer
+                    _request_tokenizer(
+                        tokenizer,
+                        bool(kwargs.get("ignore_eos")),
+                        bool(kwargs.get("skip_special_tokens", True)),
                     ),
                     prompt=prompt_arr,
                     max_tokens=max_tokens,
@@ -2596,6 +2633,7 @@ class SimpleEngine(BaseEngine):
         n_tokens = len(tokens)
         cancel_requested = Event()
         ignore_eos = bool(kwargs.get("ignore_eos", False))
+        skip_special = bool(kwargs.get("skip_special_tokens", True))
 
         def _request_cancel() -> None:
             cancel_requested.set()
@@ -2688,7 +2726,11 @@ class SimpleEngine(BaseEngine):
                 if ignore_eos:
                     # EOS does not end the response.
                     eos_id = None
-                first_text = decode_visible(tokenizer, [first_token_id])
+                first_text = (
+                    ""
+                    if first_token_id == eos_id
+                    else decode_visible(tokenizer, [first_token_id], skip_special)
+                )
 
                 results = [
                     SimpleNamespace(
@@ -2706,6 +2748,7 @@ class SimpleEngine(BaseEngine):
                         stop=stop,
                         prompt_cache=cache,
                         ignore_eos=ignore_eos,
+                        skip_special_tokens=skip_special,
                     ):
                         _cancel_check()
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
@@ -2823,10 +2866,9 @@ class SimpleEngine(BaseEngine):
         # ignore_eos: mlx-lm stops when a token is in tokenizer.eos_token_ids,
         # so decode under a view of the tokenizer that reports none.
         ignore_eos = bool(kwargs.pop("ignore_eos", False))
-        generation_tokenizer = (
-            eos_ignoring_tokenizer(self._text_tokenizer)
-            if ignore_eos
-            else self._text_tokenizer
+        skip_special = bool(kwargs.pop("skip_special_tokens", True))
+        generation_tokenizer = _request_tokenizer(
+            self._text_tokenizer, ignore_eos, skip_special
         )
         abort_event = threading.Event()
 
@@ -3363,10 +3405,14 @@ class SimpleEngine(BaseEngine):
 
                 tok_id = y.item()
 
-                # The seed token is text unless it is EOS/BOS/PAD/UNK (never
-                # rendered; an EOS seed is still a stop unless ignore_eos).
-                new_text = decode_visible(self._text_tokenizer, [tok_id])
+                # An EOS seed ends the request and is not text. Any other seed
+                # is, except BOS/PAD/UNK/EOS unless the request keeps them.
                 is_eos = tok_id == eos_id and not ignore_eos
+                new_text = (
+                    ""
+                    if is_eos
+                    else decode_visible(self._text_tokenizer, [tok_id], skip_special)
+                )
                 _emit_response(
                     SimpleNamespace(
                         text=new_text,

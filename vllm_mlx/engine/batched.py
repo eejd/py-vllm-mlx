@@ -875,6 +875,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        skip_special = bool(kwargs.get("skip_special_tokens", True))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -897,10 +899,11 @@ class BatchedEngine(BaseEngine):
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
                 ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+                skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
             )
 
             return GenerationOutput(
-                text=clean_output_text(output.output_text),
+                text=clean_output_text(output.output_text, skip_special),
                 tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -925,6 +928,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
             ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+            skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
         )
 
         output = await self._engine.generate(
@@ -932,7 +936,7 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = clean_output_text(output.output_text)
+        text = clean_output_text(output.output_text, skip_special)
 
         return GenerationOutput(
             text=text,
@@ -977,6 +981,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        skip_special = bool(kwargs.get("skip_special_tokens", True))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
             request_id = await self._mllm_scheduler.add_request_async(
@@ -997,11 +1003,12 @@ class BatchedEngine(BaseEngine):
                 specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
                 ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+                skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
                 yield GenerationOutput(
-                    text=clean_output_text(output.output_text),
+                    text=clean_output_text(output.output_text, skip_special),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -1028,6 +1035,7 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
             ignore_eos=bool(kwargs.pop("ignore_eos", False)),
+            skip_special_tokens=bool(kwargs.pop("skip_special_tokens", True)),
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
@@ -1038,7 +1046,7 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
-            text = clean_output_text(output.output_text)
+            text = clean_output_text(output.output_text, skip_special)
 
             yield GenerationOutput(
                 text=text,

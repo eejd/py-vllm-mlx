@@ -75,6 +75,10 @@ class SamplingParams:
     # tokens are generated and counted like any other, but EOS tokens are
     # never rendered into the output text.
     ignore_eos: bool = False
+    # vLLM ``skip_special_tokens`` (default true): BOS/PAD/UNK/EOS tokens the
+    # model generates are left out of the output text (still generated and
+    # counted). False renders them, as vLLM does.
+    skip_special_tokens: bool = True
     # Extra per-request logits processors (e.g. JSON schema constrained
     # decoding via ``lm-format-enforcer``).  These are merged with any
     # built-in processors (repetition/presence penalty) at batch time.

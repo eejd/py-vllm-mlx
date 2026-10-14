@@ -1026,19 +1026,19 @@ class Scheduler:
         # Fallback to the original
         return tokenizer
 
-    def _decode_tokens(self, token_ids: List[int]) -> str:
-        """
-        Decode token IDs to text, handling both tokenizers and processors.
-        """
-        return self._actual_tokenizer.decode(token_ids)
-
     def _get_detokenizer(self, request_id: str) -> Any:
-        """Get or create a streaming detokenizer for a request."""
+        """Get or create a streaming detokenizer for a request.
+
+        It leaves BOS/PAD/UNK/EOS out of the text, unless the request asked for
+        ``skip_special_tokens=False`` (vLLM's request field).
+        """
         if request_id not in self._detokenizer_pool:
-            detok = streaming_detokenizer(
-                self._actual_tokenizer, self._hidden_token_ids()
+            request = self.requests.get(request_id)
+            skip = request is None or request.sampling_params.skip_special_tokens
+            self._detokenizer_pool[request_id] = streaming_detokenizer(
+                self._actual_tokenizer,
+                self._hidden_token_ids() if skip else frozenset(),
             )
-            self._detokenizer_pool[request_id] = detok
         return self._detokenizer_pool[request_id]
 
     def _cleanup_detokenizer(self, request_id: str) -> None:
@@ -1074,7 +1074,9 @@ class Scheduler:
     def _hidden_token_ids(self) -> frozenset:
         """Ids that never reach the text (EOS, BOS, PAD, UNK; cached)."""
         if self._hidden_token_id_set is None:
-            self._hidden_token_id_set = boundary_token_ids(self._actual_tokenizer)
+            self._hidden_token_id_set = (
+                boundary_token_ids(self._actual_tokenizer) | self._eos_token_ids()
+            )
         return self._hidden_token_id_set
 
     def _create_batch_generator(
@@ -2434,20 +2436,14 @@ class Scheduler:
                 request.first_token_time = _time.time()
 
             # Decode the new token using streaming detokenizer (UTF-8 safe).
-            # A stop-finishing token is the terminator, not content. Under
-            # ignore_eos the EOS token is generated and counted but never
-            # finishes the request, so it is dropped here instead -- the same
-            # text a natural stop would have produced for it.
+            # A stop-finishing token is the terminator, not content. Other
+            # tokens go through the request's detokenizer, which leaves out
+            # BOS/PAD/UNK/EOS (``boundary_token_ids``) unless the request set
+            # ``skip_special_tokens=False``: under ignore_eos an EOS token is
+            # generated and counted but never finishes the request, and is
+            # dropped there -- the same text a natural stop would have
+            # produced for it.
             if response.finish_reason == "stop":
-                new_text = ""
-            elif (
-                request.sampling_params.ignore_eos
-                and response.token in self._eos_token_ids()
-            ):
-                # Make sure the request has a detokenizer even when every token
-                # so far was EOS: the finish path falls back to decoding the raw
-                # token ids (EOS included) when it finds none.
-                self._get_detokenizer(request_id)
                 new_text = ""
             else:
                 detok = self._get_detokenizer(request_id)
@@ -2478,13 +2474,15 @@ class Scheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                # Finalize streaming detokenizer and get full output
+                # Finalize streaming detokenizer and get full output. No
+                # detokenizer means the request ended on its first token, the
+                # terminator: there is no text.
                 detok = self._detokenizer_pool.get(request_id)
                 if detok is not None:
                     detok.finalize()
                     output.output_text = detok.text
                 else:
-                    output.output_text = self._decode_tokens(request.output_token_ids)
+                    output.output_text = ""
                 request.output_text = output.output_text
                 self._cleanup_detokenizer(request_id)
 

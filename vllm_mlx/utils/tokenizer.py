@@ -84,11 +84,14 @@ def collect_eos_token_ids(tokenizer, model_path=None) -> set:
     return eos_ids
 
 
+_BOUNDARY_IDS_ATTR = "_vllm_mlx_boundary_token_ids"
+
+
 def boundary_token_ids(tokenizer) -> frozenset:
     """Ids of the tokens that delimit a sequence and are never text.
 
     The EOS ids (``collect_eos_token_ids``) plus the tokenizer's BOS, PAD and UNK.
-    vLLM renders none of them: it detokenizes with ``skip_special_tokens=True``. A
+    vLLM renders none of them by default (``skip_special_tokens=True``). A
     base-style model that ends a document with ``<|end_of_text|>`` where the
     checkpoint declares another EOS (Hermes-3 on Llama-3.2: EOS ``<|im_end|>``,
     PAD ``<|end_of_text|>``) goes on generating ``<|begin_of_text|>`` and the next
@@ -96,14 +99,30 @@ def boundary_token_ids(tokenizer) -> frozenset:
 
     The other special tokens (``<|python_tag|>``, ``<|channel|>``, ``[TOOL_CALLS]``,
     ...) are not here: the tool-call and reasoning parsers read them out of the
-    text.
+    text. vLLM hides them too by default but turns that off under a tool parser
+    (``adjust_request``); this server's parsers work on text, so they stay.
+
+    The set is read from the config files once per tokenizer object.
     """
+    cached = getattr(tokenizer, "__dict__", {}).get(_BOUNDARY_IDS_ATTR)
+    if cached is not None:
+        return cached
     hidden = set(collect_eos_token_ids(tokenizer))
     for attr in ("bos_token_id", "pad_token_id", "unk_token_id"):
         token_id = getattr(tokenizer, attr, None)
         if isinstance(token_id, int):
             hidden.add(token_id)
-    return frozenset(hidden)
+    hidden = frozenset(hidden)
+    try:
+        tokenizer.__dict__[_BOUNDARY_IDS_ATTR] = hidden
+    except AttributeError:
+        pass
+    return hidden
+
+
+def _visible_ids(tokenizer, skip_special_tokens: bool) -> frozenset:
+    """The ids a request leaves out of its text (none for ``skip_special_tokens=False``)."""
+    return boundary_token_ids(tokenizer) if skip_special_tokens else frozenset()
 
 
 class _TokenSkippingDetokenizer:
@@ -137,6 +156,58 @@ class _TokenSkippingDetokenizer:
         return getattr(self._inner, name)
 
 
+class _SkippingDetokenizerClass:
+    """``detokenizer_class`` of an mlx-lm 0.31 ``TokenizerWrapper`` that skips ids.
+
+    0.31 builds a fresh detokenizer on every ``tokenizer.detokenizer`` access from
+    ``self._detokenizer_class(self)``; 0.32 keeps one instance and copies it.
+    """
+
+    def __init__(self, inner_class, skip_ids):
+        self.inner_class = inner_class
+        self.skip_ids = skip_ids
+
+    def __call__(self, tokenizer):
+        return _TokenSkippingDetokenizer(self.inner_class(tokenizer), self.skip_ids)
+
+
+def _set_detokenizer_skip(wrapper, skip_ids: frozenset) -> bool:
+    """Make ``wrapper``'s detokenizer skip exactly ``skip_ids`` (none: render all).
+
+    Works on both shapes of mlx-lm's ``TokenizerWrapper`` (a detokenizer instance
+    in ``_detokenizer``, 0.32; a class in ``_detokenizer_class``, 0.31), replacing
+    any skip filter set before. Only the wrapper's own attribute is rebound, so a
+    view that shares its base's state is changed without touching the base.
+    Returns False, leaving the wrapper alone, for a shape it does not know.
+    """
+    state = wrapper.__dict__
+    if "_detokenizer" in state:
+        inner = state["_detokenizer"]
+        while isinstance(inner, _TokenSkippingDetokenizer):
+            inner = inner._inner
+        state["_detokenizer"] = (
+            _TokenSkippingDetokenizer(inner, skip_ids) if skip_ids else inner
+        )
+        return True
+    if "_detokenizer_class" in state:
+        inner = state["_detokenizer_class"]
+        while isinstance(inner, _SkippingDetokenizerClass):
+            inner = inner.inner_class
+        state["_detokenizer_class"] = (
+            _SkippingDetokenizerClass(inner, skip_ids) if skip_ids else inner
+        )
+        return True
+    return False
+
+
+def _as_wrapper(tokenizer):
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    if isinstance(tokenizer, TokenizerWrapper):
+        return tokenizer
+    return TokenizerWrapper(tokenizer)
+
+
 def hide_boundary_tokens(tokenizer):
     """``tokenizer`` as an mlx-lm ``TokenizerWrapper`` that never renders
     ``boundary_token_ids`` (see there).
@@ -144,23 +215,23 @@ def hide_boundary_tokens(tokenizer):
     Every text path that detokenizes through the tokenizer (``mlx_lm.generate``
     and ``stream_generate``, with or without a prompt cache) picks it up. The
     wrapper is modified in place, so call it once on the tokenizer the engine
-    owns; a second call is a no-op.
+    owns; a second call is a no-op. A mlx-lm whose wrapper has neither shape of
+    ``_set_detokenizer_skip`` is left as it is, with a warning: the text then
+    shows the markers, as before, instead of the model failing to load.
     """
-    from mlx_lm.tokenizer_utils import TokenizerWrapper
-
-    if not isinstance(tokenizer, TokenizerWrapper):
-        tokenizer = TokenizerWrapper(tokenizer)
+    tokenizer = _as_wrapper(tokenizer)
     hidden = boundary_token_ids(tokenizer)
-    if hidden and not isinstance(tokenizer._detokenizer, _TokenSkippingDetokenizer):
-        tokenizer._detokenizer = _TokenSkippingDetokenizer(
-            tokenizer._detokenizer, hidden
+    if hidden and not _set_detokenizer_skip(tokenizer, hidden):
+        logger.warning(
+            "mlx-lm TokenizerWrapper has an unknown detokenizer layout; generated "
+            "BOS/PAD/UNK/EOS tokens will be rendered into the text"
         )
     return tokenizer
 
 
 def streaming_detokenizer(tokenizer, hidden_ids=None):
     """A fresh per-request streaming detokenizer for ``tokenizer`` that skips
-    ``hidden_ids`` (default ``boundary_token_ids(tokenizer)``).
+    ``hidden_ids`` (default ``boundary_token_ids(tokenizer)``; empty: renders all).
 
     For the batching schedulers, which feed the tokens of many requests through
     detokenizers they own instead of ``tokenizer.detokenizer``.
@@ -169,41 +240,63 @@ def streaming_detokenizer(tokenizer, hidden_ids=None):
 
     if hidden_ids is None:
         hidden_ids = boundary_token_ids(tokenizer)
-    return _TokenSkippingDetokenizer(NaiveStreamingDetokenizer(tokenizer), hidden_ids)
+    detokenizer = NaiveStreamingDetokenizer(tokenizer)
+    return (
+        _TokenSkippingDetokenizer(detokenizer, hidden_ids)
+        if hidden_ids
+        else detokenizer
+    )
 
 
-def decode_visible(tokenizer, token_ids) -> str:
-    """``tokenizer.decode(token_ids)`` without the ``boundary_token_ids``."""
-    hidden = boundary_token_ids(tokenizer)
+def decode_visible(tokenizer, token_ids, skip_special_tokens: bool = True) -> str:
+    """``tokenizer.decode(token_ids)`` without the ``boundary_token_ids``
+    (unless ``skip_special_tokens`` is False)."""
+    hidden = _visible_ids(tokenizer, skip_special_tokens)
     return tokenizer.decode([t for t in token_ids if t not in hidden])
 
 
-def eos_ignoring_tokenizer(tokenizer):
-    """A view of ``tokenizer`` under which mlx-lm does not stop on EOS.
+def _tokenizer_view(tokenizer, *, eos_token_ids, skip_ids):
+    """A ``TokenizerWrapper`` over ``tokenizer``'s state with its own EOS set and
+    detokenizer skip ids; ``tokenizer`` is not modified.
 
-    Implements ``ignore_eos`` for every code path that drives
-    ``mlx_lm.stream_generate``/``generate``: those stop when a token is in
-    ``tokenizer.eos_token_ids``, so the view reports an empty set, and its
-    detokenizer skips the former EOS ids so they stay out of the text.
-    The wrapped tokenizer is not modified; the result is cheap to build per
-    request (no detokenizer map rebuild).
+    The result is cheap to build per request (no detokenizer map rebuild).
     """
     from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-    if not isinstance(tokenizer, TokenizerWrapper):
-        tokenizer = TokenizerWrapper(tokenizer)
-
-    class _EosIgnoringTokenizer(TokenizerWrapper):
+    class _View(TokenizerWrapper):
         def __init__(self, base):
             # Share base's state instead of re-running TokenizerWrapper.__init__,
             # which rebuilds the detokenizer token map.
             self.__dict__.update(base.__dict__)
-            self._eos_token_ids = set()
-            self._detokenizer = _TokenSkippingDetokenizer(
-                base._detokenizer, frozenset(base.eos_token_ids)
-            )
+            self._eos_token_ids = set(eos_token_ids)
+            _set_detokenizer_skip(self, skip_ids)
 
-    return _EosIgnoringTokenizer(tokenizer)
+    return _View(tokenizer)
+
+
+def eos_ignoring_tokenizer(tokenizer, skip_special_tokens: bool = True):
+    """A view of ``tokenizer`` under which mlx-lm does not stop on EOS.
+
+    Implements ``ignore_eos`` for every code path that drives
+    ``mlx_lm.stream_generate``/``generate``: those stop when a token is in
+    ``tokenizer.eos_token_ids``, so the view reports an empty set. Its
+    detokenizer skips the former EOS ids (and the other boundary tokens) so they
+    stay out of the text, unless the request set ``skip_special_tokens=False``.
+    """
+    base = _as_wrapper(tokenizer)
+    skip = (
+        frozenset(base.eos_token_ids) | boundary_token_ids(base)
+        if skip_special_tokens
+        else frozenset()
+    )
+    return _tokenizer_view(base, eos_token_ids=(), skip_ids=skip)
+
+
+def unfiltered_tokenizer(tokenizer):
+    """A view of ``tokenizer`` that renders every token it is fed
+    (``skip_special_tokens=False``); it still stops on EOS."""
+    base = _as_wrapper(tokenizer)
+    return _tokenizer_view(base, eos_token_ids=base.eos_token_ids, skip_ids=frozenset())
 
 
 def _needs_strict_false(model_name: str) -> bool:
