@@ -2911,16 +2911,18 @@ def _responses_tools_to_chat_tools(
 _REASONING_ITEM_MARK = "_responses_reasoning_item"
 
 
-def _fold_reasoning_items(messages: list[dict], first: int) -> list[dict]:
+def _fold_reasoning_items(messages: list[dict]) -> list[dict]:
     """Attach a reasoning input item to the assistant message that follows it.
 
     vLLM (``responses/utils.py``) puts a ``reasoning`` item on the next assistant
     message's ``reasoning`` field, never into its visible content; that field is
     ``reasoning_content`` here, which is what the chat route's replay reads.
-    A reasoning item with no assistant message after it stays an assistant
-    message of its own, as before.  History before ``first`` is left alone.
+    A reasoning item with no assistant message right after it (another reasoning
+    item, a user or tool message, the end of the input) stays an assistant
+    message of its own, as before.  Only items of the current request carry the
+    mark, so replayed ``previous_response_id`` history passes through untouched.
     """
-    out = messages[:first]
+    out: list[dict] = []
     pending: dict | None = None
 
     def release() -> None:
@@ -2930,16 +2932,12 @@ def _fold_reasoning_items(messages: list[dict], first: int) -> list[dict]:
             out.append(pending)
             pending = None
 
-    for msg in messages[first:]:
+    for msg in messages:
         if msg.get(_REASONING_ITEM_MARK):
             release()
             pending = msg
             continue
-        if (
-            pending is not None
-            and msg.get("role") == "assistant"
-            and not msg.get("reasoning_content")
-        ):
+        if pending is not None and msg.get("role") == "assistant":
             msg = {**msg, "reasoning_content": pending["content"]}
             pending = None
         else:
@@ -2969,7 +2967,6 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
         messages.append({"role": "user", "content": request.input})
         return messages
 
-    first_new = len(messages)
     for item in request.input:
         if isinstance(item, dict):
             # ``type`` is optional on a message item (EasyInputMessage): a dict
@@ -3084,7 +3081,7 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                 getattr(item, "type", type(item).__name__),
             )
 
-    return _fold_reasoning_items(messages, first_new)
+    return _fold_reasoning_items(messages)
 
 
 def _responses_request_to_new_persisted_messages(
@@ -6834,6 +6831,14 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
         ):
             # Merge string content with double newline separator
             prev["content"] = prev["content"] + "\n\n" + msg["content"]
+            # Replayed reasoning of the merged messages is kept, in order.
+            reasoning = [
+                r
+                for r in (prev.get("reasoning_content"), msg.get("reasoning_content"))
+                if isinstance(r, str) and r
+            ]
+            if reasoning:
+                prev["reasoning_content"] = "\n\n".join(reasoning)
             logger.debug(
                 f"Merged consecutive {role} messages "
                 f"({len(prev['content'])} chars total)"

@@ -1702,3 +1702,209 @@ class TestResponsesPreparedMessages:
         got = self._post(client, engine, _user_input(_image(detail=detail)))
 
         assert got[0]["content"][0]["image_url"]["detail"] == detail
+
+
+def _reasoning(text):
+    return {"type": "reasoning", "content": [{"type": "reasoning_text", "text": text}]}
+
+
+def _msg(role, content):
+    return {"type": "message", "role": role, "content": content}
+
+
+class TestResponsesReasoningReplay:
+    """A replayed ``reasoning`` item belongs to the assistant message after it."""
+
+    def _messages(self, client, engine, input_items, **extra):
+        import vllm_mlx.server as srv
+
+        srv._engine = engine
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": input_items, **extra},
+        )
+        assert resp.status_code == 200, resp.text
+        return engine.chat.call_args.kwargs["messages"]
+
+    def test_reasoning_before_a_user_message_stays_its_own_message(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._messages(
+            client,
+            engine,
+            [_msg("user", "Hi"), _reasoning("pondering"), _msg("user", "Next")],
+        )
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert got[1] == {"role": "assistant", "content": "pondering"}
+        assert all("reasoning_content" not in m for m in got)
+
+    def test_reasoning_at_the_end_of_the_input_stays_its_own_message(self, client):
+        got = self._messages(
+            client,
+            _mock_engine(_output("a")),
+            [_msg("user", "Hi"), _reasoning("pondering")],
+        )
+
+        assert got[-1] == {"role": "assistant", "content": "pondering"}
+
+    def test_only_the_last_of_two_reasoning_items_rides_on_the_message(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._messages(
+            client,
+            engine,
+            [
+                _msg("user", "Hi"),
+                _reasoning("first"),
+                _reasoning("second"),
+                _msg("assistant", "Hello"),
+            ],
+        )
+
+        (assistant,) = [m for m in got if m["role"] == "assistant"]
+        assert assistant["reasoning_content"] == "second"
+        assert "first" in assistant["content"]
+        assert assistant["content"].endswith("Hello")
+
+    def test_history_with_a_reasoning_bearing_assistant_message_is_replayed(
+        self, client
+    ):
+        engine = _mock_engine(_output("one"), _output("two"))
+        engine.is_mllm = True
+        first = self._messages(
+            client,
+            engine,
+            [
+                _msg("user", "Hi"),
+                _reasoning("pondering"),
+                _msg("assistant", "Hello"),
+                _msg("user", "Again"),
+            ],
+        )
+        import vllm_mlx.server as srv
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "And again",
+                "previous_response_id": next(iter(srv._responses_store)),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        second = engine.chat.call_args_list[1].kwargs["messages"]
+
+        assert second[:3] == first[:3]
+        assert second[1]["reasoning_content"] == "pondering"
+        assert "_responses_reasoning_item" not in str(second)
+        assert [m["role"] for m in second] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+        ]
+
+    def test_stored_unattached_reasoning_is_not_replayed_as_a_reasoning_item(
+        self, client
+    ):
+        # The first request ends with a reasoning item that has no assistant
+        # message after it, so it is stored as a plain assistant message; the
+        # next turn must read it as that, not attach it to the answer.
+        engine = _mock_engine(_output("Done"), _output("Again"))
+        engine.is_mllm = True
+        self._messages(client, engine, [_msg("user", "Hi"), _reasoning("pondering")])
+        import vllm_mlx.server as srv
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [_msg("user", "Next")],
+                "previous_response_id": next(iter(srv._responses_store)),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        got = engine.chat.call_args_list[1].kwargs["messages"]
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert got[1]["content"] == "pondering\n\nDone"
+        assert "reasoning_content" not in got[1]
+
+    def test_reasoning_of_merged_assistant_messages_is_kept_in_order(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._messages(
+            client,
+            engine,
+            [
+                _msg("user", "Hi"),
+                _reasoning("first thought"),
+                _msg("assistant", "One"),
+                _reasoning("second thought"),
+                _msg("assistant", "Two"),
+                _msg("user", "Go"),
+            ],
+        )
+
+        assistant = [m for m in got if m["role"] == "assistant"]
+        assert len(assistant) == 1
+        assert assistant[0]["content"] == "One\n\nTwo"
+        assert assistant[0]["reasoning_content"] == "first thought\n\nsecond thought"
+
+
+class TestPrepareChatMessagesFlattening:
+    """``flatten_tool_turns`` on messages that arrive as plain dicts."""
+
+    def _prepare(self, messages, **engine_attrs):
+        import vllm_mlx.server as srv
+
+        engine = SimpleNamespace(
+            is_mllm=True,
+            preserve_native_tool_format=False,
+            use_harmony_rendering=False,
+            **engine_attrs,
+        )
+        return srv._prepare_chat_messages(
+            engine, messages, validate_remote_media=False, flatten_tool_turns=True
+        )[0]
+
+    def test_dict_tool_result_and_tool_call_messages_are_flattened(self):
+        got = self._prepare(
+            [
+                {"role": "user", "content": "Run it"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ]
+        )
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert "[Calling tool: shell(" in got[1]["content"]
+
+    def test_dict_message_without_tool_calls_is_not_touched(self):
+        got = self._prepare(
+            [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": "Hello",
+                    "tool_calls": None,
+                    "reasoning_content": "thought",
+                },
+                {"role": "assistant", "content": "Again", "tool_calls": []},
+            ]
+        )
+
+        assert [m["content"] for m in got] == ["Hi", "Hello\n\nAgain"]
+        assert got[1]["reasoning_content"] == "thought"
