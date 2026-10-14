@@ -27,7 +27,9 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
 from .base import (
     BaseEngine,
+    GenerationError,
     GenerationOutput,
+    RequestPreprocessingError,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
 )
@@ -35,6 +37,7 @@ from .chat_template_safety import (
     chat_template_rejections,
     normalize_messages_for_chat_template,
 )
+from ..request import ERROR_KIND_PREPROCESSING
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,22 @@ def _resolve_metal_buffer_cache_limit(
             )
 
     return int(max_recommended * gpu_memory_utilization), "device-scaled"
+
+
+def _raise_if_request_failed(output: Any) -> None:
+    """Turn a scheduler's ``finish_reason="error"`` into an :class:`EngineRequestError`.
+
+    The scheduler finishes the requests that were running when a step failed
+    (Metal out-of-memory, command-buffer error) with that reason and no text.
+    Passed on as output it reads as a normal, empty completion.  A request whose
+    inputs the multimodal scheduler could not preprocess says so in
+    ``error_kind`` and is the client's error (400), not a generation failure.
+    """
+    if getattr(output, "finish_reason", None) != "error":
+        return
+    if getattr(output, "error_kind", None) == ERROR_KIND_PREPROCESSING:
+        raise RequestPreprocessingError()
+    raise GenerationError()
 
 
 def _normalize_tool_call_arguments_for_template(messages: list[dict]) -> list[dict]:
@@ -921,6 +940,8 @@ class BatchedEngine(BaseEngine):
                 ignore_eos=bool(kwargs.pop("ignore_eos", False)),
             )
 
+            _raise_if_request_failed(output)
+
             return GenerationOutput(
                 text=clean_output_text(output.output_text),
                 tokens=output.output_token_ids,
@@ -953,6 +974,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
         )
+        _raise_if_request_failed(output)
 
         text = clean_output_text(output.output_text)
 
@@ -1022,6 +1044,7 @@ class BatchedEngine(BaseEngine):
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
+                _raise_if_request_failed(output)
                 yield GenerationOutput(
                     text=clean_output_text(output.output_text),
                     new_text=output.new_text,
@@ -1060,6 +1083,7 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
+            _raise_if_request_failed(output)
             text = clean_output_text(output.output_text)
 
             yield GenerationOutput(

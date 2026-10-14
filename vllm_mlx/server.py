@@ -55,12 +55,12 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing, suppress
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.routing import Match
@@ -121,9 +121,12 @@ from .api.models import (
 from .api.prompt_canonicalize import canonicalize_system_messages
 from .api.responses_models import (
     ResponseCompletedEvent,
+    ResponseError,
+    ResponseErrorEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
+    ResponseFailedEvent,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallItem,
     ResponseFunctionCallOutputItem,
@@ -185,7 +188,12 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import EngineBusy, suspend_cancellation
+from .engine.base import (
+    EngineBusy,
+    EngineRequestError,
+    GenerationError,
+    suspend_cancellation,
+)
 from .request import UnsupportedRequestOption
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
@@ -2145,6 +2153,55 @@ app = FastAPI(
 security = HTTPBearer(auto_error=False)
 
 
+_INTERNAL_ERROR = "Internal server error"
+
+
+def _as_engine_error(exc: Exception) -> EngineRequestError:
+    """The error to report for *exc*: itself when the engine classified it, else a 500."""
+    if isinstance(exc, EngineRequestError):
+        return exc
+    return GenerationError(_INTERNAL_ERROR)
+
+
+def _openai_error_body(exc: EngineRequestError) -> dict:
+    """OpenAI/vLLM error body (``ErrorResponse``) for *exc*."""
+    return {
+        "error": {
+            "message": str(exc),
+            "type": exc.openai_type,
+            "param": None,
+            "code": exc.status_code,
+        }
+    }
+
+
+def _anthropic_error_body(exc: EngineRequestError) -> dict:
+    """Anthropic error envelope for *exc*."""
+    return {"type": "error", "error": {"type": exc.anthropic_type, "message": str(exc)}}
+
+
+@app.exception_handler(EngineRequestError)
+async def _engine_request_error_handler(request: Request, exc: EngineRequestError):
+    """Answer a request the engine failed with its HTTP error and a JSON error body.
+
+    A generation failure (``finish_reason == "error"``) is HTTP 500, not a 200
+    with an empty completion: the same mapping vLLM applies.  Inputs the engine
+    could not preprocess are HTTP 400, as in vLLM.  ``/v1/messages`` gets
+    Anthropic's error envelope, every other route OpenAI's.
+    """
+    logger.error(
+        "Request failed in the engine (%s): %s %s",
+        type(exc).__name__,
+        request.method,
+        request.url.path,
+    )
+    if request.url.path.rstrip("/") == "/v1/messages":
+        content = _anthropic_error_body(exc)
+    else:
+        content = _openai_error_body(exc)
+    return JSONResponse(status_code=exc.status_code, content=content)
+
+
 def _metrics_result_from_status(status_code: int) -> str:
     """Map HTTP-ish status codes to low-cardinality inference results."""
     if status_code == 499:
@@ -2154,6 +2211,13 @@ def _metrics_result_from_status(status_code: int) -> str:
     if status_code >= 500:
         return "error"
     return "success"
+
+
+def _engine_error_result(exc: Exception) -> str:
+    """Inference result label for a failed request: the client's fault, or ours."""
+    if isinstance(exc, EngineRequestError) and exc.status_code < 500:
+        return "client_error"
+    return "error"
 
 
 def _metrics_path_for_request(request: Request) -> str:
@@ -3253,10 +3317,70 @@ async def _run_responses_request(
     return response_object, persisted_messages
 
 
+async def _capture_stream_failure(
+    stream: AsyncIterator, failures: list[Exception]
+) -> AsyncIterator:
+    """Pass *stream* through; a failure ends it quietly and is left in *failures*.
+
+    For a stream whose caller reports failures as events of its own protocol
+    rather than by letting the exception end the response.  Cancellation and
+    generator exit are not failures and propagate.
+    """
+    try:
+        async with aclosing(stream) as items:
+            async for item in items:
+                yield item
+    except Exception as exc:
+        logger.error("Streaming error, reporting it in-band: %s", exc)
+        failures.append(exc)
+
+
+def _responses_failure_events(
+    request: ResponsesRequest,
+    response_id: str,
+    exc: Exception,
+    sequence: int,
+) -> list[str]:
+    """The events that end a Responses stream the engine failed.
+
+    An ``error`` event (``code``/``message``/``param``) followed by
+    ``response.failed`` carrying the response with ``status: "failed"`` and its
+    ``error`` object, as the OpenAI Responses API sends.  vLLM 0.31 intends the
+    same (it catches ``GenerationError`` around its stream) but hands its
+    ``ErrorResponse`` JSON to a validator of Responses events, which rejects it.
+    The message is generic; the cause is in the server log.
+    """
+    err = _as_engine_error(exc)
+    failed = _build_response_object(
+        request=request,
+        output_items=[],
+        prompt_tokens=0,
+        completion_tokens=0,
+        finish_reason=None,
+        response_id=response_id,
+    )
+    failed.status = "failed"
+    failed.usage = None
+    failed.error = ResponseError(code=err.responses_code, message=str(err))
+    return [
+        _responses_sse_event(
+            "error",
+            ResponseErrorEvent(
+                sequence_number=sequence, code=err.responses_code, message=str(err)
+            ),
+        ),
+        _responses_sse_event(
+            "response.failed",
+            ResponseFailedEvent(sequence_number=sequence + 1, response=failed),
+        ),
+    ]
+
+
 async def _stream_responses_request(
     request: ResponsesRequest,
     engine: BaseEngine | None = None,
     prepared: tuple[BaseEngine, ChatCompletionRequest, list[dict], dict] | None = None,
+    metrics_tracker=None,
 ) -> AsyncIterator[str]:
     """Execute a Responses API request and stream SSE events incrementally.
 
@@ -3425,7 +3549,10 @@ async def _stream_responses_request(
                 )
         return content
 
-    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+    failures: list[Exception] = []
+    async for output in _capture_stream_failure(
+        engine.stream_chat(messages=messages, **chat_kwargs), failures
+    ):
         last_output = output
         finish_reason = output.finish_reason
         if hasattr(output, "prompt_tokens") and output.prompt_tokens:
@@ -3593,6 +3720,18 @@ async def _stream_responses_request(
         )
         sequence += 1
 
+    if failures:
+        # The 200 header is long gone: the failure can only be an in-band
+        # event.  Nothing after the loop runs, so no completed response is
+        # stored and no ``response.completed`` follows.
+        if metrics_tracker is not None:
+            metrics_tracker.finish(result=_engine_error_result(failures[0]))
+        for event in _responses_failure_events(
+            request, response_id, failures[0], sequence
+        ):
+            yield event
+        return
+
     # The final calls come from the content part only, as in the non-streaming
     # path: the tool parser never sees the reasoning.
     _, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
@@ -3757,6 +3896,12 @@ async def _stream_responses_request(
         while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
             _responses_store.popitem(last=False)
 
+    if metrics_tracker is not None:
+        metrics_tracker.finish(
+            result="success",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
     yield _responses_sse_event(
         "response.completed",
         ResponseCompletedEvent(sequence_number=sequence, response=response_object),
@@ -5727,9 +5872,26 @@ async def list_voices(model: str = "kokoro"):
 # =============================================================================
 
 
+def _openai_stream_error_frame(exc: Exception) -> str:
+    """OpenAI-style in-band error for a stream that already sent its 200 header.
+
+    Same shape vLLM sends.  The message is generic on purpose: the cause is in
+    the server log, not for the client.
+    """
+    return f"data: {json.dumps(_openai_error_body(_as_engine_error(exc)))}\n\n"
+
+
+def _anthropic_stream_error_frame(exc: Exception) -> str:
+    """Anthropic-style ``error`` event, for ``/v1/messages`` streams."""
+    payload = _anthropic_error_body(_as_engine_error(exc))
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
 async def _ensure_sse_terminal(
     generator: AsyncIterator[str],
     terminal_frame: str,
+    *,
+    error_frame: Callable[[Exception], str] | None = None,
 ) -> AsyncIterator[str]:
     """Guarantee that *terminal_frame* is emitted exactly once at the end of
     *generator*, even if the generator raises mid-stream.
@@ -5737,16 +5899,25 @@ async def _ensure_sse_terminal(
     If the inner generator already yields the terminal frame on its happy path,
     the wrapper detects it and avoids double-emission.  If the generator raises
     before reaching the terminal, the wrapper emits it in the ``finally`` block.
+
+    The response is already a 200 by then, so a failure can only be reported
+    in-band.  With *error_frame* the wrapper sends that frame (built from the
+    exception) ahead of the terminal one; without it the stream just ends, which
+    a client cannot tell from a completion.
     """
     emitted = False
+    failure: Exception | None = None
     try:
         async for chunk in generator:
             if chunk == terminal_frame:
                 emitted = True
             yield chunk
     except Exception as e:
+        failure = e
         logger.error(f"Streaming error, ensuring terminal frame: {e}")
     finally:
+        if failure is not None and error_frame is not None:
+            yield error_frame(failure)
         if not emitted:
             yield terminal_frame
 
@@ -5793,7 +5964,11 @@ async def _build_chat_streaming_response(
 
     response = StreamingResponse(
         _disconnect_guard(
-            _ensure_sse_terminal(stream_generator, "data: [DONE]\n\n"),
+            _ensure_sse_terminal(
+                stream_generator,
+                "data: [DONE]\n\n",
+                error_frame=_openai_stream_error_frame,
+            ),
             raw_request,
             cleanup=_make_release_cleanup(raw_request),
             timeout=total_timeout,
@@ -6338,6 +6513,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                             metrics_tracker=tracker,
                         ),
                         "data: [DONE]\n\n",
+                        error_frame=_openai_stream_error_frame,
                     ),
                     raw_request,
                     cleanup=_make_release_cleanup(raw_request),
@@ -6401,6 +6577,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except UnsupportedRequestOption as exc:
                 tracker.finish(result="client_error")
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except EngineRequestError as exc:
+                tracker.finish(result=_engine_error_result(exc))
+                raise
             if output is None:
                 tracker.finish(
                     result="client_closed",
@@ -6606,6 +6785,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except UnsupportedRequestOption as exc:
             tracker.finish(result="client_error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except EngineRequestError as exc:
+            tracker.finish(result=_engine_error_result(exc))
+            raise
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
@@ -6758,6 +6940,22 @@ def _get_engine_tokenizer(engine) -> object | None:
     return None
 
 
+async def _track_responses_stream(
+    stream: AsyncIterator[str], tracker
+) -> AsyncIterator[str]:
+    """Pass a Responses stream through; a stream that ended without recording its
+    outcome (the client left, or something unforeseen raised) is accounted for here."""
+    try:
+        async for chunk in stream:
+            yield chunk
+    except (asyncio.CancelledError, GeneratorExit):
+        tracker.finish(result="cancelled")
+        raise
+    except Exception as exc:
+        tracker.finish(result=_engine_error_result(exc))
+        raise
+
+
 @app.post(
     "/v1/responses",
     dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
@@ -6788,6 +6986,7 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             return Response(status_code=499)
         release_on_exit = True
 
+    tracker = _metrics.track_inference("responses", stream=request.stream)
     try:
         if request.stream:
             chat_request = _responses_request_to_chat_request(request)
@@ -6803,8 +7002,14 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             await prepared[0].validate_chat_template(prepared[2], **prepared[3])
             response = StreamingResponse(
                 _disconnect_guard(
-                    _stream_responses_request(
-                        request, engine=engine, prepared=prepared
+                    _track_responses_stream(
+                        _stream_responses_request(
+                            request,
+                            engine=engine,
+                            prepared=prepared,
+                            metrics_tracker=tracker,
+                        ),
+                        tracker,
                     ),
                     raw_request,
                     cleanup=(
@@ -6822,16 +7027,30 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             request, raw_request, engine=engine
         )
     except UnsafeRemoteURLError as exc:
+        tracker.finish(result="client_error")
         _raise_remote_media_http_error(exc)
     except (UnsupportedRequestOption, EngineBusy) as exc:
-        _raise_preflight_error(exc)
+        _raise_preflight_error(exc, tracker)
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
+    except Exception as exc:
+        tracker.finish(result=_engine_error_result(exc))
+        raise
     finally:
         if release_on_exit:
             await _release_engine_for_request(raw_request)
 
     if response_object is None:
+        tracker.finish(result="client_closed")
         return Response(status_code=499)
 
+    usage = response_object.usage
+    tracker.finish(
+        result="success",
+        prompt_tokens=usage.input_tokens if usage else 0,
+        completion_tokens=usage.output_tokens if usage else 0,
+    )
     return response_object
 
 
@@ -7076,6 +7295,7 @@ async def create_anthropic_message(
                             metrics_tracker=tracker,
                         ),
                         anthropic_terminal,
+                        error_frame=_anthropic_stream_error_frame,
                     ),
                     request,
                     cleanup=_make_release_cleanup(request),
@@ -7104,6 +7324,9 @@ async def create_anthropic_message(
         except UnsupportedRequestOption as exc:
             tracker.finish(result="client_error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except EngineRequestError as exc:
+            tracker.finish(result=_engine_error_result(exc))
+            raise
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
@@ -7725,8 +7948,8 @@ async def _stream_anthropic_messages(
     except (asyncio.CancelledError, GeneratorExit):
         result_label = "cancelled"
         raise
-    except Exception:
-        result_label = "error"
+    except Exception as exc:
+        result_label = _engine_error_result(exc)
         raise
     finally:
         if metrics_tracker is not None:
@@ -7812,17 +8035,17 @@ async def stream_completion(
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
             yield f"data: {json.dumps(data)}\n\n"
+        yield "data: [DONE]\n\n"
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
         raise
     except (asyncio.CancelledError, GeneratorExit):
         result = "cancelled"
         raise
-    except Exception:
-        result = "error"
+    except Exception as exc:
+        result = _engine_error_result(exc)
         raise
     finally:
-        yield "data: [DONE]\n\n"
         if metrics_tracker is not None:
             metrics_tracker.finish(
                 result=result,
@@ -8492,8 +8715,8 @@ async def stream_chat_completion(
     except (asyncio.CancelledError, GeneratorExit):
         result_label = "cancelled"
         raise
-    except Exception:
-        result_label = "error"
+    except Exception as exc:
+        result_label = _engine_error_result(exc)
         raise
     finally:
         if metrics_tracker is not None:
