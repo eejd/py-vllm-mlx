@@ -77,6 +77,24 @@ CALLS = {
     "xlam": "[" + _J + "]",
 }
 
+# Parsers that exist only once another change has merged (a name that is not registered
+# is skipped, so the test is green with and without it). Format: the call text.
+OPTIONAL_CALLS = {
+    # a bare Python list of keyword-only calls and nothing else (PythonicToolParser)
+    "pythonic": "[echo_args(text='hello world')]",
+}
+
+
+def _registered(name: str) -> bool:
+    try:
+        ToolParserManager.get_tool_parser(name)
+    except KeyError:
+        return False
+    return True
+
+
+CALLS = {**CALLS, **{n: c for n, c in OPTIONAL_CALLS.items() if _registered(n)}}
+
 
 _DEEPSEEK_INNER = (
     "<｜tool▁call▁begin｜>function<｜tool▁sep｜>echo_args\n"
@@ -93,6 +111,8 @@ _KIMI_INNER = (
 )
 # parsers whose format puts every call of a turn inside one wrapper
 TWO_CALLS = {
+    # one list holds every call of the turn
+    "pythonic": "[echo_args(text='hello world'), echo_args(text='hello world')]",
     "deepseek": "<｜tool▁calls▁begin｜>" + _DEEPSEEK_INNER * 2 + "<｜tool▁calls▁end｜>",
     "deepseek_v4": "<｜DSML｜tool_calls>\n"
     + _DSML_INVOKE * 2
@@ -149,6 +169,14 @@ def _all_scenarios(name: str) -> dict[str, str]:
         **_extra_scenarios(name, call),
     }
 
+
+# Scenarios whose answer is different for a format that is only a call when the response
+# *starts* with it (a Python list): text before the call makes the whole response text.
+# (Documented in PythonicToolParser: vLLM reads it the same way.)
+EXPECTED_OVERRIDES = {
+    ("pythonic", "text-then-call"): 0,
+    ("pythonic", "two-calls"): 2,
+}
 
 # What every parser must return for the whole text, whatever the stream does.
 EXPECTED_CALLS = {
@@ -372,16 +400,43 @@ PAIRS = [
 ]
 
 
-def test_every_registered_parser_class_is_covered():
+# Registered parser classes this test does not drive, each with the reason: a class in the
+# tree that is neither in CALLS nor listed here fails the test, so a new parser cannot slip
+# in unexamined (and an entry for a parser that is not registered is simply unused).
+EXEMPT = {
+    # needs its own control tokens and a reasoning parser to be interesting:
+    # tests/test_harmony_chunking.py, tests/test_harmony_openai_encoding.py
+    "HarmonyToolParser",
+}
+
+
+def _unexamined_parser_classes() -> set[str]:
     classes = {
         ToolParserManager.get_tool_parser(name)
         for name in ToolParserManager.list_registered()
     }
     covered = {ToolParserManager.get_tool_parser(name) for name in CALLS}
-    # harmony is covered by tests/test_harmony_chunking.py (it needs its own control
-    # tokens and a reasoning parser to be interesting)
-    uncovered = {c.__name__ for c in classes - covered}
-    assert uncovered == {"HarmonyToolParser"}
+    return {c.__name__ for c in classes - covered} - EXEMPT
+
+
+def test_every_registered_parser_class_is_covered():
+    assert _unexamined_parser_classes() == set()
+
+
+def test_a_parser_class_that_is_not_in_the_table_is_reported(monkeypatch):
+    from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+    class NewToolParser(ToolParser):
+        def extract_tool_calls(self, model_output, request=None):
+            raise NotImplementedError
+
+    monkeypatch.setattr(
+        ToolParserManager,
+        "tool_parsers",
+        {**ToolParserManager.tool_parsers, "brand-new": NewToolParser},
+    )
+
+    assert _unexamined_parser_classes() == {"NewToolParser"}
 
 
 def _xfail_if_known(request, registry, parser_name, scenario, site=None, chunking=None):
@@ -422,7 +477,9 @@ async def test_whole_text_answer_is_right(request, monkeypatch, parser_name, sce
 
     whole = await _run("chat", monkeypatch, raw, "whole", stream=False)
 
-    assert len(whole.calls) == EXPECTED_CALLS[scenario]
+    assert len(whole.calls) == EXPECTED_OVERRIDES.get(
+        (parser_name, scenario), EXPECTED_CALLS[scenario]
+    )
     if scenario == "plain":
         assert whole.content.strip() == raw
     if scenario == "cut-off":
