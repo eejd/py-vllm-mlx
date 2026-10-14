@@ -129,6 +129,34 @@ mistral-common itself accepts both (it emits the extra system prompt in place, o
 consecutive same-role messages with a blank line). Merge such messages in the client; the
 server does not rewrite them.
 
+**System prompt (tekken checkpoints).** A request without a `system` message is prompted
+without one, exactly as mistral-common (and vLLM's `mistral` tokenizer mode, and mlx-lm)
+builds it. Some templates would insert a default system prompt of their own: Ministral 3
+Instruct's is Mistral's `SYSTEM_PROMPT.txt` with the model name filled in and the literal
+text `The current date is {today}.` (and `{yesterday}`) in about 500 tokens, and the
+official Devstral Small 2 template carries a Mistral Vibe prompt. The server empties that
+default at load, so such a request renders as `<s>[INST]...[/INST]`. The log line names
+the checkpoint, the size and the start of what was dropped (`dropped the chat template's
+default system prompt (... characters, starting '...')`) and says how to get it back. A
+request's own `system` message is rendered as before.
+
+> **Ministral 3 Reasoning loses its thinking-format prompt.** The Reasoning templates'
+> default is the prompt that tells the model how to think and answer
+> (`# HOW YOU SHOULD THINK AND ANSWER ...`). It is dropped like the others, as vLLM's
+> `mistral` mode and mistral-common build none, so a Reasoning checkpoint served without
+> a `system` message no longer gets it. Send the model card's `SYSTEM_PROMPT.txt` as the
+> `system` message (fill `{name}`, `{today}`, `{yesterday}` as the card's
+> `load_system_prompt` does), as for vLLM. There is no flag to keep the template's
+> default; `--chat-template` with the checkpoint's own `chat_template.jinja` restores it.
+
+Only a default the template renders under `{% if default_system_message != '' %}` is
+dropped. Templates that render it unconditionally, such as Mistral Small 3.x's
+(`"..." + today + "..."`, with the real date from `strftime_now`), keep it: emptying it
+there would emit an empty `[SYSTEM_PROMPT][/SYSTEM_PROMPT]` block, which mistral-common
+does not build either. Ministral-3-3B at temperature 0 padded optional tool arguments
+(`count: 0, flag: false`) under the template's default prompt and did not under
+mistral-common's.
+
 **Text after a call.** A `[TOOL_CALLS]name[ARGS]{...}` call has no terminator of its own,
 so a model may write prose after the closing brace. The call's arguments are the first
 complete JSON value; the text after it is dropped, streaming and not (as in vLLM,
