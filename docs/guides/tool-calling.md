@@ -157,6 +157,14 @@ does not build either. Ministral-3-3B at temperature 0 padded optional tool argu
 (`count: 0, flag: false`) under the template's default prompt and did not under
 mistral-common's.
 
+**Text after a call.** A `[TOOL_CALLS]name[ARGS]{...}` call has no terminator of its own,
+so a model may write prose after the closing brace. The call's arguments are the first
+complete JSON value; the text after it is dropped, streaming and not (as in vLLM,
+vllm-project/vllm#48975). The prose is not returned as content. A call with no name, or
+after `[ARGS]` a name that is not `[A-Za-z0-9_.-]+`, is not returned either. Arguments
+that are not JSON are rejected in a complete response (the call is not returned) but a
+stream has already sent them by the time it can tell, so it carries them as generated.
+
 ### Qwen
 
 ```bash
