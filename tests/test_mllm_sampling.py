@@ -30,7 +30,12 @@ def model(monkeypatch):
     cache.make_prompt_cache = lambda *args, **kwargs: []
     models = ModuleType("mlx_vlm.models")
     models.cache = cache
-    for module in (vlm, prompt_utils, models, cache):
+    utils = ModuleType("mlx_vlm.utils")
+    utils.prepare_inputs = lambda *a, **k: {
+        "input_ids": [[1, 2, 3]],
+        "attention_mask": [[1, 1, 1]],
+    }
+    for module in (vlm, prompt_utils, models, cache, utils):
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
     wrapper = MLXMultimodalLM("test-model", enable_cache=False)

@@ -212,6 +212,16 @@ def test_mllm_chat_forwards_configured_assistant_drafter(monkeypatch):
         SimpleNamespace(get_chat_template=lambda *args, **kwargs: "rendered prompt"),
     )
     monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.utils",
+        SimpleNamespace(
+            prepare_inputs=lambda *a, **k: {
+                "input_ids": [[1, 2, 3]],
+                "attention_mask": [[1, 1, 1]],
+            }
+        ),
+    )
 
     tokenizer = SimpleNamespace(encode=lambda text: [1, 2, 3])
     processor = SimpleNamespace(tokenizer=tokenizer)
@@ -286,6 +296,16 @@ def test_mllm_chat_uses_configured_drafter_over_call_kwargs(monkeypatch):
     )
     monkeypatch.setitem(
         sys.modules,
+        "mlx_vlm.utils",
+        SimpleNamespace(
+            prepare_inputs=lambda *a, **k: {
+                "input_ids": [[1, 2, 3]],
+                "attention_mask": [[1, 1, 1]],
+            }
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
         "mlx_vlm.prompt_utils",
         SimpleNamespace(get_chat_template=lambda *args, **kwargs: "rendered prompt"),
     )
@@ -339,6 +359,16 @@ def test_mllm_chat_requires_request_draft_opt_in(monkeypatch):
         sys.modules,
         "mlx_vlm",
         SimpleNamespace(generate=fake_generate),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.utils",
+        SimpleNamespace(
+            prepare_inputs=lambda *a, **k: {
+                "input_ids": [[1, 2, 3]],
+                "attention_mask": [[1, 1, 1]],
+            }
+        ),
     )
     monkeypatch.setitem(
         sys.modules,

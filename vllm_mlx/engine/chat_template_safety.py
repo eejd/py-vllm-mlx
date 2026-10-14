@@ -1,8 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
 """Safety normalization for messages before Jinja chat-template rendering."""
 
+import functools
 import json
-from typing import Any
+import logging
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from typing import Any, TypeVar
+
+import jinja2
+
+from ..request import ChatTemplateRejected
+
+T = TypeVar("T")
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def chat_template_rejections() -> Iterator[None]:
+    """Turn a template's rejection of the request's messages into ``ChatTemplateRejected``.
+
+    Chat templates validate their input by raising from inside the template
+    (``raise_exception(...)`` becomes ``jinja2.TemplateError``) or by failing while
+    rendering the client's messages (``UndefinedError``). Both mean the request is
+    wrong for this model, so the server answers 400 with the template's message, as
+    vLLM does (``safe_apply_chat_template``). A ``TemplateSyntaxError`` means the
+    template itself does not compile, whatever the request says: that stays a server
+    error, as does everything that is not a Jinja error.
+    """
+    try:
+        yield
+    except jinja2.TemplateSyntaxError:
+        raise
+    except jinja2.TemplateError as exc:
+        logger.warning("Chat template rejected the request: %s", exc)
+        raise ChatTemplateRejected(str(exc)) from exc
+
+
+def reject_template_errors(
+    method: Callable[..., Awaitable[T]],
+) -> Callable[..., Awaitable[T]]:
+    """Run an async engine method under ``chat_template_rejections``."""
+
+    @functools.wraps(method)
+    async def wrapper(*args: Any, **kwargs: Any) -> T:
+        with chat_template_rejections():
+            return await method(*args, **kwargs)
+
+    return wrapper
 
 
 def _close_dangling_think_before_tool_call(content: str) -> str:

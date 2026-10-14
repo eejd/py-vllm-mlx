@@ -15,12 +15,24 @@ is prompted with a malformed chat and answers in kind.
 The ``tokenizer.json`` of those checkpoints is the same tokenizer in the Hugging
 Face fast format: control tokens are added tokens, so the rendered string encodes to
 the very ids mistral-common would produce, and ``chat_template.jinja`` renders the
-same prompt. ``equivalent_fast_tokenizer`` loads it and only returns it once it is
-shown identical to the tekken tokenizer it replaces: every id maps to the same bytes
-(read from ``tekken.json`` itself, so ids that are only partial UTF-8 are covered),
-the control tokens carry the same names, BOS/EOS agree, and a battery of plain-text
-probes encodes to the same ids as mistral-common's. A fast tokenizer is also what
-constrained decoding needs.
+same prompt, with one exception (below). ``equivalent_fast_tokenizer`` loads it and
+only returns it once it is shown identical to the tekken tokenizer it replaces: every
+id maps to the same bytes (read from ``tekken.json`` itself, so ids that are only
+partial UTF-8 are covered), the control tokens carry the same names, BOS/EOS agree,
+and a battery of plain-text probes encodes to the same ids as mistral-common's. A
+fast tokenizer is also what constrained decoding needs.
+
+The exception: some of these templates (Ministral 3 Instruct, official Devstral Small
+2) open with ``{% set default_system_message = '...' %}`` and render it as a system
+prompt whenever the request has none. mistral-common renders no system prompt then,
+and neither does ``transformers``' ``MistralCommonBackend``, mlx-lm, or vLLM in its
+``mistral`` tokenizer mode (the recommended one for these checkpoints). Ministral 3's
+default is Mistral's ``SYSTEM_PROMPT.txt`` pasted in with ``{name}`` filled and
+``{today}``/``{yesterday}`` left as literal text, so every prompt carried about 500
+tokens saying "The current date is {today}." (Ministral-3-3B then padded optional tool
+arguments with ``count: 0, flag: false`` that mistral-common's prompt did not provoke).
+``drop_default_system_prompt`` empties that default so the prompt is the one
+mistral-common builds; a request's own ``system`` message is rendered as before.
 """
 
 from __future__ import annotations
@@ -28,20 +40,27 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # What ``transformers`` needs to be told to load the fast tokenizer of a tekken
-# checkpoint: skip the mistral-common auto-detection, and apply the Mistral
+# checkpoint: skip the mistral-common auto-detection, apply the Mistral
 # pre-tokenizer regex fix (a no-op when tokenizer.json already carries the right
 # pattern, which also silences a misleading "incorrect regex" warning on such repos;
 # it rescues a tokenizer.json that still has the old pattern, which the equivalence
-# check would otherwise reject).
+# check would otherwise reject), and prepend the BOS to ``add_special_tokens=True``
+# encodings.  tekken checkpoints' ``tokenizer.json`` has no BOS post-processor, but
+# mistral-common (what vLLM tokenizes raw completion prompts with:
+# ``encode(text, bos=add_special_tokens)``) always prepends it, and a raw prompt
+# without a BOS is out of distribution for the model.  ``add_special_tokens=False``
+# (a chat prompt the template rendered, ``<s>`` included) is unaffected.
 FAST_TOKENIZER_KWARGS: dict[str, Any] = {
     "mistral_format": False,
     "fix_mistral_regex": True,
+    "add_bos_token": True,
 }
 
 _CODE = '''
@@ -88,6 +107,112 @@ def holds_mistral_common_tokenizer(processor: Any) -> bool:
     return is_mistral_common_tokenizer(processor) or is_mistral_common_tokenizer(
         getattr(processor, "tokenizer", None)
     )
+
+
+def mentions_default_system_message(target: Any) -> bool:
+    """Whether the chat template on ``target`` (or its inner tokenizer) has a
+    ``default_system_message``; a cheap test, so callers can skip locating the
+    checkpoint's files for every other model."""
+    inner = getattr(target, "tokenizer", None)
+    return any(
+        isinstance(template, str) and "default_system_message" in template
+        for template in (
+            getattr(holder, "chat_template", None)
+            for holder in (target, inner)
+            if holder is not None
+        )
+    )
+
+
+# ``{%- set default_system_message = '...' %}``: the string literal (either quote, with
+# backslash escapes, possibly spanning lines) is group 2.
+_DEFAULT_SYSTEM_MESSAGE = re.compile(
+    r"(\{%-?\s*set\s+default_system_message\s*=\s*)"
+    r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")"""
+    r"(\s*-?%\})",
+    re.DOTALL,
+)
+# ``{%- if default_system_message != '' %}``, ``{%- if messages[0]['role'] != 'system'
+# and default_system_message != '' %}`` or a bare ``if default_system_message``: the
+# template renders the default only when it is not empty.
+_DEFAULT_GUARD = re.compile(
+    r"""\{%-?\s*(?:el)?if\b(?:[^%]*?\bdefault_system_message\s*!=\s*(?:''|"")"""
+    r"""|\s+default_system_message\s*(?:and\b[^%]*)?-?%\})"""
+)
+
+
+def template_without_default_system_message(template: str) -> tuple[str, str]:
+    """``template`` with its default system message emptied, and the text dropped.
+
+    The text (as written in the template, escapes included) is "" and the template is
+    returned as it is when there is nothing to drop or it is not safe to drop:
+
+    - no ``default_system_message``, or one that is already empty;
+    - a template that renders the default whether or not it is empty (no
+      ``if default_system_message != ''`` around it, as in the Mistral Small 3.x
+      templates, which would then emit an empty ``[SYSTEM_PROMPT][/SYSTEM_PROMPT]``
+      block: a prompt mistral-common does not build either; those defaults carry the
+      real date, from ``strftime_now``, and stay);
+    - a default that is not one string literal this can find (a warning says so).
+    """
+    if "default_system_message" not in template:
+        return template, ""
+    if _DEFAULT_GUARD.search(template) is None:
+        logger.debug(
+            "the chat template renders default_system_message unconditionally: "
+            "emptying it would not give mistral-common's prompt, so it stays"
+        )
+        return template, ""
+    match = _DEFAULT_SYSTEM_MESSAGE.search(template)
+    if match is None:
+        logger.warning(
+            "the chat template mentions default_system_message but not as a string "
+            "literal this server can empty: its default system prompt stays"
+        )
+        return template, ""
+    dropped = match.group(2)[1:-1]
+    if not dropped:
+        return template, ""
+    return template[: match.start(2)] + "''" + template[match.end(2) :], dropped
+
+
+def drop_default_system_prompt(target: Any, model_path: str | Path) -> bool:
+    """Make a tekken checkpoint's prompt the one mistral-common builds.
+
+    mistral-common renders no system prompt for a request that has none, but a
+    ``default_system_message`` in the checkpoint's chat template is rendered as one.
+    This empties it on ``target`` (a tokenizer or a processor) and on the tokenizer
+    inside a processor, when the template renders it only if it is not empty (see
+    ``template_without_default_system_message``). Only ``tekken.json`` checkpoints, the
+    ones mistral-common serves, are touched; a request's own ``system`` message is
+    rendered as before. ``--chat-template`` replaces the template afterwards and so
+    overrides this. Returns whether a default was dropped.
+    """
+    if not (Path(model_path) / "tekken.json").is_file():
+        return False
+    inner = getattr(target, "tokenizer", None)
+    dropped = ""
+    for holder in (target, inner) if inner is not None else (target,):
+        template = getattr(holder, "chat_template", None)
+        if not isinstance(template, str):
+            continue
+        emptied, text = template_without_default_system_message(template)
+        if text:
+            holder.chat_template = emptied
+            dropped = dropped or text
+    if dropped:
+        logger.info(
+            "Mistral tekken checkpoint %s: dropped the chat template's default system "
+            "prompt (%d characters, starting %r). A request without a system message "
+            "is now prompted without one, as mistral-common and vLLM's mistral "
+            "tokenizer mode do. To use that prompt, send it as the system message "
+            "(the model card's SYSTEM_PROMPT.txt) or serve the checkpoint's own "
+            "template with --chat-template",
+            Path(model_path).name,
+            len(dropped),
+            dropped[:60],
+        )
+    return bool(dropped)
 
 
 def _unicode_to_byte() -> dict[str, int]:
@@ -165,10 +290,14 @@ def _mismatch(fast: Any, reference: Any, tekken_path: Path) -> str | None:
     if reason is not None:
         return reason
     for probe in _PROBES:
-        if fast.encode(probe, add_special_tokens=False) != reference.encode(
-            probe, add_special_tokens=False
-        ):
-            return f"encoding of {probe[:40]!r} differs"
+        for add_special_tokens in (False, True):
+            if fast.encode(probe, add_special_tokens=add_special_tokens) != (
+                reference.encode(probe, add_special_tokens=add_special_tokens)
+            ):
+                return (
+                    f"encoding of {probe[:40]!r} differs "
+                    f"(add_special_tokens={add_special_tokens})"
+                )
     return None
 
 

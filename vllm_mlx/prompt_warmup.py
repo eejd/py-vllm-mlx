@@ -221,10 +221,14 @@ async def warm_prefix_cache(
         if prefix_str is None:
             return await _one_chat(idx, messages)
         try:
+            # The prefix is a rendered chat prompt: tokenize it exactly like a
+            # chat request (the template owns the BOS) so it stays a strict
+            # prefix of the real requests' tokens.
             async for output in engine.stream_generate(
                 prompt=prefix_str,
                 max_tokens=max_tokens,
                 temperature=0.0,
+                add_special_tokens=False,
             ):
                 if output.finished:
                     return 1, int(output.prompt_tokens or 0), None

@@ -2328,6 +2328,7 @@ class TestSimpleEngineConcurrency:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
         tokenizer.bos_token = None
+        tokenizer.encode.return_value = [1, 2, 3]
         tokenizer.eos_token_id = 42
 
         engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
@@ -2428,7 +2429,10 @@ class TestSimpleEngineConcurrency:
             ]
 
         assert outputs[-1].text == "Hello"
-        assert captured_prompts == [tokenizer.apply_chat_template.return_value]
+        # mlx-lm is handed the ids counted for usage.prompt_tokens: the chat
+        # template owns the BOS, so the prompt is encoded without special tokens.
+        assert [prompt.tolist() for prompt in captured_prompts] == [list(range(10))]
+        assert tokenizer.encode.call_args.kwargs["add_special_tokens"] is False
         # The manual system-cache path is skipped -- asserted by
         # fail_if_manual_cache_path_runs above. encode() is no longer a proxy
         # for that: the full prompt is now tokenized on every request so
@@ -2504,6 +2508,7 @@ class TestSimpleEngineConcurrency:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
         tokenizer.bos_token = None
+        tokenizer.encode.return_value = [1, 2, 3]
         tokenizer.eos_token_id = 42
 
         engine = SimpleEngine("test-model", force_mllm=True, mtp=True)
@@ -2546,6 +2551,7 @@ class TestSimpleEngineConcurrency:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
         tokenizer.bos_token = None
+        tokenizer.encode.return_value = [1, 2, 3]
         tokenizer.eos_token_id = 42
 
         engine = SimpleEngine("test-model", force_mllm=True, mtp=True)
@@ -2588,6 +2594,7 @@ class TestSimpleEngineConcurrency:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
         tokenizer.bos_token = None
+        tokenizer.encode.return_value = [1, 2, 3]
         tokenizer.eos_token_id = 42
 
         engine = SimpleEngine(
@@ -2899,6 +2906,7 @@ class TestSimpleEngineConcurrency:
             engine._text_tokenizer = MagicMock()
             engine._text_tokenizer.apply_chat_template = MagicMock(return_value="hello")
             engine._text_tokenizer.bos_token = None
+            engine._text_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
             engine._draft_model = None
             engine._run_blocking_serialized = fake_serialized  # type: ignore[method-assign]
 
@@ -2942,7 +2950,7 @@ class TestSimpleEngineConcurrency:
             engine._model.model = MagicMock()
             engine._model.tokenizer = MagicMock()
             engine._model.tokenizer.decode = MagicMock(return_value="A")
-            engine._model.tokenizer.eos_token_id = 0
+            engine._model.tokenizer.eos_token_id = 99
 
             outputs = []
             with (

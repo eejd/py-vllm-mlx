@@ -47,6 +47,8 @@ from .mllm_specprefill import (
     request_eligibility_reason,
     run_media_specprefill,
 )
+from .request import ERROR_KIND_PREPROCESSING
+from .utils.tokenizer import resolve_add_special_tokens
 from .vision_embedding_cache import VisionEmbeddingCache
 
 logger = logging.getLogger(__name__)
@@ -224,6 +226,10 @@ class MLLMBatchRequest:
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
     mllm_draft: bool = False
+    # Request kind for tokenization (vLLM ``add_special_tokens``): False for a
+    # prompt the chat template already rendered, None for a raw completion
+    # prompt (BOS added unless the prompt already starts with it).
+    add_special_tokens: Optional[bool] = None
     # Extra logits processors (e.g. JSON schema constrained decoding).
     # Merged with built-in repetition/presence penalty processors in
     # ``_prefill_batch``.
@@ -293,6 +299,9 @@ class MLLMBatchResponse:
     mtp_attempted: bool = False  # True when the primary step attempted MTP
     mtp_attempted_count: int = 0  # Number of draft tokens attempted
     specprefill_outcome: Optional[SpecPrefillOutcome] = None
+    # With finish_reason "error": ERROR_KIND_PREPROCESSING when the request's
+    # inputs could not be preprocessed, None for a failure while generating.
+    error_kind: Optional[str] = None
 
 
 @dataclass
@@ -929,6 +938,34 @@ class MLLMBatchGenerator:
         """Prompt tokens the prefix cache supplied; None if it was not consulted."""
         return self._reuse_table().pop(request_id, None)
 
+    def _record_prompt_tokens(self, req: Any) -> None:
+        """Remember the processed prompt length of a media request.
+
+        The processor expands each image/audio placeholder into the model's
+        real number of media tokens, so the scheduler's tokenizer estimate
+        under-counts. Text-only prompts are tokenized the same way by both and
+        are left to the estimate.
+        """
+        input_ids = getattr(req, "input_ids", None)
+        if getattr(req, "is_text_only", True) or input_ids is None:
+            return
+        table = self.__dict__.get("_prompt_token_counts")
+        if table is None:
+            table = self._prompt_token_counts = {}
+        table[req.request_id] = int(input_ids.shape[-1])
+        try:
+            while len(table) > 4096:
+                table.pop(next(iter(table)), None)
+        except (RuntimeError, StopIteration):
+            pass
+
+    def pop_prompt_tokens(self, request_id: str) -> Optional[int]:
+        """Processed prompt length of a media request; None for text-only."""
+        table = self.__dict__.get("_prompt_token_counts")
+        if table is None:
+            return None
+        return table.pop(request_id, None)
+
     def abort_prefill(self, request_id: str) -> None:
         """Signal that a request's prefill should be aborted.
 
@@ -940,6 +977,7 @@ class MLLMBatchGenerator:
         the request and may remain reusable after a later disconnect.
         """
         self._reuse_table().pop(request_id, None)
+        self.pop_prompt_tokens(request_id)
         with self._prefix_checkpoint_lock:
             self._aborted_request_ids.add(request_id)
             state = self._request_prefix_checkpoints.pop(request_id, None)
@@ -1099,7 +1137,7 @@ class MLLMBatchGenerator:
         ):
             return
 
-        from mlx_vlm.utils import prepare_inputs
+        from .utils.vlm_inputs import prepare_inputs
 
         tic = time.perf_counter()
 
@@ -1172,6 +1210,11 @@ class MLLMBatchGenerator:
             audio=all_audio if all_audio else None,
             prompts=request.prompt,
             image_token_index=image_token_index,
+            add_special_tokens=resolve_add_special_tokens(
+                getattr(self.processor, "tokenizer", self.processor),
+                request.prompt,
+                request.add_special_tokens,
+            ),
         )
 
         request.input_ids = inputs.get("input_ids")
@@ -1693,36 +1736,59 @@ class MLLMBatchGenerator:
         """
         Run the initial VLM forward pass to encode vision and get first logits.
 
-        This runs the full VLM model (vision + language) on the prompt,
-        which encodes the images and fills the provided KV cache.
+        This follows mlx-vlm's own prefill (``mlx_vlm.generate.ar``):
+        ``model.get_input_embeddings(input_ids, pixel_values, mask=mask,
+        **processor_kwargs)`` fuses the image features into the token
+        embeddings, then the language model runs on those embeddings with the
+        embedding step's extra outputs (``position_ids``, ``rope_deltas``,
+        ``visual_pos_masks``, ``per_layer_inputs`` ...) and the processor's
+        remaining outputs (``image_grid_thw``, ``image_sizes`` ...).
+
+        The model's own ``__call__`` is deliberately not used: its signature
+        and its use of the attention mask differ per family (Gemma-3 builds
+        an all-ones 4D mask there that makes the prompt attend bidirectionally,
+        Mistral-3 requires ``mask`` positionally, Qwen-VL ignores it), whereas
+        ``get_input_embeddings`` takes the processor's mask as ``mask=`` for
+        every family.
 
         Args:
             request: Preprocessed request with input_ids and pixel_values
-            cache: KV cache list for the language model. If provided, the
-                   language model writes its KV state directly into this cache
-                   during the forward pass.
+            cache: KV cache list for the language model. The language model
+                   writes its KV state directly into this cache.
 
         Returns:
             Logits from the forward pass
         """
-        # Build model call kwargs
-        kwargs = dict(request.extra_kwargs)
-
-        if request.pixel_values is not None:
-            kwargs["pixel_values"] = request.pixel_values
-        if request.attention_mask is not None:
-            kwargs["attention_mask"] = request.attention_mask
+        # Processor outputs other than input_ids/pixel_values/attention_mask
+        # reach both the embedding step and the language model, as in mlx-vlm.
+        data_kwargs = dict(request.extra_kwargs)
         if request.image_grid_thw is not None:
-            kwargs["image_grid_thw"] = request.image_grid_thw
+            data_kwargs["image_grid_thw"] = request.image_grid_thw
 
-        # Run full VLM forward pass with cache.
-        # The VLM passes cache= through to self.language_model(),
-        # so the language model writes KV state directly into our cache.
         input_ids = request.input_ids
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
+        mask = request.attention_mask
+        if mask is not None and mask.ndim == 1:
+            mask = mask[None, :]
 
-        output = self.model(input_ids, cache=cache, **kwargs)
+        embedding = self.model.get_input_embeddings(
+            input_ids, request.pixel_values, mask=mask, **data_kwargs
+        )
+        language_kwargs = {
+            **data_kwargs,
+            **{
+                key: value
+                for key, value in embedding.to_dict().items()
+                if key != "inputs_embeds" and value is not None
+            },
+        }
+        output = self.language_model(
+            input_ids,
+            inputs_embeds=embedding.inputs_embeds,
+            cache=cache,
+            **language_kwargs,
+        )
         request.vision_encoded = True
 
         # Release preprocessed vision inputs now that they have been encoded
@@ -1948,22 +2014,27 @@ class MLLMBatchGenerator:
 
         tic = time.perf_counter()
 
-        # Preprocess all requests (per-request error handling)
+        # Preprocess all requests (per-request error handling).  Only a failure
+        # of the inputs themselves is the client's; once they are preprocessed,
+        # a failure (rope derivation) is ours.
         failed_requests = []
         for req in requests:
+            failure_kind = ERROR_KIND_PREPROCESSING
             try:
                 self._preprocess_request(req)
+                failure_kind = None
                 req.rope_deltas = self._derive_request_rope_deltas(req)
+                self._record_prompt_tokens(req)
             except Exception as e:
                 logger.error(
                     f"Failed to preprocess request {req.request_id}: "
                     f"{type(e).__name__}: {e}"
                 )
-                failed_requests.append(req)
+                failed_requests.append((req, failure_kind))
 
         # Remove failed requests from batch and create error responses
         if failed_requests:
-            for req in failed_requests:
+            for req, failure_kind in failed_requests:
                 requests.remove(req)
                 self._pending_error_responses.append(
                     MLLMBatchResponse(
@@ -1972,6 +2043,7 @@ class MLLMBatchGenerator:
                         token=0,
                         logprobs=mx.zeros(1),
                         finish_reason="error",
+                        error_kind=failure_kind,
                         specprefill_outcome=req.specprefill_outcome,
                     )
                 )
@@ -3911,6 +3983,7 @@ def install_chunked_prefill_mllm(
                                         token=0,
                                         logprobs=mx.zeros(1),
                                         finish_reason="error",
+                                        error_kind=ERROR_KIND_PREPROCESSING,
                                     )
                                 )
                                 continue
@@ -4158,9 +4231,13 @@ def install_chunked_prefill_mllm(
                     break
 
             if text_only_req is not None:
+                # Only a failure of the inputs themselves is the client's; once
+                # they are preprocessed, a failure (rope derivation) is ours.
+                failure_kind = ERROR_KIND_PREPROCESSING
                 try:
                     # Preprocess to get input_ids
                     batch_gen._preprocess_request(text_only_req)
+                    failure_kind = None
                     text_only_req.rope_deltas = batch_gen._derive_request_rope_deltas(
                         text_only_req
                     )
@@ -4177,6 +4254,7 @@ def install_chunked_prefill_mllm(
                             token=0,
                             logprobs=mx.zeros(1),
                             finish_reason="error",
+                            error_kind=failure_kind,
                             specprefill_outcome=text_only_req.specprefill_outcome,
                         )
                     )

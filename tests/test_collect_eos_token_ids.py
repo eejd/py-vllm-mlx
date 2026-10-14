@@ -111,3 +111,15 @@ def test_mllm_scheduler_batched_path_pins_gemma4_stop_set(tmp_path):
     # Bare tokenizer as processor (no .tokenizer attribute)
     scheduler = SimpleNamespace(processor=tokenizer)
     assert MLLMScheduler._get_stop_tokens(scheduler) == {1, 106, 50}
+
+
+def test_none_entries_are_skipped():
+    """mlx-lm 0.31 reports ``{None}`` for a tokenizer that has no EOS id."""
+    assert collect_eos_token_ids(FakeTokenizer(eos_token_ids={None})) == set()
+    tok = FakeTokenizer(eos_token_ids={None, 5}, eos_token_id=[None, 7])
+    assert collect_eos_token_ids(tok) == {5, 7}
+
+
+def test_none_entry_in_config_list_is_skipped(tmp_path):
+    _write_config(tmp_path, "config.json", [None, 106])
+    assert collect_eos_token_ids(FakeTokenizer(), tmp_path) == {106}

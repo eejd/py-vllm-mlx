@@ -2597,6 +2597,18 @@ class TestMLLMHybridPrefixCacheIsolation:
         def media_forward(tokens, cache, **kwargs):
             return forward(tokens, cache, 20, [0.0, 0.0, 9.0])
 
+        def language_model(tokens, cache, **kwargs):
+            # Media prefill feeds fused embeddings; text prefill feeds tokens.
+            if "inputs_embeds" in kwargs:
+                return media_forward(tokens, cache, **kwargs)
+            return text_forward(tokens, cache, **kwargs)
+
+        def get_input_embeddings(input_ids, pixel_values, **kwargs):
+            embeds = mx.zeros((1, input_ids.shape[1], 1))
+            return SimpleNamespace(
+                inputs_embeds=embeds, to_dict=lambda: {"inputs_embeds": embeds}
+            )
+
         gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         gen.max_kv_size = 0
         gen._stats = MLLMBatchStats()
@@ -2607,8 +2619,8 @@ class TestMLLMHybridPrefixCacheIsolation:
         gen._request_prefix_checkpoints = {}
         gen.prefill_step_size = 512
         gen._think_suffix_len = 0
-        gen.language_model = text_forward
-        gen.model = media_forward
+        gen.language_model = language_model
+        gen.model = SimpleNamespace(get_input_embeddings=get_input_embeddings)
         gen.sampler = lambda scores: mx.argmax(scores, axis=-1)
         gen.specprefill_enabled = False
         gen.specprefill_keep_pct = 0.5
