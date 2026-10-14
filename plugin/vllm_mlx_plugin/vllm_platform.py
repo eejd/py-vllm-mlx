@@ -18,6 +18,93 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+
+
+def unsupported_sampling_param(params: Any) -> tuple[str, Any, str] | None:
+    """The first sampling parameter the MLX runner cannot honour, if any.
+
+    Returns ``(name, value, reason)``.  Pooling requests have no sampling
+    parameters and are not generation: this platform serves ``generate`` only.
+    """
+    if not hasattr(params, "temperature"):
+        return ("pooling", None, "the platform serves text generation only")
+
+    no_logprobs = "the runner returns no log-probabilities"
+    no_penalty = (
+        "mlx-lm's penalties look at the last 20 tokens only, vLLM's at the "
+        "whole sequence"
+    )
+    no_seed = "the MLX random state is process-wide, not per request"
+    checks = (
+        ("logprobs", params.logprobs, params.logprobs is not None, no_logprobs),
+        (
+            "prompt_logprobs",
+            params.prompt_logprobs,
+            params.prompt_logprobs is not None,
+            no_logprobs,
+        ),
+        (
+            "logprob_token_ids",
+            getattr(params, "logprob_token_ids", None),
+            bool(getattr(params, "logprob_token_ids", None)),
+            no_logprobs,
+        ),
+        ("seed", params.seed, params.seed is not None, no_seed),
+        (
+            "repetition_penalty",
+            params.repetition_penalty,
+            params.repetition_penalty != 1.0,
+            no_penalty,
+        ),
+        (
+            "presence_penalty",
+            params.presence_penalty,
+            params.presence_penalty != 0.0,
+            no_penalty,
+        ),
+        (
+            "frequency_penalty",
+            params.frequency_penalty,
+            params.frequency_penalty != 0.0,
+            no_penalty,
+        ),
+        (
+            "min_tokens",
+            params.min_tokens,
+            bool(params.min_tokens),
+            "the runner cannot hold back the stop tokens",
+        ),
+        (
+            "allowed_token_ids",
+            params.allowed_token_ids,
+            params.allowed_token_ids is not None,
+            "the runner applies no token allow-list",
+        ),
+        (
+            "bad_words",
+            params.bad_words,
+            bool(params.bad_words),
+            "the runner applies no banned-sequence check",
+        ),
+        (
+            "thinking_token_budget",
+            getattr(params, "thinking_token_budget", None),
+            getattr(params, "thinking_token_budget", None) is not None,
+            "the runner does not count reasoning tokens",
+        ),
+        (
+            "repetition_detection",
+            getattr(params, "repetition_detection", None),
+            getattr(params, "repetition_detection", None) is not None,
+            "the runner does not watch for repetition",
+        ),
+    )
+    for name, value, unsupported, reason in checks:
+        if unsupported:
+            return (name, value, reason)
+    return None
 
 
 def _get_apple_chip_name() -> str:
@@ -214,15 +301,9 @@ class MLXPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(
         cls,
-        selected_backend,
-        head_size: int,
-        dtype: torch.dtype,
-        kv_cache_dtype,
-        block_size: int,
-        use_mla: bool,
-        has_sink: bool,
-        use_sparse: bool,
-        attn_type: str | None = None,
+        selected_backend: "AttentionBackendEnum",
+        attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         """Return MLX attention backend class path."""
         # Use our custom MLX attention backend
@@ -259,6 +340,22 @@ class MLXPlatform(Platform):
             cache_config = vllm_config.cache_config
             if cache_config.block_size is None:
                 cache_config.block_size = 16  # Default for MLX
+
+            # vLLM's prefix cache hands out hits on blocks of ITS kv cache,
+            # which MLX does not have: each request's cache lives in mlx-lm.
+            # A hit would make the scheduler count the shared prefix as already
+            # computed and schedule only the rest, while the runner still has
+            # to feed the whole prompt from token 0 -- all of it in the one step
+            # that completes the prompt, i.e. a step far longer than the
+            # scheduler's token budget (a re-sent 9.8k-token prompt stalled a
+            # concurrent decode for 0.9 s against 0.08 s cold).  Without hits
+            # the scheduler's chunking is the runner's chunking.
+            if cache_config.enable_prefix_caching:
+                logger.info(
+                    "Disabling vLLM prefix caching: MLX keeps its own KV cache "
+                    "per request, so a vLLM cache hit cannot be used"
+                )
+                cache_config.enable_prefix_caching = False
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
@@ -322,6 +419,28 @@ class MLXPlatform(Platform):
     def get_punica_wrapper(cls) -> str:
         """Return LoRA wrapper (not yet implemented for MLX)."""
         raise NotImplementedError("LoRA not yet supported on MLX backend")
+
+    @classmethod
+    def validate_request(cls, processed_inputs: Any, params: Any) -> None:
+        """Reject, as a 400, a request the MLX runner would answer wrongly.
+
+        vLLM calls this once per request, before scheduling.  The runner
+        honours temperature, top_p, top_k, min_p, logit_bias, structured
+        outputs, and (in the engine) max_tokens, stop conditions, ignore_eos
+        and n.  Everything below it would otherwise be accepted and silently
+        ignored (returning text that breaks vLLM's semantics) or, for
+        logprobs, crash the response with an IndexError.
+        """
+        message_and_value = unsupported_sampling_param(params)
+        if message_and_value is not None:
+            from vllm.exceptions import VLLMValidationError
+
+            parameter, value, reason = message_and_value
+            raise VLLMValidationError(
+                f"{parameter} is not supported on the MLX platform: {reason}",
+                parameter=parameter,
+                value=value,
+            )
 
     def __repr__(self) -> str:
         return f"<MLXPlatform device={self.device_name}>"
