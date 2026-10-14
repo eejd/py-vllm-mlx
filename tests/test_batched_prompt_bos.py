@@ -484,3 +484,159 @@ class TestWarmupTokenizesLikeChat:
         messages = [{"role": "system", "content": "be terse"}]
         _run(warm_prefix_cache(Engine(), [messages]))
         assert calls and calls[0]["add_special_tokens"] is False
+
+
+def _bare_engine_core():
+    """The real ``EngineCore.add_request`` with a scheduler that records the request."""
+    from vllm_mlx.engine_core import EngineCore
+
+    core = EngineCore.__new__(EngineCore)
+    core.config = SimpleNamespace(stream_interval=1)
+    core._output_collectors = {}
+    core._stream_states = {}
+    core._finished_events = {}
+    core.scheduler = SimpleNamespace(add_request=lambda request: seen.append(request))
+    seen = []
+    core.seen = seen
+    return core
+
+
+class TestEngineCoreHop:
+    """The kind must survive ``EngineCore`` / ``AsyncEngineCore`` into the ``Request``."""
+
+    @pytest.mark.parametrize("kind", [False, None])
+    def test_engine_core_puts_the_kind_on_the_request(self, kind):
+        core = _bare_engine_core()
+        _run(core.add_request(CHAT_PROMPT, add_special_tokens=kind))
+        (request,) = core.seen
+        assert request.add_special_tokens is kind
+
+    @pytest.mark.parametrize("kind", [False, None])
+    def test_the_non_streaming_generate_path_carries_the_kind(self, kind):
+        from vllm_mlx.engine_core import AsyncEngineCore
+        from vllm_mlx.request import RequestOutput
+
+        core = _bare_engine_core()
+        core._cleanup_request = lambda request_id: None
+
+        def finish_at_once(request):
+            core.seen.append(request)
+            core._output_collectors[request.request_id].put(
+                RequestOutput(
+                    request_id=request.request_id, output_text="x", finished=True
+                )
+            )
+            core._finished_events[request.request_id].set()
+
+        core.scheduler = SimpleNamespace(add_request=finish_at_once)
+        wrapper = AsyncEngineCore.__new__(AsyncEngineCore)
+        wrapper.engine = core
+        _run(wrapper.generate(CHAT_PROMPT, add_special_tokens=kind))
+        (request,) = core.seen
+        assert request.add_special_tokens is kind
+
+    def test_async_engine_core_forwards_the_kind(self):
+        from vllm_mlx.engine_core import AsyncEngineCore
+
+        core = _bare_engine_core()
+        wrapper = AsyncEngineCore.__new__(AsyncEngineCore)
+        wrapper.engine = core
+        _run(wrapper.add_request(CHAT_PROMPT, add_special_tokens=False))
+        (request,) = core.seen
+        assert request.add_special_tokens is False
+
+
+class _MLLMSchedulerStub:
+    def __init__(self):
+        self.calls = []
+
+    async def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            output_text="x",
+            output_token_ids=[1],
+            prompt_tokens=1,
+            completion_tokens=1,
+            finish_reason="stop",
+            mtp_drafts=0,
+            mtp_accepted=0,
+        )
+
+
+class TestBatchedMultimodalNonStreaming:
+    """``chat`` / ``generate`` on a multimodal model carry the kind to the scheduler."""
+
+    def _engine(self):
+        engine = _engine(FakeHFTokenizer())
+        engine._is_mllm = True
+        engine._mllm_scheduler = _MLLMSchedulerStub()
+        engine._default_mllm_draft = False
+        return engine
+
+    def test_raw_generate_carries_no_kind(self):
+        engine = self._engine()
+        _run(engine.generate(RAW_PROMPT, max_tokens=2))
+        (call,) = engine._mllm_scheduler.calls
+        assert call["add_special_tokens"] is None
+
+    def test_chat_carries_the_chat_kind(self):
+        engine = self._engine()
+        _run(engine.chat(MESSAGES, max_tokens=2))
+        (call,) = engine._mllm_scheduler.calls
+        assert call["add_special_tokens"] is False
+
+
+class TestMLLMSchedulerCountForTemplatesWithoutBos:
+    def test_chat_count_ignores_the_tokenizer_bos(self):
+        # A ChatML-style template renders no BOS on a BOS-adding tokenizer: the
+        # model is fed no BOS, so the count must not include one.
+        tok = FakeHFTokenizer()
+        scheduler = _bare_mllm_scheduler(tok)
+        request_id = scheduler.add_request(
+            CHATML_PROMPT, max_tokens=4, add_special_tokens=False
+        )
+        assert scheduler.requests[request_id].num_prompt_tokens == len(
+            _no_special(tok, CHATML_PROMPT)
+        )
+
+    def test_raw_count_includes_the_tokenizer_bos(self):
+        tok = FakeHFTokenizer()
+        scheduler = _bare_mllm_scheduler(tok)
+        request_id = scheduler.add_request(RAW_PROMPT, max_tokens=4)
+        assert scheduler.requests[request_id].num_prompt_tokens == (
+            len(_no_special(tok, RAW_PROMPT)) + 1
+        )
+
+
+class TestSimpleEngineSwallowsTheKind:
+    """``prompt_warmup`` passes the kind to every engine; Simple must not forward it."""
+
+    def test_the_hint_does_not_leak_into_the_model_call(self):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        seen = []
+
+        def stream_generate(**kwargs):
+            seen.append(kwargs)
+            return iter(
+                [SimpleNamespace(text="x", finished=True, finish_reason="stop")]
+            )
+
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._model = SimpleNamespace(
+            tokenizer=FakeHFTokenizer(), stream_generate=stream_generate
+        )
+
+        async def run():
+            return [
+                o
+                async for o in engine.stream_generate(
+                    CHAT_PROMPT, max_tokens=2, add_special_tokens=False
+                )
+            ]
+
+        outputs = _run(run())
+        assert outputs
+        (kwargs,) = seen
+        assert "add_special_tokens" not in kwargs
