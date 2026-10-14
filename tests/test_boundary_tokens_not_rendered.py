@@ -673,3 +673,95 @@ class TestSimpleEngineRoutes:
                 assert _render(engine._text_tokenizer, [7, 3, 4, 8]) == "w7 w8"
             finally:
                 await engine.stop()
+
+
+@pytest.mark.anyio
+class TestSpecPrefillSeedToken:
+    """The first token of a SpecPrefill generation is sampled outside mlx-lm."""
+
+    async def _first_chunk(self, seed_id, **kwargs):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        def score(*args, cancel_check=None, **kw):
+            return mx.array([0.5], dtype=mx.float32)
+
+        def sparse(*args, cancel_check=None, **kw):
+            return mx.zeros((1, 1, 8), dtype=mx.float32)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._draft_model = MagicMock()
+        engine._model = MagicMock()
+        engine._model.model = MagicMock()
+        engine._model.tokenizer = hide_boundary_tokens(
+            _special_tokenizer(pad_id=3, bos_id=4, eos_id=5)
+        )
+        engine._model.stream_generate.return_value = iter(())
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch(
+                "mlx_lm.sample_utils.make_sampler",
+                return_value=lambda logits: mx.array([seed_id], dtype=mx.int32),
+            ),
+            patch("vllm_mlx.specprefill.score_tokens", side_effect=score),
+            patch(
+                "vllm_mlx.specprefill.select_chunks",
+                return_value=mx.array([0], dtype=mx.int32),
+            ),
+            patch("vllm_mlx.specprefill.sparse_prefill", side_effect=sparse),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+        ):
+            return [
+                chunk
+                async for chunk in engine._stream_generate_specprefill(
+                    prompt="hello",
+                    tokens=[1, 2, 3, 4],
+                    max_tokens=4,
+                    temperature=0.0,
+                    top_p=1.0,
+                    **kwargs,
+                )
+            ]
+
+    @pytest.mark.parametrize("skip", [True, False])
+    async def test_a_seed_that_is_the_eos_ends_the_request_with_no_text(self, skip):
+        chunks = await self._first_chunk(5, skip_special_tokens=skip)
+        assert "".join(c.new_text for c in chunks) == ""
+        assert chunks[-1].finish_reason == "stop"
+
+    @pytest.mark.parametrize("skip, expected", [(True, ""), (False, "<pad>")])
+    async def test_a_seed_that_is_a_pad_follows_the_request(self, skip, expected):
+        chunks = await self._first_chunk(3, skip_special_tokens=skip)
+        assert "".join(c.new_text for c in chunks) == expected
+
+    async def test_ignore_eos_seed_is_text_only_when_asked_for(self):
+        hidden = await self._first_chunk(5, ignore_eos=True)
+        assert "".join(c.new_text for c in hidden) == ""
+        shown = await self._first_chunk(5, ignore_eos=True, skip_special_tokens=False)
+        assert "".join(c.new_text for c in shown) == "<eos>"
+
+
+class TestSchedulerHidesTheProcessorsStopIds:
+    def test_stop_ids_only_the_processor_declares_are_not_rendered(
+        self, model, greedy_tokens, distinct
+    ):
+        """A multimodal processor wraps the tokenizer and can carry the EOS set."""
+        eos = distinct[1]
+        inner = _special_tokenizer(
+            pad_id=distinct[2], bos_id=VOCAB - 1, eos_id=VOCAB - 2
+        )
+
+        class Processor:
+            tokenizer = inner
+            eos_token_ids = {eos}
+
+            def __getattr__(self, name):
+                raise AttributeError(name)
+
+        sched = Scheduler(
+            model=model,
+            tokenizer=Processor(),
+            config=SchedulerConfig(enable_prefix_cache=False),
+        )
+        assert eos in sched._hidden_token_ids()
