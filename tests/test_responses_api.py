@@ -58,6 +58,8 @@ def server_state():
 def _mock_engine(*outputs):
     engine = MagicMock()
     engine.model_name = "test-model"
+    engine.is_mllm = False
+    engine.use_harmony_rendering = False
     engine.preserve_native_tool_format = False
     engine.chat = AsyncMock(side_effect=list(outputs))
     engine.validate_chat_template = AsyncMock(return_value=None)
@@ -1188,3 +1190,722 @@ class TestResponsesRegistryRouting:
             assert resp.status_code == 400, resp.text
             assert registry.acquired.count("alpha") == (2 if stream else 1)
             assert registry.active_requests == 0
+
+
+_PNG = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4"
+    "nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+_PNG_2 = _PNG.replace("iVBORw0KGgo", "iVBORw0KGgp")
+
+
+def _user_input(*parts):
+    return [{"type": "message", "role": "user", "content": list(parts)}]
+
+
+def _text(text):
+    return {"type": "input_text", "text": text}
+
+
+def _image(url=_PNG, **extra):
+    return {"type": "input_image", "image_url": url, **extra}
+
+
+class TestResponsesInputImages:
+    """``input_image`` parts reach the engine exactly as chat-route images do."""
+
+    def _post(self, client, engine, input_items, **extra):
+        import vllm_mlx.server as srv
+
+        srv._engine = engine
+        return client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": input_items, **extra},
+        )
+
+    def _chat_call(self, client, engine, content):
+        import vllm_mlx.server as srv
+
+        srv._engine = engine
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": content}],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        return engine.chat.call_args.kwargs
+
+    def test_llm_engine_gets_text_and_the_extracted_image(self, client):
+        engine = _mock_engine(_output("a pixel"))
+        resp = self._post(client, engine, _user_input(_text("What is this?"), _image()))
+
+        assert resp.status_code == 200, resp.text
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["messages"] == [{"role": "user", "content": "What is this?"}]
+        assert kwargs["images"] == [_PNG]
+
+    def test_llm_engine_matches_the_chat_route(self, client):
+        responses_engine = _mock_engine(_output("a"))
+        self._post(client, responses_engine, _user_input(_text("Describe"), _image()))
+        chat_engine = _mock_engine(_output("a"))
+        chat = self._chat_call(
+            client,
+            chat_engine,
+            [
+                {"type": "text", "text": "Describe"},
+                {"type": "image_url", "image_url": {"url": _PNG}},
+            ],
+        )
+
+        got = responses_engine.chat.call_args.kwargs
+        assert got["messages"] == chat["messages"]
+        assert got["images"] == chat["images"]
+
+    def test_mllm_engine_keeps_the_image_in_the_message_like_the_chat_route(
+        self, client
+    ):
+        # An MLLM engine reads media out of the messages; its chat() has no use
+        # for an ``images`` argument, so flattening the message would drop it.
+        responses_engine = _mock_engine(_output("a"))
+        responses_engine.is_mllm = True
+        self._post(
+            client,
+            responses_engine,
+            _user_input(_text("Describe"), _image(detail="high")),
+        )
+        chat_engine = _mock_engine(_output("a"))
+        chat_engine.is_mllm = True
+        chat = self._chat_call(
+            client,
+            chat_engine,
+            [
+                {"type": "text", "text": "Describe"},
+                {"type": "image_url", "image_url": {"url": _PNG, "detail": "high"}},
+            ],
+        )
+
+        got = responses_engine.chat.call_args.kwargs
+        assert got["messages"] == chat["messages"]
+        assert got["messages"][0]["content"][1]["image_url"] == {
+            "url": _PNG,
+            "detail": "high",
+        }
+        assert "images" not in got
+
+    def test_image_only_message_is_not_an_empty_conversation(self, client):
+        engine = _mock_engine(_output("a"))
+        resp = self._post(client, engine, _user_input(_image()))
+
+        assert resp.status_code == 200, resp.text
+        assert engine.chat.call_args.kwargs["images"] == [_PNG]
+
+    def test_image_detail_defaults_to_auto(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        self._post(client, engine, _user_input(_image()))
+
+        part = engine.chat.call_args.kwargs["messages"][0]["content"][0]
+        assert part["image_url"]["detail"] == "auto"
+
+    def test_parts_keep_their_request_order(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        self._post(
+            client,
+            engine,
+            _user_input(_text("one"), _image(_PNG), _text("two"), _image(_PNG_2)),
+        )
+
+        content = engine.chat.call_args.kwargs["messages"][0]["content"]
+        assert [part.get("text") or part["image_url"]["url"] for part in content] == [
+            "one",
+            _PNG,
+            "two",
+            _PNG_2,
+        ]
+
+    def test_llm_engine_gets_every_image_in_order(self, client):
+        engine = _mock_engine(_output("a"))
+        self._post(
+            client, engine, _user_input(_image(_PNG), _text("vs"), _image(_PNG_2))
+        )
+
+        assert engine.chat.call_args.kwargs["images"] == [_PNG, _PNG_2]
+
+    def test_streaming_request_carries_the_image(self, client):
+        engine = _mock_engine()
+        engine._stream_outputs = [_stream_output("ok", finish_reason="stop")]
+        resp = self._post(
+            client, engine, _user_input(_text("Describe"), _image()), stream=True
+        )
+
+        assert resp.status_code == 200, resp.text
+        call = engine._stream_calls[0]
+        assert call["messages"] == [{"role": "user", "content": "Describe"}]
+        assert call["images"] == [_PNG]
+
+    def test_message_item_without_a_type_is_a_message(self, client):
+        # EasyInputMessage: ``type`` is optional when there is a role.
+        engine = _mock_engine(_output("a"))
+        resp = self._post(
+            client,
+            engine,
+            [{"role": "user", "content": [_text("Describe"), _image()]}],
+        )
+
+        assert resp.status_code == 200, resp.text
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["messages"] == [{"role": "user", "content": "Describe"}]
+        assert kwargs["images"] == [_PNG]
+
+    def test_image_is_replayed_through_previous_response_id(self, client):
+        engine = _mock_engine(_output("a pixel"), _output("still a pixel"))
+        first = self._post(client, engine, _user_input(_text("What?"), _image()))
+        resp = self._post(
+            client,
+            engine,
+            "And now?",
+            previous_response_id=first.json()["id"],
+        )
+
+        assert resp.status_code == 200, resp.text
+        kwargs = engine.chat.call_args_list[1].kwargs
+        assert [m["role"] for m in kwargs["messages"]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert kwargs["images"] == [_PNG]
+
+    def test_text_part_types_of_history_are_accepted(self, client):
+        engine = _mock_engine(_output("a"))
+        resp = self._post(
+            client,
+            engine,
+            [
+                {"type": "message", "role": "user", "content": [_text("Hi")]},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": "No."}],
+                },
+                {"type": "message", "role": "user", "content": [_text("Again")]},
+            ],
+        )
+
+        assert resp.status_code == 200, resp.text
+        contents = [m["content"] for m in engine.chat.call_args.kwargs["messages"]]
+        assert contents == ["Hi", "Hello\n\nNo.", "Again"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "part, expected",
+        [
+            (
+                {"type": "input_file", "file_data": "abc", "filename": "a.pdf"},
+                "input_file",
+            ),
+            (
+                {"type": "input_audio", "input_audio": {"data": "x", "format": "wav"}},
+                "input_audio",
+            ),
+            ({"type": "made_up"}, "made_up"),
+        ],
+    )
+    def test_unsupported_part_is_a_400_naming_it(self, client, part, expected, stream):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(client, engine, _user_input(_text("hi"), part), stream=stream)
+
+        assert resp.status_code == 400, resp.text
+        assert expected in resp.json()["detail"]
+        engine.chat.assert_not_called()
+        assert engine._stream_calls == []
+
+    @pytest.mark.parametrize(
+        "part, expected",
+        [
+            ({"type": "input_image", "file_id": "file-1"}, "file_id"),
+            ({"type": "input_image"}, "image_url"),
+            ({"type": "input_image", "image_url": ""}, "image_url"),
+            ({"type": "input_image", "image_url": {"url": _PNG}}, "image_url"),
+            (_image(detail="ultra"), "detail"),
+            ({"image_url": _PNG}, "no `type`"),
+        ],
+    )
+    def test_malformed_part_is_a_400(self, client, part, expected):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(client, engine, _user_input(part))
+
+        assert resp.status_code == 400, resp.text
+        assert expected in resp.json()["detail"]
+        engine.chat.assert_not_called()
+
+    @pytest.mark.parametrize("role", ["system", "developer"])
+    def test_image_in_a_system_message_is_a_400(self, client, role):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(
+            client,
+            engine,
+            [
+                {"type": "message", "role": role, "content": [_image()]},
+                {"type": "message", "role": "user", "content": "hi"},
+            ],
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "system or developer" in resp.json()["detail"]
+        engine.chat.assert_not_called()
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "items, seen",
+        [
+            ([], None),
+            ([{"type": "item_reference", "id": "msg_1"}], "item_reference"),
+            (
+                [
+                    {"type": "item_reference", "id": "msg_1"},
+                    {"type": "computer_call_output", "call_id": "c"},
+                ],
+                "computer_call_output, item_reference",
+            ),
+        ],
+    )
+    def test_empty_conversation_is_a_400_not_a_500(self, client, items, seen, stream):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(client, engine, items, stream=stream, instructions="Be nice")
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert "no conversation message" in detail
+        if seen:
+            assert seen in detail
+        engine.chat.assert_not_called()
+        assert engine._stream_calls == []
+
+    def test_history_alone_is_not_an_empty_conversation(self, client):
+        engine = _mock_engine(_output("one"), _output("two"))
+        first = self._post(client, engine, "Hello")
+        resp = self._post(client, engine, [], previous_response_id=first.json()["id"])
+
+        assert resp.status_code == 200, resp.text
+        roles = [m["role"] for m in engine.chat.call_args_list[1].kwargs["messages"]]
+        assert roles == ["user", "assistant"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_private_image_url_is_refused_like_on_the_chat_route(self, client, stream):
+        engine = _mock_engine(_output("never"))
+        resp = self._post(
+            client,
+            engine,
+            _user_input(_image("http://127.0.0.1:9/secret.png")),
+            stream=stream,
+        )
+
+        assert resp.status_code == 400, resp.text
+        engine.chat.assert_not_called()
+        assert engine._stream_calls == []
+
+
+_TOOL_FLOW = [
+    {"type": "message", "role": "user", "content": "Run it"},
+    {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "shell",
+        "arguments": '{"cmd":"pwd"}',
+    },
+    {"type": "function_call_output", "call_id": "call_1", "output": "/tmp/work"},
+]
+
+
+class TestResponsesPreparedMessages:
+    """What each kind of engine is handed for tool turns and replayed reasoning."""
+
+    def _post(self, client, engine, input_items):
+        import vllm_mlx.server as srv
+
+        srv._engine = engine
+        resp = client.post(
+            "/v1/responses", json={"model": "test-model", "input": input_items}
+        )
+        assert resp.status_code == 200, resp.text
+        return engine.chat.call_args.kwargs["messages"]
+
+    def test_mllm_engine_without_native_tools_gets_the_flattened_tool_turn(
+        self, client
+    ):
+        # A batched MLLM engine (Gemma-3) renders ``role=tool`` / ``tool_calls``
+        # with a template that cannot: it must see what an LLM engine sees.
+        mllm = _mock_engine(_output("Done"))
+        mllm.is_mllm = True
+        llm = _mock_engine(_output("Done"))
+        got = self._post(client, mllm, _TOOL_FLOW)
+        expected = self._post(client, llm, _TOOL_FLOW)
+
+        assert got == expected
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert "[Calling tool: shell(" in got[1]["content"]
+        assert "[Tool Result (call_1)]" in got[2]["content"]
+
+    def test_mllm_tool_turn_is_flattened_next_to_an_image(self, client):
+        engine = _mock_engine(_output("Done"))
+        engine.is_mllm = True
+        got = self._post(
+            client,
+            engine,
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [_text("Look"), _image()],
+                },
+                *_TOOL_FLOW[1:],
+            ],
+        )
+
+        assert got[0]["content"][1]["type"] == "image_url"
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert isinstance(got[1]["content"], str)
+
+    def test_mllm_engine_with_native_tools_keeps_the_structural_tool_turn(self, client):
+        engine = _mock_engine(_output("Done"))
+        engine.is_mllm = True
+        engine.preserve_native_tool_format = True
+        got = self._post(client, engine, _TOOL_FLOW)
+
+        assert [m["role"] for m in got] == ["user", "assistant", "tool"]
+        assert got[1]["tool_calls"][0]["function"]["arguments"] == {"cmd": "pwd"}
+        assert got[2]["tool_call_id"] == "call_1"
+
+    def test_harmony_rendering_keeps_the_structural_tool_turn(self, client):
+        engine = _mock_engine(_output("Done"))
+        engine.use_harmony_rendering = True
+        got = self._post(client, engine, _TOOL_FLOW)
+
+        assert [m["role"] for m in got] == ["user", "assistant", "tool"]
+        assert got[1]["tool_calls"][0]["function"]["name"] == "shell"
+        assert got[2]["content"] == "/tmp/work"
+
+    def test_without_harmony_the_tool_turn_is_text(self, client):
+        got = self._post(client, _mock_engine(_output("Done")), _TOOL_FLOW)
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+
+    def test_reasoning_item_rides_on_the_next_assistant_message(self, client):
+        # vLLM puts it on that message's ``reasoning`` field, never in the
+        # visible content: the answer must not be fused with the thinking.
+        engine = _mock_engine(_output("Done"))
+        engine.preserve_native_tool_format = True
+        got = self._post(
+            client,
+            engine,
+            [
+                {"type": "message", "role": "user", "content": "Run it"},
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "need pwd"}],
+                },
+                _TOOL_FLOW[1],
+                _TOOL_FLOW[2],
+            ],
+        )
+
+        assert [m["role"] for m in got] == ["user", "assistant", "tool"]
+        assert got[1]["reasoning_content"] == "need pwd"
+        assert got[1]["content"] == ""
+        assert got[1]["tool_calls"][0]["function"]["name"] == "shell"
+
+    def test_reasoning_item_never_joins_the_visible_answer(self, client):
+        got = self._post(
+            client,
+            _mock_engine(_output("Done")),
+            [
+                {"type": "message", "role": "user", "content": "Hi"},
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "thinking"}],
+                },
+                {"type": "message", "role": "assistant", "content": "Hello"},
+                {"type": "message", "role": "user", "content": "Again"},
+            ],
+        )
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert got[1]["content"] == "Hello"
+        assert "thinking" not in str(got)
+
+    def test_mllm_engine_gets_the_reasoning_of_the_assistant_message(self, client):
+        engine = _mock_engine(_output("Done"))
+        engine.is_mllm = True
+        got = self._post(
+            client,
+            engine,
+            [
+                {"type": "message", "role": "user", "content": "Hi"},
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "thinking"}],
+                },
+                {"type": "message", "role": "assistant", "content": "Hello"},
+                {"type": "message", "role": "user", "content": "Again"},
+            ],
+        )
+
+        assert got[1] == {
+            "role": "assistant",
+            "content": "Hello",
+            "reasoning_content": "thinking",
+        }
+
+    def test_text_parts_are_joined_by_newlines_in_order(self, client):
+        got = self._post(
+            client,
+            _mock_engine(_output("a")),
+            _user_input(_text("one"), _text("two"), _text("three")),
+        )
+
+        assert got[0]["content"] == "one\ntwo\nthree"
+
+    def test_bare_strings_in_a_part_list_are_text_parts(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._post(
+            client,
+            engine,
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": ["bare", "", _text("typed"), _image()],
+                }
+            ],
+        )
+
+        assert [p["type"] for p in got[0]["content"]] == [
+            "text",
+            "text",
+            "image_url",
+        ]
+        assert [p.get("text") for p in got[0]["content"][:2]] == ["bare", "typed"]
+
+    @pytest.mark.parametrize("detail", ["auto", "low", "high", "original"])
+    def test_every_documented_image_detail_is_accepted(self, client, detail):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._post(client, engine, _user_input(_image(detail=detail)))
+
+        assert got[0]["content"][0]["image_url"]["detail"] == detail
+
+
+def _reasoning(text):
+    return {"type": "reasoning", "content": [{"type": "reasoning_text", "text": text}]}
+
+
+def _msg(role, content):
+    return {"type": "message", "role": role, "content": content}
+
+
+class TestResponsesReasoningReplay:
+    """A replayed ``reasoning`` item belongs to the assistant message after it."""
+
+    def _messages(self, client, engine, input_items, **extra):
+        import vllm_mlx.server as srv
+
+        srv._engine = engine
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": input_items, **extra},
+        )
+        assert resp.status_code == 200, resp.text
+        return engine.chat.call_args.kwargs["messages"]
+
+    def test_reasoning_before_a_user_message_stays_its_own_message(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._messages(
+            client,
+            engine,
+            [_msg("user", "Hi"), _reasoning("pondering"), _msg("user", "Next")],
+        )
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert got[1] == {"role": "assistant", "content": "pondering"}
+        assert all("reasoning_content" not in m for m in got)
+
+    def test_reasoning_at_the_end_of_the_input_stays_its_own_message(self, client):
+        got = self._messages(
+            client,
+            _mock_engine(_output("a")),
+            [_msg("user", "Hi"), _reasoning("pondering")],
+        )
+
+        assert got[-1] == {"role": "assistant", "content": "pondering"}
+
+    def test_only_the_last_of_two_reasoning_items_rides_on_the_message(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._messages(
+            client,
+            engine,
+            [
+                _msg("user", "Hi"),
+                _reasoning("first"),
+                _reasoning("second"),
+                _msg("assistant", "Hello"),
+            ],
+        )
+
+        (assistant,) = [m for m in got if m["role"] == "assistant"]
+        assert assistant["reasoning_content"] == "second"
+        assert "first" in assistant["content"]
+        assert assistant["content"].endswith("Hello")
+
+    def test_history_with_a_reasoning_bearing_assistant_message_is_replayed(
+        self, client
+    ):
+        engine = _mock_engine(_output("one"), _output("two"))
+        engine.is_mllm = True
+        first = self._messages(
+            client,
+            engine,
+            [
+                _msg("user", "Hi"),
+                _reasoning("pondering"),
+                _msg("assistant", "Hello"),
+                _msg("user", "Again"),
+            ],
+        )
+        import vllm_mlx.server as srv
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "And again",
+                "previous_response_id": next(iter(srv._responses_store)),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        second = engine.chat.call_args_list[1].kwargs["messages"]
+
+        assert second[:3] == first[:3]
+        assert second[1]["reasoning_content"] == "pondering"
+        assert "_responses_reasoning_item" not in str(second)
+        assert [m["role"] for m in second] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+        ]
+
+    def test_stored_unattached_reasoning_is_not_replayed_as_a_reasoning_item(
+        self, client
+    ):
+        # The first request ends with a reasoning item that has no assistant
+        # message after it, so it is stored as a plain assistant message; the
+        # next turn must read it as that, not attach it to the answer.
+        engine = _mock_engine(_output("Done"), _output("Again"))
+        engine.is_mllm = True
+        self._messages(client, engine, [_msg("user", "Hi"), _reasoning("pondering")])
+        import vllm_mlx.server as srv
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [_msg("user", "Next")],
+                "previous_response_id": next(iter(srv._responses_store)),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        got = engine.chat.call_args_list[1].kwargs["messages"]
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert got[1]["content"] == "pondering\n\nDone"
+        assert "reasoning_content" not in got[1]
+
+    def test_reasoning_of_merged_assistant_messages_is_kept_in_order(self, client):
+        engine = _mock_engine(_output("a"))
+        engine.is_mllm = True
+        got = self._messages(
+            client,
+            engine,
+            [
+                _msg("user", "Hi"),
+                _reasoning("first thought"),
+                _msg("assistant", "One"),
+                _reasoning("second thought"),
+                _msg("assistant", "Two"),
+                _msg("user", "Go"),
+            ],
+        )
+
+        assistant = [m for m in got if m["role"] == "assistant"]
+        assert len(assistant) == 1
+        assert assistant[0]["content"] == "One\n\nTwo"
+        assert assistant[0]["reasoning_content"] == "first thought\n\nsecond thought"
+
+
+class TestPrepareChatMessagesFlattening:
+    """``flatten_tool_turns`` on messages that arrive as plain dicts."""
+
+    def _prepare(self, messages, **engine_attrs):
+        import vllm_mlx.server as srv
+
+        engine = SimpleNamespace(
+            is_mllm=True,
+            preserve_native_tool_format=False,
+            use_harmony_rendering=False,
+            **engine_attrs,
+        )
+        return srv._prepare_chat_messages(
+            engine, messages, validate_remote_media=False, flatten_tool_turns=True
+        )[0]
+
+    def test_dict_tool_result_and_tool_call_messages_are_flattened(self):
+        got = self._prepare(
+            [
+                {"role": "user", "content": "Run it"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ]
+        )
+
+        assert [m["role"] for m in got] == ["user", "assistant", "user"]
+        assert "[Calling tool: shell(" in got[1]["content"]
+
+    def test_dict_message_without_tool_calls_is_not_touched(self):
+        got = self._prepare(
+            [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": "Hello",
+                    "tool_calls": None,
+                    "reasoning_content": "thought",
+                },
+                {"role": "assistant", "content": "Again", "tool_calls": []},
+            ]
+        )
+
+        assert [m["content"] for m in got] == ["Hi", "Hello\n\nAgain"]
+        assert got[1]["reasoning_content"] == "thought"
