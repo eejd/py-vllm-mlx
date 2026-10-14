@@ -314,8 +314,11 @@ JSON with typos (`{"name: "echo_args", ...}`, no call); the model-card order mak
 `<tool_call>{"arguments": ..., "name": ...}` and nested-object and list arguments parse into correct
 calls, the tool roundtrip answers cleanly. It is still a 3B 4-bit model: it sometimes drops characters
 from values (`<ok>` vanished from a string argument) or answers with untagged JSON, so expect
-unreliable calls (quantbench tool-echo: `object` 3/3 pass, scalars wrong values, `markup_in_value` and
-`code_value` no call).
+unreliable calls. quantbench tool-echo on this template (server, BOS included; verdict `fail`, it
+was `inconclusive` without the BOS because every case was `no_call`): `object` 3/3 pass, `scalars`
+mismatch (right values plus filler), `list` `raw_markup` 3/3 (the first failure shows a
+`<tool_call>` block with Python `False` in it that the parser left as text), `markup_in_value` and
+`code_value` no call.
 
 Requests without tools render like the checkpoint's own template, after the BOS (tests pin this);
 requests with tools get the `<tools>` system prompt and `<tool_call>` instructions. The template
@@ -324,12 +327,23 @@ template and NousResearch's own Hermes-3-Llama-3.1-8B/70B templates do. The serv
 rendered chat prompt without special tokens (as vLLM does: the template owns every marker), so a
 template that leaves the BOS off sends the model a prompt with none, and the 4-bit 3B model degrades
 (stray words before the answer, a tool round trip that never stops). The 3B checkpoint's own template
-omits the BOS, so serve it with this template even when no request carries tools. On
-`mlx-community/Hermes-3-Llama-3.2-3B-4bit` (greedy, 12 tool prompts, 6 tool round trips, 20 plain
-questions) the BOS took correct tool calls from 3 to 7 of 12 and cleanly answered round trips from 1
-to 5 of 6; the model's own errors (wrong values, dropped quotes in a call) remain. The other bundled
-templates follow their checkpoints: Gemma-3's renders `<bos>`, Phi-4-mini's renders none (its
-tokenizer adds none).
+omits the BOS, so serve it with this template even when no request carries tools. The BOS fixes
+plain-answer corruption and tool round trips; it does not make single tool calls reliable.
+Measured on `mlx-community/Hermes-3-Llama-3.2-3B-4bit` (greedy, no BOS -> BOS):
+
+* 20 plain questions: 5 -> 1 cut at `max_tokens`, no whitespace garbage left; correct answers 15 -> 15.
+* 6 tool round trips: cleanly answered 1 -> 5 (cut at `max_tokens` 3 -> 0); conformance
+  `tool_roundtrip` fail -> pass.
+* Single tool calls are prompt-sensitive and move both ways. A mixed three-tool workload (12
+  prompts): correct calls 3 -> 7. A single-tool `get_weather` workload (32 prompts, independent
+  review): 14 -> 9. The conformance `tool_call_shape` check (required) passes without the BOS
+  and fails with it on this checkpoint. With the BOS the model often writes a malformed call such as
+  `{"arguments": {"city: "Paris"}, "name: "get_weather"}` (dropped closing quotes); without it, the
+  output is more often garbage before a well-formed call or none at all. Treat the 3B 4-bit
+  checkpoint's tool calls as unreliable either way.
+
+The other bundled templates follow their checkpoints: Gemma-3's renders `<bos>`, Phi-4-mini's renders
+none (its tokenizer adds none).
 
 ### Templates that ignore tools
 
