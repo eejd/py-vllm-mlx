@@ -58,6 +58,7 @@ class SimpleEngineCancelSerializationTests(unittest.IsolatedAsyncioTestCase):
             engine._text_tokenizer = MagicMock()
             engine._text_tokenizer.apply_chat_template = MagicMock(return_value="hello")
             engine._text_tokenizer.bos_token = None
+            engine._text_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
             engine._draft_model = None
             engine._run_blocking_serialized = fake_serialized  # type: ignore[method-assign]
 

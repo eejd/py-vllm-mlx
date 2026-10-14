@@ -38,7 +38,6 @@ from ..utils.tokenizer import (
     decode_visible,
     encode_prompt,
     eos_ignoring_tokenizer,
-    prompt_adds_special_tokens,
     unfiltered_tokenizer,
 )
 from .base import (
@@ -1512,10 +1511,11 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # The Simple engine tokenizes string prompts with the mlx-lm rule (BOS
-        # added unless the prompt already starts with it), so the request-kind
-        # hint the batched schedulers use is accepted and not forwarded.
-        kwargs.pop("add_special_tokens", None)
+        # Request kind (vLLM ``add_special_tokens``): False for a prompt the chat
+        # template rendered, None for a raw completion prompt.  It decides whether
+        # the prompt string is tokenized with the tokenizer's BOS (see
+        # ``utils.tokenizer.encode_prompt``), the same for the batched engine.
+        add_special_tokens = kwargs.pop("add_special_tokens", None)
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
@@ -1532,8 +1532,7 @@ class SimpleEngine(BaseEngine):
 
             if use_specprefill:
                 tokenizer = self._model.tokenizer
-                add_special = prompt_adds_special_tokens(tokenizer, prompt)
-                tokens_list = tokenizer.encode(prompt, add_special_tokens=add_special)
+                tokens_list = encode_prompt(tokenizer, prompt, add_special_tokens)
                 n_tokens = len(tokens_list)
 
                 # Threshold check (skip when force-enabled via per-request override)
@@ -1564,6 +1563,7 @@ class SimpleEngine(BaseEngine):
                         stop=stop,
                         specprefill_keep_pct=specprefill_keep_pct_override,
                         specprefill_backbone_pct=specprefill_backbone_pct_override,
+                        add_special_tokens=add_special_tokens,
                         **kwargs,
                     )
                     async with aclosing(specprefill_stream):
@@ -1614,6 +1614,7 @@ class SimpleEngine(BaseEngine):
                         temperature=temperature,
                         top_p=top_p,
                         stop=stop,
+                        add_special_tokens=add_special_tokens,
                         **kwargs,
                     )
 
@@ -1688,7 +1689,9 @@ class SimpleEngine(BaseEngine):
                     if not finished:
                         if prompt_tokens == 0 and self._model is not None:
                             prompt_tokens = len(
-                                encode_prompt(self._model.tokenizer, prompt)
+                                encode_prompt(
+                                    self._model.tokenizer, prompt, add_special_tokens
+                                )
                             )
                         if request_id in self._active_requests:
                             self._active_requests[request_id].update(
@@ -2362,6 +2365,12 @@ class SimpleEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
 
+        # The chat template owns the BOS of the prompt it rendered (vLLM tokenizes
+        # chat prompts with ``add_special_tokens=False``): the cached/uncached
+        # tokenizations below and the generation itself must all agree.  The
+        # plain-text fallback is no template rendering: raw-prompt rule.
+        prompt_kind = False if hasattr(tokenizer, "apply_chat_template") else None
+
         # --- System-prompt KV caching on the pure-LLM stream_chat path ---
         # Mirrors the cache in _stream_generate_text. Locates the system prefix
         # via probe-divergence (cf. prompt_warmup._build_strict_prefix_string):
@@ -2416,8 +2425,7 @@ class SimpleEngine(BaseEngine):
             and not cache_blocking_controls
             and hasattr(tokenizer, "encode")
         ):
-            add_special = prompt_adds_special_tokens(tokenizer, prompt)
-            full_tokens_list = tokenizer.encode(prompt, add_special_tokens=add_special)
+            full_tokens_list = encode_prompt(tokenizer, prompt, prompt_kind)
             full_token_count = len(full_tokens_list)
             prefix_trie_eligible = bool(full_tokens_list)
 
@@ -2437,13 +2445,10 @@ class SimpleEngine(BaseEngine):
         if system_prefix_text is not None:
             system_hash = hashlib.sha256(system_prefix_text.encode()).hexdigest()[:16]
 
-            add_special = prompt_adds_special_tokens(tokenizer, prompt)
             if full_tokens_list is None:
-                full_tokens_list = tokenizer.encode(
-                    prompt, add_special_tokens=add_special
-                )
-            system_tokens_list = tokenizer.encode(
-                system_prefix_text, add_special_tokens=add_special
+                full_tokens_list = encode_prompt(tokenizer, prompt, prompt_kind)
+            system_tokens_list = encode_prompt(
+                tokenizer, system_prefix_text, prompt_kind
             )
             full_token_count = len(full_tokens_list)
             system_token_count = len(system_tokens_list)
@@ -2728,6 +2733,7 @@ class SimpleEngine(BaseEngine):
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    add_special_tokens=prompt_kind,
                     **kwargs,
                 )
                 async with aclosing(fallback_stream):
@@ -2742,6 +2748,7 @@ class SimpleEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            add_special_tokens=prompt_kind,
             **kwargs,
         )
         async with aclosing(fallback_stream):
@@ -3037,7 +3044,6 @@ class SimpleEngine(BaseEngine):
 
         # --- System prompt KV caching ---
         backbone_cache = None  # Backbone-only cache (no MTP), used by both paths
-        prompt_to_send = full_prompt  # Default: send full prompt text
         cache_hit = False
         system_token_count = 0
         system_hash = None
@@ -3058,11 +3064,14 @@ class SimpleEngine(BaseEngine):
         # reported. Previously this only happened inside the system-KV-cache
         # branch (which requires a system message AND ChatML markers) or for
         # specprefill — every other request reported prompt_tokens=0.
-        _add_special = prompt_adds_special_tokens(self._text_tokenizer, full_prompt)
-        full_tokens_list = self._text_tokenizer.encode(
-            full_prompt, add_special_tokens=_add_special
-        )
+        # ``full_prompt`` is a chat-template rendering, so the template owns its
+        # BOS (vLLM: ``add_special_tokens=False``).  The ids counted here are the
+        # ids generation is fed: a string prompt would be re-tokenized by
+        # mlx-lm's own BOS rule, which keeps the tokenizer's BOS on a template
+        # that renders none.
+        full_tokens_list = encode_prompt(self._text_tokenizer, full_prompt, False)
         full_token_count = len(full_tokens_list)
+        prompt_to_send = mx.array(full_tokens_list)  # Default: the whole prompt
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
@@ -3089,10 +3098,9 @@ class SimpleEngine(BaseEngine):
                     :16
                 ]
 
-                # Tokenize the system prefix (full prompt is tokenized above,
-                # matching stream_generate's tokenization logic)
-                system_tokens_list = self._text_tokenizer.encode(
-                    system_prefix_text, add_special_tokens=_add_special
+                # Tokenize the system prefix the way the full prompt was above
+                system_tokens_list = encode_prompt(
+                    self._text_tokenizer, system_prefix_text, False
                 )
                 system_token_count = len(system_tokens_list)
 
@@ -3351,7 +3359,7 @@ class SimpleEngine(BaseEngine):
                     )
                     # Discard potentially corrupted cache
                     backbone_cache = None
-                    prompt_to_send = full_prompt
+                    prompt_to_send = mx.array(full_tokens_list)
 
             # --- Normal path (mlx_lm stream_generate) ---
             prompt_cache = None
