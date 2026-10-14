@@ -24,7 +24,7 @@ classifiers = [
 
 dependencies = [
     "vllm-mlx>=0.4.0rc1",
-    "vllm>=0.10",
+    "vllm>=0.27",
     "torch>=2.8.0",
 ]
 
