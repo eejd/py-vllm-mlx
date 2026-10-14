@@ -57,6 +57,19 @@ class UnsupportedRequestOption(ValueError):
     """
 
 
+class ChatTemplateRejected(UnsupportedRequestOption):
+    """The chat template refused the request's messages (HTTP 400).
+
+    Templates validate their input by raising from inside the template
+    (``raise_exception("Conversation roles must alternate ...")``: Gemma, Mistral,
+    Llama-2 and many others), which surfaces as ``jinja2.TemplateError``. That is the
+    template saying the *request* is malformed for this model, the case vLLM answers
+    with a 400 carrying the template's message. Raised by the engines through
+    ``chat_template_rejections``; a template that cannot be compiled, or any other
+    exception, is a server problem and keeps its own type.
+    """
+
+
 @dataclass
 class SamplingParams:
     """Sampling parameters for text generation."""
