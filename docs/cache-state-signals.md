@@ -152,8 +152,12 @@ when a tier starts, so upgrades do not strand a cache each; until then it is lef
 using it. "Not used" means that nothing in the directory (`identity.json`, written at every tier start, `index.db`
 and its WAL, which every spill, hit and eviction write) is newer than the retention and that no running tier holds
 the directory: a tier keeps a shared advisory lock (`flock` on `.lock`) on its own directory until it closes, and a
-reclaim needs the exclusive lock, so a server that has run or idled for longer than the retention never loses its
-cache to another server's start. Delete directories you no longer need sooner by hand. Each spilled entry is checked
+reclaim needs the exclusive lock, so a server that has run or idled for longer than the retention does not lose its
+cache to another server's start. The reclaim renames the directory to `<digest>.reclaim-<pid>-<time>` while it holds
+the lock and deletes that (a leftover one is deleted at the next start), so a server starting on that identity at the
+same moment gets a fresh directory. On a filesystem that refuses advisory locks (some network and FUSE mounts: a warning
+names it) a tier runs without the mark, and no directory in that base directory is reclaimed, since none can be shown
+to be idle: delete stale ones by hand (as you can any directory you no longer need sooner). Each spilled entry is checked
 on promotion (manifest token count, `tokens.bin`, and each
 layer's offset against the key) and a mismatching one is quarantined and counted as a miss.
 

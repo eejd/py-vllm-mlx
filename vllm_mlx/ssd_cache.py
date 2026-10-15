@@ -49,6 +49,8 @@ _PREFIX_FILTER_TOKENS = 16
 _TOKEN_BYTES = _array.array("i").itemsize
 _LEGACY_ENTRY_RE = re.compile(r"^[0-9a-f]{64}(\.tmp)?$")
 _DIGEST_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
+# A namespace being deleted is renamed to this first (see _reclaim_stale_namespaces).
+_TOMBSTONE_RE = re.compile(r"^[0-9a-f]{32}\.reclaim-[0-9]+-[0-9]+$")
 
 
 @dataclass(frozen=True)
@@ -70,8 +72,11 @@ class SSDCacheConfig:
         spill_queue_size: Max pending spill operations before dropping.
         retention_seconds: Optional max age for cache entries (None = no expiry).
         stale_namespace_days: Sibling identity directories (other models,
-            revisions, library versions) whose ``identity.json`` is older than
-            this are deleted when a tier starts (None = never).
+            revisions, library versions) that nothing has used for this long
+            (``identity.json``, ``index.db`` and its WAL all older) and that no
+            running tier holds (an advisory lock) are deleted when a tier
+            starts (None = never). On a filesystem without advisory locks no
+            directory can be shown to be idle, so none is reclaimed.
     """
 
     cache_dir: str | None = None
@@ -1049,8 +1054,13 @@ class SSDCacheTier:
         Reclaiming a stale namespace needs the exclusive lock, so a directory
         a running server holds is never reclaimed however old its files look
         (a server can sit idle, or serve only from RAM, for longer than the
-        retention). A reclaim in progress holds the lock exclusively: the claim
-        waits for it, and starts over when the directory was deleted meanwhile.
+        retention). A reclaim moves the directory away (to a name no tier
+        uses) while it holds the lock: a claim that raced it finds the path
+        gone or a different ``.lock`` and starts over on a fresh directory.
+
+        On a filesystem that cannot lock (network or FUSE mounts: ``ENOLCK``,
+        ``ENOTSUP``) the tier runs without the mark, as builds before it did;
+        nothing can then be proved idle, so such a directory is not reclaimed.
         """
         config = self._config
         for _ in range(5):
@@ -1062,14 +1072,31 @@ class SSDCacheTier:
             try:
                 fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, config.file_permissions)
             except FileNotFoundError:
-                continue  # a reclaim removed the directory under us
+                continue  # a reclaim moved the directory away under us
+            except OSError:
+                logger.warning(
+                    "[ssd_cache] cannot create %s; running without the in-use mark",
+                    lock_path,
+                    exc_info=True,
+                )
+                return
             try:
                 fcntl.flock(fd, fcntl.LOCK_SH)
                 if os.fstat(fd).st_ino == os.stat(lock_path).st_ino:
                     self._namespace_lock_fd = fd
                     return
             except FileNotFoundError:
-                pass  # deleted by the reclaim that held the lock
+                pass  # moved away by the reclaim that held the lock
+            except OSError as exc:
+                os.close(fd)
+                logger.warning(
+                    "[ssd_cache] advisory locks are unavailable on %s (%s); running "
+                    "without the in-use mark, and stale namespaces cannot be "
+                    "reclaimed from this directory",
+                    self._base_dir,
+                    exc,
+                )
+                return
             except BaseException:
                 os.close(fd)
                 raise
@@ -1088,25 +1115,50 @@ class SSDCacheTier:
         ``--ssd-cache-dir`` is user-supplied, and any SQLite file named
         ``index.db`` starts with the same header: only a database holding the
         ``entries`` table of those builds (token_hash, tokens_blob, file_path)
-        is ours to delete. Opened read-only.
+        is ours to delete. The probe must not change what it inspects: SQLite
+        creates ``-wal`` / ``-shm`` files next to a WAL-mode database it opens,
+        even read-only. A database with no WAL is opened ``immutable``; one that
+        has a WAL (a crash left it: the table may live only there) is probed as
+        a copy in a temporary directory.
         """
         import pathlib
+        import shutil
         import sqlite3
+        import tempfile
 
+        wal = path + "-wal"
         try:
             with open(path, "rb") as f:
                 if f.read(16) != b"SQLite format 3\x00":
                     return False
-            conn = sqlite3.connect(pathlib.Path(path).as_uri() + "?mode=ro", uri=True)
-        except (OSError, sqlite3.Error):
+            has_wal = os.path.getsize(wal) > 0
+        except FileNotFoundError:
+            has_wal = False
+        except OSError:
             return False
+
+        def has_legacy_table(db_path: str, query: str) -> bool:
+            try:
+                conn = sqlite3.connect(pathlib.Path(db_path).as_uri() + query, uri=True)
+            except sqlite3.Error:
+                return False
+            try:
+                columns = {r[1] for r in conn.execute("PRAGMA table_info(entries)")}
+            except sqlite3.Error:
+                return False
+            finally:
+                conn.close()
+            return {"token_hash", "tokens_blob", "file_path"} <= columns
+
+        if not has_wal:
+            return has_legacy_table(path, "?mode=ro&immutable=1")
         try:
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
-        except sqlite3.Error:
+            with tempfile.TemporaryDirectory(prefix="ssd-probe-") as tmp:
+                shutil.copyfile(path, os.path.join(tmp, "index.db"))
+                shutil.copyfile(wal, os.path.join(tmp, "index.db-wal"))
+                return has_legacy_table(os.path.join(tmp, "index.db"), "?mode=ro")
+        except OSError:
             return False
-        finally:
-            conn.close()
-        return {"token_hash", "tokens_blob", "file_path"} <= columns
 
     def _discard_untagged_layout(self) -> None:
         """Remove entries a build that keyed on tokens alone left in the base dir.
@@ -1169,7 +1221,7 @@ class SSDCacheTier:
             )
 
     @staticmethod
-    def _namespace_last_used(path: str) -> float | None:
+    def _namespace_last_used(path: str, use_dir: bool = True) -> float | None:
         """When a namespace directory was last used (None: cannot be told).
 
         The newest of ``identity.json`` (written at each tier start),
@@ -1184,7 +1236,7 @@ class SSDCacheTier:
             except OSError:
                 continue
             newest = mtime if newest is None else max(newest, mtime)
-        if newest is None:
+        if newest is None and use_dir:
             try:
                 newest = os.stat(path).st_mtime
             except OSError:
@@ -1200,6 +1252,13 @@ class SSDCacheTier:
         like an identity digest, nothing in it (identity marker, index, WAL) has
         been written for ``stale_namespace_days``, no running tier holds it
         (``_claim_namespace``) and it is not this tier's own.
+
+        Under the exclusive lock the directory is first renamed to a tombstone
+        (``<digest>.reclaim-<pid>-<ns>``, which no tier uses), then the lock is
+        dropped and the tombstone deleted: deleting in place would remove the
+        ``.lock`` file first, and a tier starting meanwhile would create a new
+        one, lock it and settle into a directory being deleted. Tombstones an
+        interrupted reclaim left are deleted on the next start.
         """
         import shutil
         import time as _time
@@ -1208,7 +1267,11 @@ class SSDCacheTier:
         if days is None:
             return
         cutoff = _time.time() - days * 86400
-        for name in os.listdir(self._base_dir):
+        names = os.listdir(self._base_dir)
+        for name in names:
+            if _TOMBSTONE_RE.match(name):
+                shutil.rmtree(os.path.join(self._base_dir, name), ignore_errors=True)
+        for name in names:
             path = os.path.join(self._base_dir, name)
             if (
                 name == self._identity.digest
@@ -1220,34 +1283,73 @@ class SSDCacheTier:
             last_used = self._namespace_last_used(path)
             if last_used is None or last_used >= cutoff:
                 continue
-            lock_fd = None
+            tombstone = self._tombstone_if_idle(path, name, cutoff, last_used)
+            if tombstone is None:
+                continue
             try:
-                if fcntl is not None:
-                    lock_fd = os.open(
-                        os.path.join(path, self._NAMESPACE_LOCK),
-                        os.O_CREAT | os.O_RDWR,
-                        self._config.file_permissions,
-                    )
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        logger.debug(
-                            "[ssd_cache] %s is held by a running tier; not reclaimed",
-                            name,
-                        )
-                        continue
-                shutil.rmtree(path)
+                shutil.rmtree(tombstone)
+            except OSError:
+                logger.warning(
+                    "[ssd_cache] could not delete reclaimed namespace %s",
+                    tombstone,
+                    exc_info=True,
+                )
+                continue
+            logger.info("[ssd_cache] reclaimed %s: not used for %s days", name, days)
+
+    def _tombstone_if_idle(
+        self, path: str, name: str, cutoff: float, last_used: float
+    ) -> str | None:
+        """Rename ``path`` to a tombstone if no tier holds it and it is still stale.
+
+        Returns the tombstone's path, or None (nothing changed) when a tier holds
+        the directory, locks are unavailable, or it was used again meanwhile.
+        """
+        if fcntl is None:
+            return None
+        try:
+            lock_fd = os.open(
+                os.path.join(path, self._NAMESPACE_LOCK),
+                os.O_CREAT | os.O_RDWR,
+                self._config.file_permissions,
+            )
+        except OSError:
+            return None  # gone already, or not ours to open
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                logger.debug(
+                    "[ssd_cache] %s is held by a running tier; not reclaimed", name
+                )
+                return None
+            except OSError as exc:
+                logger.debug(
+                    "[ssd_cache] cannot lock %s (%s); not reclaimed", name, exc
+                )
+                return None
+            # A tier may have started, written and closed between the check and
+            # the lock: judge again now that nothing can change it. (Taking the
+            # lock created ``.lock``, which touches the directory itself: a
+            # directory with none of the marker files keeps its earlier age.)
+            fresh = self._namespace_last_used(path, use_dir=False)
+            if (fresh if fresh is not None else last_used) >= cutoff:
+                return None
+            tombstone = os.path.join(
+                self._base_dir, f"{name}.reclaim-{os.getpid()}-{time.time_ns()}"
+            )
+            try:
+                os.rename(path, tombstone)
             except OSError:
                 logger.warning(
                     "[ssd_cache] could not reclaim stale namespace %s",
                     path,
                     exc_info=True,
                 )
-                continue
-            finally:
-                if lock_fd is not None:
-                    os.close(lock_fd)
-            logger.info("[ssd_cache] reclaimed %s: not used for %s days", name, days)
+                return None
+            return tombstone
+        finally:
+            os.close(lock_fd)  # a claimer waiting on the old inode starts over
 
     def _write_identity_file(self) -> None:
         """Record what this directory's entries are valid for (for operators)."""

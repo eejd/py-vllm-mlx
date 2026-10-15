@@ -1834,6 +1834,63 @@ class TestIdentityNamespacing:
         finally:
             tier.close()
 
+    @staticmethod
+    def _listing(base):
+        return sorted(os.listdir(base))
+
+    def test_probing_a_foreign_wal_index_db_adds_no_files_beside_it(self, tmp_path):
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_path / "index.db")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.close()
+        assert self._listing(tmp_path) == ["index.db"]
+        before = self._listing(tmp_path)
+        assert SSDCacheTier._is_legacy_index(str(tmp_path / "index.db")) is False
+        assert self._listing(tmp_path) == before
+
+    def test_a_legacy_index_whose_table_is_only_in_the_wal_is_still_recognised(
+        self, tmp_path
+    ):
+        """A crash leaves the WAL; the schema may exist nowhere else."""
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_path / "index.db")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute(
+            "CREATE TABLE entries (token_hash TEXT PRIMARY KEY, tokens_blob BLOB, "
+            "num_tokens INTEGER, file_path TEXT, memory_bytes INTEGER)"
+        )
+        conn.commit()  # the connection stays open: the table lives in the WAL
+        try:
+            assert os.path.getsize(tmp_path / "index.db-wal") > 0
+            assert SSDCacheTier._is_legacy_index(str(tmp_path / "index.db")) is True
+        finally:
+            conn.close()
+
+    def test_a_foreign_wal_index_db_with_a_live_wal_is_left_as_it_was(self, tmp_path):
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_path / "index.db")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.commit()
+        before = self._listing(tmp_path)
+        sizes = {n: os.path.getsize(tmp_path / n) for n in before}
+        try:
+            tier = _tier(tmp_path)
+            tier.close()
+            assert (tmp_path / "index.db").exists()
+            for name in before:
+                assert os.path.getsize(tmp_path / name) == sizes[name], name
+            assert {"index.db", "index.db-wal"} <= set(self._listing(tmp_path))
+        finally:
+            conn.close()
+
     def test_an_index_db_with_an_entries_table_of_another_shape_is_left_alone(
         self, tmp_path
     ):
@@ -2022,6 +2079,197 @@ class TestIdentityNamespacing:
             assert os.path.isdir(tier._data_dir)
             _spill(tier, tuple(range(1, 17)))
             assert tier.lookup_ssd(tuple(range(1, 17))) is not None
+        finally:
+            tier.close()
+
+    @staticmethod
+    def _backdate(
+        tier_dir,
+        days=31,
+        names=("identity.json", "index.db", "index.db-wal", "index.db-shm"),
+    ):
+        long_ago = time.time() - days * 86400
+        for name in names:
+            path = os.path.join(tier_dir, name)
+            if os.path.exists(path):
+                os.utime(path, (long_ago, long_ago))
+
+    def test_a_tier_starting_while_its_stale_directory_is_being_deleted_keeps_its_own(
+        self, tmp_path, monkeypatch
+    ):
+        """The reclaim holds the exclusive lock and then deletes the directory; the
+        ``.lock`` file goes first, so a tier of that identity starting meanwhile
+        used to create a new one, lock it and settle in a directory being deleted."""
+        import shutil
+
+        other = CacheIdentity(model="model-b", window="window-a", kv="kv-a")
+        old = _tier(tmp_path)
+        old.close()
+        self._backdate(old.namespace_dir)
+        real_rmtree = shutil.rmtree
+        started = {}
+
+        def rmtree_with_a_start_in_the_middle(path, *args, **kwargs):
+            lock = os.path.join(path, ".lock")
+            if os.path.exists(lock):
+                os.unlink(lock)  # what rmtree does first among the files
+            if "tier" not in started:
+                started["tier"] = None
+                started["tier"] = _tier(  # same identity as the stale one
+                    tmp_path, stale_namespace_days=None
+                )
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", rmtree_with_a_start_in_the_middle)
+        reclaiming = _tier(tmp_path, identity=other, stale_namespace_days=30)
+        monkeypatch.undo()
+        mid = started["tier"]
+        try:
+            assert mid.namespace_dir == old.namespace_dir
+            assert os.path.isfile(os.path.join(mid.namespace_dir, "index.db"))
+            _spill(mid, tuple(range(1, 17)))
+            assert mid.lookup_ssd(tuple(range(1, 17))) is not None
+            assert not [n for n in os.listdir(tmp_path) if ".reclaim-" in n]
+        finally:
+            mid.close()
+            reclaiming.close()
+
+    def test_a_claim_starts_over_when_the_directory_is_removed_under_it(
+        self, tmp_path, monkeypatch
+    ):
+        import shutil
+
+        real_open = os.open
+        calls = []
+
+        def open_after_a_reclaim(path, *args, **kwargs):
+            if str(path).endswith(".lock") and not calls:
+                calls.append(path)
+                shutil.rmtree(
+                    os.path.dirname(path)
+                )  # moved away between mkdir and open
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", open_after_a_reclaim)
+        tier = _tier(tmp_path)
+        monkeypatch.undo()
+        try:
+            assert calls and os.path.isdir(tier._data_dir)
+            _spill(tier, tuple(range(1, 17)))
+        finally:
+            tier.close()
+
+    def test_a_claim_that_waited_on_a_replaced_lock_file_holds_the_new_one(
+        self, tmp_path
+    ):
+        import fcntl
+        import threading
+
+        ns = self._stale_namespace(tmp_path, 45, IDENT.digest)
+        lock_path = ns / ".lock"
+        old = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(old, fcntl.LOCK_EX)
+        result = {}
+        thread = threading.Thread(target=lambda: result.update(tier=_tier(tmp_path)))
+        thread.start()
+        time.sleep(0.3)
+        assert thread.is_alive()
+        os.unlink(lock_path)  # the directory stays; its lock file is replaced
+        lock_path.write_text("")
+        os.close(old)
+        thread.join(timeout=10)
+        tier = result["tier"]
+        try:
+            assert (
+                os.fstat(tier._namespace_lock_fd).st_ino == os.stat(lock_path).st_ino
+            ), "the tier holds a lock nobody else can see"
+        finally:
+            tier.close()
+
+    def test_advisory_locks_that_cannot_be_taken_do_not_stop_a_tier_and_nothing_is_reclaimed(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Network and FUSE mounts can refuse flock (ENOLCK / ENOTSUP)."""
+        import errno
+        import fcntl
+
+        stale = self._stale_namespace(tmp_path, 90, "5" * 32)
+
+        def refuse(fd, operation):
+            raise OSError(errno.ENOLCK, "No locks available")
+
+        monkeypatch.setattr(fcntl, "flock", refuse)
+        with caplog.at_level("DEBUG", logger="vllm_mlx.ssd_cache"):
+            tier = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert tier._namespace_lock_fd is None
+            assert stale.exists(), "idleness cannot be shown without locks"
+            assert "advisory locks are unavailable" in caplog.text
+            _spill(tier, tuple(range(1, 17)))
+            assert tier.lookup_ssd(tuple(range(1, 17))) is not None
+        finally:
+            tier.close()
+
+    def test_a_namespace_used_between_the_check_and_the_lock_is_kept(
+        self, tmp_path, monkeypatch
+    ):
+        import fcntl
+
+        stale = self._stale_namespace(tmp_path, 90, "6" * 32)
+        real_flock = fcntl.flock
+
+        def a_tier_started_and_closed_first(fd, operation):
+            if operation & fcntl.LOCK_EX:
+                os.utime(stale / "identity.json")  # now
+            return real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", a_tier_started_and_closed_first)
+        tier = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert stale.exists()
+        finally:
+            tier.close()
+
+    def test_only_the_wal_is_recent(self, tmp_path):
+        """Spills and hits write the WAL first; the main file can stay old."""
+        ns = self._stale_namespace(tmp_path, 90, "7" * 32)
+        (ns / "index.db").write_text("x")
+        (ns / "index.db-wal").write_text("x")
+        long_ago = time.time() - 90 * 86400
+        os.utime(ns / "index.db", (long_ago, long_ago))
+        tier = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert ns.exists()
+        finally:
+            tier.close()
+
+    def test_a_failed_start_releases_the_namespace(self, tmp_path, monkeypatch):
+        import fcntl
+
+        def broken(cache_dir):
+            raise RuntimeError("index cannot be opened")
+
+        monkeypatch.setattr(ssd_cache_module, "SSDIndex", broken)
+        with pytest.raises(RuntimeError, match="index cannot be opened"):
+            SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path), identity=IDENT))
+        monkeypatch.undo()
+        fd = os.open(os.path.join(tmp_path, IDENT.digest, ".lock"), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if still held
+        finally:
+            os.close(fd)
+
+    def test_tombstones_of_an_interrupted_reclaim_are_deleted_at_the_next_start(
+        self, tmp_path
+    ):
+        leftover = tmp_path / ("8" * 32 + ".reclaim-123-456")
+        (leftover / "data" / ("ab" * 32)).mkdir(parents=True)
+        mine = tmp_path / ("8" * 32 + ".reclaim-notmine")  # not our naming: left alone
+        mine.mkdir()
+        tier = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert not leftover.exists()
+            assert mine.exists()
         finally:
             tier.close()
 
