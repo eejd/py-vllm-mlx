@@ -944,6 +944,7 @@ class Scheduler:
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
+        self._paged_skip_logged = False
         self._ssd_tier: Optional[SSDCacheTier] = None
 
         if self.config.enable_prefix_cache:
@@ -1647,10 +1648,13 @@ class Scheduler:
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
-            block_table, remaining = self.block_aware_cache.fetch_cache(
-                request.request_id,
-                request.prompt_token_ids,
-            )
+            if self._paged_cache_bypassed(request):
+                block_table, remaining = None, request.prompt_token_ids
+            else:
+                block_table, remaining = self.block_aware_cache.fetch_cache(
+                    request.request_id,
+                    request.prompt_token_ids,
+                )
             if block_table and block_table.num_tokens > 0:
                 request.cache_hit_type = "hit"
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -1668,6 +1672,7 @@ class Scheduler:
                     )
                 else:
                     # Reconstruction failed, treat as cache miss
+                    self._release_paged_request(request.request_id)
                     request.cache_hit_type = "miss"
                     request.remaining_tokens = request.prompt_token_ids
                     logger.debug(
@@ -1820,6 +1825,8 @@ class Scheduler:
             # Release cache references so Metal buffers can be freed
             request.prompt_cache = None
             request._extracted_cache = None
+            request.block_table = None
+        self._release_paged_request(request_id)
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
 
@@ -2493,6 +2500,10 @@ class Scheduler:
                         else:
                             raw_cache = response.prompt_cache
 
+                        if raw_cache and self._prompt_output_entry_is_useless(
+                            raw_cache
+                        ):
+                            self._note_paged_cache_skips_untrimmable(raw_cache)
                         if raw_cache and not self._prompt_output_entry_is_useless(
                             raw_cache
                         ):
@@ -2524,6 +2535,53 @@ class Scheduler:
 
         return outputs, finished_ids
 
+    def _note_paged_cache_skips_untrimmable(self, raw_cache: Any) -> None:
+        """Say once that the paged cache stores nothing for this model.
+
+        The finished request's cache is only kept when it can be trimmed
+        (``_prompt_output_entry_is_useless``). Hybrid/recurrent layers
+        (ArraysCache: Qwen3-Next/Qwen3.5, Nemotron-H) and full sliding windows
+        cannot, so with ``--use-paged-cache`` every request of such a model is
+        served cold and nothing is ever stored or hit; the hit counters stay
+        at zero without any other sign.
+        """
+        if self.block_aware_cache is None or self._paged_skip_logged:
+            return
+        self._paged_skip_logged = True
+        kinds = sorted({type(layer).__name__ for layer in raw_cache})
+        logger.info(
+            "Paged prefix cache: this model's cache (%s) cannot be trimmed, so "
+            "requests are not stored and never hit it",
+            ", ".join(kinds),
+        )
+
+    def _release_paged_request(self, request_id: str) -> None:
+        """Drop a request's references on its paged-cache blocks.
+
+        A block table is only needed while the request is being served (the
+        reconstructed KV does not depend on it afterwards); holding it for good
+        pins its blocks, so the pool fills up with unevictable blocks and stops
+        caching, and the full-length KV kept for the request stays in memory.
+        """
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.release_cache(request_id)
+
+    @staticmethod
+    def _paged_cache_bypassed(request: Request) -> bool:
+        """Requests whose KV depends on more than their token ids.
+
+        Blocks are keyed by tokens (and per-request extra keys). Media
+        placeholders are the same tokens whatever the image, so a block cached
+        behind one image would be served behind another: such a request
+        neither reads nor writes the paged cache.
+        """
+        return bool(
+            request.is_multimodal
+            or request.images
+            or request.videos
+            or request.pixel_values is not None
+        )
+
     def _cleanup_finished(self, finished_ids: Set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
         for request_id in finished_ids:
@@ -2535,7 +2593,8 @@ class Scheduler:
                     # Store in paged cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     if (
-                        hasattr(request, "_extracted_cache")
+                        not self._paged_cache_bypassed(request)
+                        and hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
                     ):
                         try:
@@ -2555,9 +2614,10 @@ class Scheduler:
                             logger.debug(
                                 f"Failed to store paged cache for {request_id}: {e}"
                             )
-                    # NOTE: Do NOT call release_cache here - blocks should persist
-                    # for future requests to share. The LRU eviction will clean up
-                    # unused blocks when under memory pressure.
+                    # The request's block references are dropped below, once
+                    # per finished request: unreferenced blocks stay cached
+                    # (hash and tensors) until the pool recycles them, least
+                    # recently used first.
 
                 elif self.memory_aware_cache is not None:
                     # Keep mid-prefill entry as prefix cache for future
@@ -2660,6 +2720,8 @@ class Scheduler:
             if request is not None:
                 request.prompt_cache = None
                 request._extracted_cache = None
+                request.block_table = None
+            self._release_paged_request(request_id)
 
             # Remove from running
             if request_id in self.running:
@@ -2729,6 +2791,7 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is not None:
                 request.set_finished(RequestStatus.FINISHED_ABORTED)
+            self._release_paged_request(request_id)
             aborted_ids.add(request_id)
             self.finished_req_ids.add(request_id)
         self.running.clear()
