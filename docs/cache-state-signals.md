@@ -109,20 +109,50 @@ depend on them.
 | `counters` | `hits`, `misses`, `evictions`, `tokens_saved`, `entry_count`, `current_memory_mb`, `max_memory_mb`; or `unreported` with a reason. Monotonic until `DELETE /v1/cache` or a restart |
 | `persistence` | the existing block (`policy`, `dirs`) plus `applies` (false for engines without persistence hooks) and `not_applied_reason`. In registry mode the `dirs` block is server-wide (one directory per model) and `applies` is set per model |
 
-## Fingerprint of a persisted cache
+## Identity of a persisted or spilled cache entry
 
-`load_from_disk` refuses a cache whose version, `cache_format` or model fingerprint differs. The
-fingerprint is now also a function of the **weight quantization actually present in the loaded model**
-(count of quantized layers by kind, bits, group size and mode; a layer counts as quantized when it has integer
-`bits` and `group_size`, which includes MoE expert layers such as `QuantizedSwitchLinear`), so a 4-bit checkpoint and a 6-bit
-checkpoint of one architecture no longer share a cache. Before this change the fingerprint hashed only
-architecture fields (layers, hidden size, heads, vocab, ...) although its docstring claimed to reject a
-different quantization. **Existing persisted caches are refused once and rebuilt**; the refusal is
-logged as a fingerprint mismatch.
+An entry that outlives the process (the persisted prefix cache, the SSD tier) is keyed by token ids, but
+its tensors depend on more than that. Each such store carries one **cache identity** and refuses entries
+written under another (`vllm_mlx/cache_identity.py`):
 
-KV-cache quantization needs no fingerprint field: entries are dequantized when saved. The reverse is
-not true: before eejd/py-vllm-mlx#40 entries read from disk were inserted unquantized even when KV
-quantization is on; they are now quantized on load under the same rule as fresh entries.
+| Part | What it covers | Rule |
+|---|---|---|
+| `model` | every field of the model config (rope theta and scaling, sliding window, head layout, norm epsilon, tied embeddings, ...), the model class, the weight quantization present in the loaded model (count of quantized layers by kind, bits, group size and mode, MoE experts included), a **content digest of every weight** (names, shapes, dtypes and two exact wrapping integer sums per tensor, computed on the device in one pass over the weights; about 0.02 s per GB, so well under a second for a 30B 4-bit model), and the mlx / mlx-lm (mlx-vlm for a VLM text model) versions | must match |
+| `window` | `--max-kv-size` (a bounded run keeps rotating layers, an unbounded one does not) | must match |
+| `kv` | whether KV is quantized while held, and its bits, group size and minimum length | entries saved **while held quantized** need the same setting; entries saved exactly are valid under any (they are quantized on the way in like a fresh one) |
+
+Weights are identified by content, not by path or modification time, because a different fine-tune of one
+architecture and a new revision downloaded over the same path have the same file names and tensor shapes.
+The digest is a change detector, not a cryptographic hash. Not part of the identity: the tokenizer and the chat
+template (keys are token ids; the KV of a token sequence does not depend on how text maps to them) and the
+serving name.
+
+`load_from_disk` refuses a cache whose version, `cache_format` or identity differs, naming which part
+(`model` or `max-kv-size`), and skips entries saved quantized under another KV-quantization setting. A
+persisted entry is also checked against itself before it is used: the token count and a digest of the tokens
+are written into the entry's KV file and compared with the tokens file, and every layer must hold exactly the
+key's length, so a save that was interrupted or two servers writing one directory cannot pair KV with tokens
+it was not computed for. A save drops the old `index.json` before writing entry files and publishes the new
+one atomically. **Existing persisted caches (version 4 and earlier) are refused once and rebuilt.**
+
+The SSD tier keeps its files in `<--ssd-cache-dir>/<identity digest>/` (`identity.json` there says what the
+digest stands for), so servers, models and settings sharing one directory never index or promote each
+other's entries; the whole identity (all three parts) names the directory, because a spilled entry is not
+tracked per KV setting. `--ssd-cache-max-gb` applies to each such subdirectory. The `index.db` and `data/` an
+older build left directly in the directory recorded no model and are removed. Subdirectories of other models
+and revisions are left alone (another server may be using them) and are not cleaned up: delete the ones you
+no longer need. Each spilled entry is checked on promotion (manifest token count, `tokens.bin`, and each
+layer's offset against the key) and a mismatching one is quarantined and counted as a miss.
+
+`DELETE /v1/cache`, `DELETE /v1/cache/prefix` and cache-error recovery empty the SSD tier together with the
+RAM cache: spills still queued, a write in flight and a promotion in flight when the flush lands are dropped,
+so nothing written before a flush can come back after it. The persisted cache on disk is not touched by a flush
+(only by `--prefix-cache-reset`).
+
+KV-cache quantization and the persisted cache: entries are saved dequantized, and read back they are quantized
+on load under the same rule as fresh entries. `mx.quantize` is not idempotent (re-quantizing a dequantized
+tensor moved 4-bit values by up to about one quantization step in a measurement), so an entry that was held
+quantized comes back rounded a second time; that is why such entries are only loaded under the same setting.
 
 ## Open items (filed, not fixed here)
 

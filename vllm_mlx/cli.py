@@ -1296,13 +1296,22 @@ Examples:
         "--ssd-cache-dir",
         type=str,
         default=None,
-        help="Directory for SSD KV cache tier (default: disabled)",
+        help=(
+            "Directory for the SSD KV cache tier (default: disabled). Entries are "
+            "kept in a subdirectory named for the model's weights, config, "
+            "mlx/mlx-lm versions, KV quantization and --max-kv-size, so one "
+            "directory can be shared and an entry is only ever reused by the "
+            "model and settings that computed it. DELETE /v1/cache empties it."
+        ),
     )
     serve_parser.add_argument(
         "--ssd-cache-max-gb",
         type=float,
         default=10.0,
-        help="Maximum SSD cache size in GB (default: 10.0)",
+        help=(
+            "Maximum SSD cache size in GB for each model/settings subdirectory "
+            "(default: 10.0)"
+        ),
     )
     # Prompt warm-up options
     serve_parser.add_argument(

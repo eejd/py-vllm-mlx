@@ -3,7 +3,10 @@
 
 import pytest
 
+from vllm_mlx.cache_identity import CacheIdentity
 from vllm_mlx.ssd_cache import SSDCacheConfig, SSDCacheStats
+
+IDENT = CacheIdentity(model="model-a", window="window-a", kv="kv-a")
 
 
 class TestSSDCacheConfig:
@@ -21,6 +24,7 @@ class TestSSDCacheConfig:
 
     def test_custom_config(self):
         config = SSDCacheConfig(
+            identity=IDENT,
             cache_dir="/tmp/test-ssd-cache",
             max_size_gb=5.0,
             max_entries=500,
@@ -86,7 +90,9 @@ class TestSSDCacheStats:
         assert d["avg_reload_latency_ms"] == 0.0
 
 
+import json
 import os
+import threading
 
 from vllm_mlx import ssd_cache as ssd_cache_module
 from vllm_mlx.ssd_cache import SSDIndex
@@ -492,21 +498,25 @@ class TestSSDCacheTierCore:
 
     def test_init_creates_directory(self, tmp_path):
         cache_dir = str(tmp_path / "ssd_tier_test")
-        config = SSDCacheConfig(cache_dir=cache_dir)
+        config = SSDCacheConfig(identity=IDENT, cache_dir=cache_dir)
         tier = SSDCacheTier(config)
         try:
+            ns = os.path.join(cache_dir, IDENT.digest)
+            assert tier.namespace_dir == ns
             assert os.path.isdir(cache_dir)
-            assert os.path.exists(os.path.join(cache_dir, "data"))
-            assert os.path.exists(os.path.join(cache_dir, "index.db"))
+            assert os.path.exists(os.path.join(ns, "data"))
+            assert os.path.exists(os.path.join(ns, "index.db"))
         finally:
             tier.close()
 
     def test_dir_permissions(self, tmp_path):
         cache_dir = str(tmp_path / "ssd_tier_perms")
-        config = SSDCacheConfig(cache_dir=cache_dir, dir_permissions=0o700)
+        config = SSDCacheConfig(
+            identity=IDENT, cache_dir=cache_dir, dir_permissions=0o700
+        )
         tier = SSDCacheTier(config)
         try:
-            stat = os.stat(os.path.join(cache_dir, "data"))
+            stat = os.stat(os.path.join(tier.namespace_dir, "data"))
             # Check owner permissions (at least rwx for owner)
             assert stat.st_mode & 0o700 == 0o700
         finally:
@@ -525,7 +535,7 @@ class TestSSDCacheTierCore:
         assert h1 != h2
 
     def test_stats_initial(self, tmp_path):
-        config = SSDCacheConfig(cache_dir=str(tmp_path / "stats_test"))
+        config = SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "stats_test"))
         tier = SSDCacheTier(config)
         try:
             stats = tier.get_stats()
@@ -536,7 +546,7 @@ class TestSSDCacheTierCore:
 
     def test_remove_deletes_the_index_and_entry_directory(self, tmp_path):
         tokens = (1, 2, 3)
-        config = SSDCacheConfig(cache_dir=str(tmp_path / "remove_test"))
+        config = SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "remove_test"))
         tier = SSDCacheTier(config)
         entry_hash = tier._entry_hash(tokens)
         entry_dir = os.path.join(tier._data_dir, entry_hash)
@@ -552,7 +562,7 @@ class TestSSDCacheTierCore:
             tier.close()
 
     def test_close_idempotent(self, tmp_path):
-        config = SSDCacheConfig(cache_dir=str(tmp_path / "close_test"))
+        config = SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "close_test"))
         tier = SSDCacheTier(config)
         tier.close()
         tier.close()  # Should not raise
@@ -574,7 +584,7 @@ class TestSSDCacheTierCore:
 
         monkeypatch.setattr(ssd_cache_module.queue, "Queue", fail_queue)
 
-        config = SSDCacheConfig(cache_dir=str(tmp_path / "init_fail"))
+        config = SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "init_fail"))
         with pytest.raises(RuntimeError, match="queue setup failed"):
             SSDCacheTier(config)
 
@@ -594,7 +604,9 @@ class TestSSDCacheTierCore:
 
         monkeypatch.setattr(ssd_cache_module.queue, "Queue", fail_queue)
 
-        config = SSDCacheConfig(cache_dir=str(tmp_path / "init_close_fail"))
+        config = SSDCacheConfig(
+            identity=IDENT, cache_dir=str(tmp_path / "init_close_fail")
+        )
         with pytest.raises(RuntimeError, match="queue setup failed"):
             SSDCacheTier(config)
 
@@ -607,7 +619,7 @@ class TestAsyncSpillWriter:
 
     @pytest.fixture
     def tier_with_writer(self, tmp_path):
-        config = SSDCacheConfig(cache_dir=str(tmp_path / "writer_test"))
+        config = SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "writer_test"))
         tier = SSDCacheTier(config)
         tier.start_writer()
         yield tier
@@ -661,6 +673,7 @@ class TestAsyncSpillWriter:
     def test_spill_queue_full_drops(self, tmp_path):
         """When queue is full, new spills are dropped (not blocking)."""
         config = SSDCacheConfig(
+            identity=IDENT,
             cache_dir=str(tmp_path / "queue_full_test"),
             spill_queue_size=2,
         )
@@ -703,7 +716,9 @@ class TestSpillPath:
         config = MemoryCacheConfig(max_memory_mb=1, max_entries=3, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
-        ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "spill_test"))
+        ssd_config = SSDCacheConfig(
+            identity=IDENT, cache_dir=str(tmp_path / "spill_test")
+        )
         ssd_tier = SSDCacheTier(ssd_config)
         ssd_tier.start_writer()
         cache.set_ssd_tier(ssd_tier)
@@ -771,7 +786,9 @@ class TestSpillPath:
                 )
                 self.offset = 1
 
-        ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "snapshot_test"))
+        ssd_config = SSDCacheConfig(
+            identity=IDENT, cache_dir=str(tmp_path / "snapshot_test")
+        )
         ssd_tier = SSDCacheTier(ssd_config)
         ssd_tier.start_writer()
 
@@ -803,14 +820,14 @@ class TestAsyncFetchPath:
     @pytest.fixture
     def populated_tier(self, tmp_path):
         """Create an SSD tier with one pre-written entry."""
-        config = SSDCacheConfig(cache_dir=str(tmp_path / "fetch_test"))
+        config = SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "fetch_test"))
         tier = SSDCacheTier(config)
         tier.start_writer()
 
         tokens = (1, 2, 3, 4, 5)
-        keys = MockMLXArray(np.random.randn(1, 8, 16, 64).astype(np.float16))
-        values = MockMLXArray(np.random.randn(1, 8, 16, 64).astype(np.float16))
-        layer = MockKVCacheLayer(keys=keys, values=values, offset=16)
+        keys = MockMLXArray(np.random.randn(1, 8, 5, 64).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 8, 5, 64).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=5)
 
         tier.enqueue_spill(tokens, [layer], memory_bytes=2048)
 
@@ -916,6 +933,7 @@ class TestCapacityManagement:
     def small_tier(self, tmp_path):
         """SSD tier with very small capacity for testing eviction."""
         config = SSDCacheConfig(
+            identity=IDENT,
             cache_dir=str(tmp_path / "capacity_test"),
             max_size_gb=0.0001,  # ~100KB
             max_entries=3,
@@ -955,15 +973,15 @@ class TestCapacityManagement:
     def test_startup_reconciliation(self, tmp_path):
         """On startup, index is reconciled with files on disk."""
         cache_dir = str(tmp_path / "reconcile_test")
-        config = SSDCacheConfig(cache_dir=cache_dir)
+        config = SSDCacheConfig(identity=IDENT, cache_dir=cache_dir)
         tier = SSDCacheTier(config)
         tier.start_writer()
 
         # Write an entry
         tokens = (1, 2, 3)
-        keys = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
-        values = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
-        layer = MockKVCacheLayer(keys=keys, values=values, offset=8)
+        keys = MockMLXArray(np.random.randn(1, 4, 3, 32).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 4, 3, 32).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=3)
         tier.enqueue_spill(tokens, [layer], memory_bytes=1024)
 
         deadline = time.monotonic() + 5.0
@@ -976,7 +994,7 @@ class TestCapacityManagement:
 
         # Delete the data file but leave the index entry
         entry_hash = SSDCacheTier._entry_hash(tokens)
-        entry_dir = os.path.join(cache_dir, "data", entry_hash)
+        entry_dir = os.path.join(tier.namespace_dir, "data", entry_hash)
         import shutil
 
         shutil.rmtree(entry_dir)
@@ -1019,7 +1037,9 @@ class TestMemoryCacheSSDCheck:
         config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
-        ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "check_ssd_test"))
+        ssd_config = SSDCacheConfig(
+            identity=IDENT, cache_dir=str(tmp_path / "check_ssd_test")
+        )
         ssd_tier = SSDCacheTier(ssd_config)
         ssd_tier.start_writer()
         cache.set_ssd_tier(ssd_tier)
@@ -1085,6 +1105,7 @@ class TestIntegrationSpillAndFetch:
         ram_cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(
+            identity=IDENT,
             cache_dir=str(tmp_path / "integration_test"),
             max_size_gb=1.0,
         )
@@ -1095,7 +1116,7 @@ class TestIntegrationSpillAndFetch:
         yield ram_cache, ssd_tier
         ssd_tier.close()
 
-    def _make_kv_layer(self, offset=16):
+    def _make_kv_layer(self, offset=10):
         keys = MockMLXArray(np.random.randn(1, 8, offset, 64).astype(np.float16))
         values = MockMLXArray(np.random.randn(1, 8, offset, 64).astype(np.float16))
         return MockKVCacheLayer(keys=keys, values=values, offset=offset)
@@ -1147,7 +1168,7 @@ class TestIntegrationSpillAndFetch:
 
     def test_hybrid_cache_round_trip(self, tmp_path):
         """ArraysCache layers survive SSD round-trip."""
-        config = SSDCacheConfig(cache_dir=str(tmp_path / "hybrid_test"))
+        config = SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "hybrid_test"))
         tier = SSDCacheTier(config)
         tier.start_writer()
 
@@ -1203,6 +1224,7 @@ class TestIntegrationSpillAndFetch:
     def test_capacity_eviction_end_to_end(self, tmp_path):
         """Entries beyond max_entries are evicted from SSD."""
         config = SSDCacheConfig(
+            identity=IDENT,
             cache_dir=str(tmp_path / "cap_e2e"),
             max_entries=2,
         )
@@ -1495,15 +1517,16 @@ class TestSchemaVersionInvalidation:
         from vllm_mlx.ssd_cache import SSDCacheTier
 
         cache_dir = str(tmp_path / "cache")
-        _, entry_dir = self._seed(cache_dir, SSDIndex._SCHEMA_VERSION - 1)
+        namespace = os.path.join(cache_dir, IDENT.digest)
+        _, entry_dir = self._seed(namespace, SSDIndex._SCHEMA_VERSION - 1)
         assert os.path.isdir(entry_dir)
 
-        tier = SSDCacheTier(SSDCacheConfig(cache_dir=cache_dir))
+        tier = SSDCacheTier(SSDCacheConfig(identity=IDENT, cache_dir=cache_dir))
         try:
             assert not os.path.exists(
                 entry_dir
             ), "stale spill files must not survive a schema bump"
-            assert os.path.isdir(os.path.join(cache_dir, "data"))
+            assert os.path.isdir(os.path.join(namespace, "data"))
         finally:
             tier.close()
 
@@ -1604,3 +1627,356 @@ class TestUnsupportedSubCaches:
             snap = ser.snapshot_layer(self._cache_list(KVCache()))
             ser.serialize_layer(snap, 0, path)
         assert not os.path.exists(path)
+
+
+# --- identity namespacing, flush and read-time validation ---------------------------------
+
+
+def _kv_layer(n, marker=1.0):
+    """A KV layer whose contents say which tokens it was computed for."""
+    keys = MockMLXArray(np.full((1, 2, n, 8), marker, dtype=np.float16))
+    values = MockMLXArray(np.full((1, 2, n, 8), marker + 0.5, dtype=np.float16))
+    return MockKVCacheLayer(keys=keys, values=values, offset=n)
+
+
+def _spill(tier, tokens, marker=1.0):
+    before = tier._stats.spill_count
+    assert tier.enqueue_spill(tuple(tokens), [_kv_layer(len(tokens), marker)], 1024)
+    deadline = time.monotonic() + 5.0
+    while tier._stats.spill_count == before and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert tier._stats.spill_count == before + 1
+
+
+def _tier(base, identity=IDENT, **kw):
+    tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(base), identity=identity, **kw))
+    tier.start_writer()
+    return tier
+
+
+class TestIdentityNamespacing:
+    """One --ssd-cache-dir shared by different models or configurations."""
+
+    def test_another_identity_never_sees_the_entries(self, tmp_path):
+        other = CacheIdentity(model="model-b", window="window-a", kv="kv-a")
+        tokens = tuple(range(1, 17))
+        a = _tier(tmp_path)
+        _spill(a, tokens, marker=3.0)
+        a.close()
+
+        b = _tier(tmp_path, identity=other)
+        try:
+            assert b.reconcile() == 0
+            assert b.lookup_ssd(tokens) is None
+            assert b.lookup_ssd_prefix(tokens + (99,)) is None
+            assert b.namespace_dir != a.namespace_dir
+        finally:
+            b.close()
+
+        # ... and reconcile() on the other tier did not sweep a's files
+        a2 = _tier(tmp_path)
+        try:
+            assert a2.lookup_ssd(tokens) is not None
+            assert a2._read_entry(tokens, a2.lookup_ssd(tokens)["file_path"])
+        finally:
+            a2.close()
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            CacheIdentity(model="model-b", window="window-a", kv="kv-a"),
+            CacheIdentity(model="model-a", window="window-b", kv="kv-a"),
+            CacheIdentity(model="model-a", window="window-a", kv="kv-b"),
+        ],
+        ids=["model", "max-kv-size", "kv-quantization"],
+    )
+    def test_each_identity_component_selects_the_namespace(self, tmp_path, other):
+        tokens = tuple(range(1, 17))
+        a = _tier(tmp_path)
+        _spill(a, tokens)
+        a.close()
+        b = _tier(tmp_path, identity=other)
+        try:
+            assert b.lookup_ssd(tokens) is None
+        finally:
+            b.close()
+
+    def test_entries_of_the_untagged_layout_are_discarded(self, tmp_path):
+        """A build that keyed on tokens alone left index.db and data/ in the base
+        dir, with nothing saying which model wrote them."""
+        data = tmp_path / "data" / ("ab" * 32)
+        data.mkdir(parents=True)
+        (data / "manifest.json").write_text("{}")
+        (tmp_path / "index.db").write_bytes(b"not a database anymore")
+        tier = _tier(tmp_path)
+        try:
+            assert not (tmp_path / "index.db").exists()
+            assert not (tmp_path / "data").exists()
+            assert tier.get_stats()["spill_count"] == 0
+        finally:
+            tier.close()
+
+    def test_tier_requires_an_identity(self, tmp_path):
+        with pytest.raises(ValueError, match="identity"):
+            SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path)))
+
+
+class TestClear:
+    """A cache flush must flush the cold tier too."""
+
+    def test_clear_removes_every_entry_from_index_and_disk(self, tmp_path):
+        tier = _tier(tmp_path)
+        try:
+            _spill(tier, tuple(range(1, 17)))
+            _spill(tier, tuple(range(100, 116)))
+            assert tier.clear() == 2
+            assert tier.lookup_ssd(tuple(range(1, 17))) is None
+            assert tier.lookup_ssd_prefix(tuple(range(1, 20))) is None
+            assert os.listdir(os.path.join(tier.namespace_dir, "data")) == []
+            # and the tier keeps working afterwards
+            _spill(tier, tuple(range(1, 17)))
+            assert tier.lookup_ssd(tuple(range(1, 17))) is not None
+        finally:
+            tier.close()
+
+    def test_spills_queued_before_a_clear_are_dropped(self, tmp_path):
+        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path), identity=IDENT))
+        try:
+            # writer not started: the spill is queued, not written
+            assert tier.enqueue_spill(tuple(range(16)), [_kv_layer(16)], 1024)
+            tier.clear()
+            tier.start_writer()
+            tier.enqueue_spill(tuple(range(100, 116)), [_kv_layer(16)], 1024)
+            deadline = time.monotonic() + 5.0
+            while tier._stats.spill_count < 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert tier.lookup_ssd(tuple(range(16))) is None, "pre-flush spill survived"
+            assert tier.lookup_ssd(tuple(range(100, 116))) is not None
+        finally:
+            tier.close()
+
+    def test_a_spill_the_writer_already_took_off_the_queue_is_dropped_too(
+        self, tmp_path
+    ):
+        """The flush lands after the writer dequeued the entry and before it wrote it."""
+        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path), identity=IDENT))
+        flushed = threading.Event()
+        real_get = tier._spill_queue.get
+
+        def get_then_flush(*args, **kwargs):
+            item = real_get(*args, **kwargs)
+            if item is not None and not flushed.is_set():
+                tier.clear()
+                flushed.set()
+            return item
+
+        tier._spill_queue.get = get_then_flush
+        try:
+            tier.start_writer()
+            assert tier.enqueue_spill(tuple(range(16)), [_kv_layer(16)], 1024)
+            assert flushed.wait(timeout=5.0)
+            time.sleep(0.2)  # the writer would have written it by now
+            assert tier.get_stats()["spill_count"] == 0
+            assert tier.lookup_ssd(tuple(range(16))) is None
+        finally:
+            tier.close()
+
+    def test_a_write_in_flight_during_clear_is_not_published(self, tmp_path):
+        tier = _tier(tmp_path)
+        started, release = threading.Event(), threading.Event()
+        real_write = tier._write_entry
+
+        def slow_write(*args):
+            started.set()
+            assert release.wait(timeout=5.0)
+            return real_write(*args)
+
+        tier._write_entry = slow_write
+        try:
+            tier.enqueue_spill(tuple(range(16)), [_kv_layer(16)], 1024)
+            assert started.wait(timeout=5.0)
+            cleared = threading.Thread(target=tier.clear)
+            cleared.start()
+            time.sleep(0.1)  # clear() waits for the entry the writer is on
+            assert cleared.is_alive()
+            release.set()
+            cleared.join(timeout=5.0)
+            assert not cleared.is_alive()
+            assert tier.lookup_ssd(tuple(range(16))) is None
+            assert os.listdir(os.path.join(tier.namespace_dir, "data")) == []
+        finally:
+            release.set()
+            tier.close()
+
+    def test_a_promotion_in_flight_during_clear_returns_nothing(self, tmp_path):
+        tokens = tuple(range(1, 17))
+        tier = _tier(tmp_path)
+        try:
+            _spill(tier, tokens)
+            released = []
+            real_read = tier._read_entry
+
+            def read_then_flush(*args):
+                layers = real_read(*args)
+                tier.clear()
+                return layers
+
+            tier._read_entry = read_then_flush
+            result = asyncio.run(
+                tier.async_promote(tokens, lambda n: True, released.append)
+            )
+            assert result is None
+            assert released == [1024], "the reserved budget must be given back"
+        finally:
+            tier.close()
+
+    def test_memory_cache_clear_flushes_the_attached_tier(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        cache = MemoryAwarePrefixCache(
+            MagicMock(), MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1)
+        )
+        tier = _tier(tmp_path)
+        try:
+            cache.set_ssd_tier(tier)
+            _spill(tier, tuple(range(1, 17)))
+            cache.clear()
+            assert cache.check_ssd(list(range(1, 17))) is None
+        finally:
+            cache.set_ssd_tier(None)
+            tier.close()
+
+    def test_clear_on_a_closed_tier_is_a_noop(self, tmp_path):
+        tier = _tier(tmp_path)
+        tier.close()
+        assert tier.clear() == 0
+
+
+class TestEntryValidation:
+    """An entry is served as the KV of its key; one that is not is quarantined."""
+
+    def _promote(self, tier, tokens):
+        meta = tier.lookup_ssd(tokens)
+        return tier._read_entry(tokens, meta["file_path"])
+
+    def test_a_consistent_entry_reads_back(self, tmp_path):
+        tokens = tuple(range(1, 17))
+        tier = _tier(tmp_path)
+        try:
+            _spill(tier, tokens, marker=7.0)
+            layers = self._promote(tier, tokens)
+            assert layers is not None and layers[0]["offset"] == 16
+            assert float(layers[0]["keys"][0, 0, 0, 0]) == 7.0
+        finally:
+            tier.close()
+
+    @pytest.mark.parametrize("defect", ["tokens", "count", "offset", "short_keys"])
+    def test_an_entry_that_is_not_its_keys_kv_is_not_served(self, tmp_path, defect):
+        tokens = tuple(range(1, 17))
+        tier = _tier(tmp_path)
+        try:
+            _spill(tier, tokens)
+            entry = os.path.join(
+                tier.namespace_dir, "data", tier.lookup_ssd(tokens)["file_path"]
+            )
+            manifest_path = os.path.join(entry, "manifest.json")
+            manifest = json.load(open(manifest_path))
+            if defect == "tokens":
+                # another prompt's entry, e.g. after an interrupted rewrite
+                import array
+
+                with open(os.path.join(entry, "tokens.bin"), "wb") as f:
+                    array.array("i", range(500, 516)).tofile(f)
+            elif defect == "count":
+                manifest["num_tokens"] = 12
+            elif defect == "offset":
+                manifest["layers"][0]["offset"] = 12
+            else:
+                from safetensors.numpy import save_file
+
+                save_file(
+                    {
+                        "layer_0_keys": np.zeros((1, 2, 4, 8), dtype=np.float16),
+                        "layer_0_values": np.zeros((1, 2, 4, 8), dtype=np.float16),
+                    },
+                    os.path.join(entry, "layer_0.safetensors"),
+                )
+            json.dump(manifest, open(manifest_path, "w"))
+
+            assert self._promote(tier, tokens) is None
+            assert tier.lookup_ssd(tokens) is None, "the bad entry must be dropped"
+            assert os.path.isdir(os.path.join(tier.namespace_dir, "quarantine"))
+        finally:
+            tier.close()
+
+    def test_a_rotating_layer_may_hold_fewer_positions_than_its_offset(self, tmp_path):
+        tokens = tuple(range(1, 41))
+        tier = _tier(tmp_path)
+        try:
+            keys = MockMLXArray(np.ones((1, 2, 16, 8), dtype=np.float16))
+            layer = MockKVCacheLayer(keys=keys, values=keys, offset=40)
+            layer.max_size, layer.keep, layer.step, layer._idx = 16, 0, 256, 8
+            assert tier.enqueue_spill(tokens, [layer], 1024)
+            deadline = time.monotonic() + 5.0
+            while tier._stats.spill_count < 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            layers = self._promote(tier, tokens)
+            assert layers is not None and layers[0]["offset"] == 40
+        finally:
+            tier.close()
+
+
+class TestRotatingLayerRoundTrip:
+    """A sliding-window layer comes back from the SSD tier as one, not as a
+    plain KVCache that merely carries the window attributes."""
+
+    @staticmethod
+    def _rotating(tokens, max_size=8, keep=0):
+        import mlx.core as mx
+        from mlx_lm.models.cache import RotatingKVCache
+
+        layer = RotatingKVCache(max_size=max_size, keep=keep)
+        # one position at a time past the window: the buffer has wrapped
+        for t in range(tokens):
+            kv = mx.full((1, 2, 1, 4), float(t))
+            layer.update_and_fetch(kv, kv + 0.5)
+        mx.eval(layer.keys, layer.values)
+        return layer
+
+    def _round_trip(self, tmp_path, layer, tokens):
+        from vllm_mlx.scheduler import Scheduler
+
+        tier = _tier(tmp_path)
+        try:
+            assert tier.enqueue_spill(tokens, [layer], 1024)
+            deadline = time.monotonic() + 5.0
+            while tier._stats.spill_count < 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            meta = tier.lookup_ssd(tokens)
+            dicts = tier._read_entry(tokens, meta["file_path"])
+        finally:
+            tier.close()
+        assert dicts is not None
+        return object.__new__(Scheduler)._reconstruct_ssd_layers(dicts)[0]
+
+    @pytest.mark.parametrize("keep", [0, 2])
+    def test_restored_layer_behaves_like_the_original(self, tmp_path, keep):
+        import mlx.core as mx
+        from mlx_lm.models.cache import RotatingKVCache
+
+        tokens = tuple(range(1, 22))  # 21 tokens through a window of 8
+        original = self._rotating(len(tokens), keep=keep)
+        restored = self._round_trip(tmp_path, original, tokens)
+
+        assert type(restored) is RotatingKVCache
+        assert (restored.max_size, restored.keep) == (original.max_size, keep)
+        assert (restored.offset, restored._idx) == (original.offset, original._idx)
+
+        # the next position lands in the same slot and attends to the same keys
+        nxt = mx.full((1, 2, 1, 4), 99.0)
+        k0, v0 = original.update_and_fetch(nxt, nxt)
+        k1, v1 = restored.update_and_fetch(nxt, nxt)
+        assert mx.array_equal(k0, k1).item() and mx.array_equal(v0, v1).item()
+        assert restored.offset == original.offset
