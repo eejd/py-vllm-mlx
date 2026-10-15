@@ -68,6 +68,24 @@ this guide wrongly said registry mode used one directory per model before it did
 `python -m vllm_mlx.server` has no `--prefix-cache-*` flags; it honors `VLLM_MLX_PREFIX_CACHE_DIR`
 and otherwise behaves as `auto`/`never`. Persist and reset modes are options of `vllm-mlx serve`.
 
+## When a persisted cache is refused
+
+The directory is named after the model path as written, so it says nothing about *which* weights are
+behind that path: a different fine-tune, or a new revision downloaded over the same path, would find the
+old entries. The index therefore records the **cache identity** of the run that wrote it, and a load
+refuses it (loads 0 entries, with a warning that names what differs) unless it matches:
+
+* the model: its whole config (rope theta and scaling, sliding window, norm epsilon, tied embeddings, ...),
+  a content digest of all its weights, their quantization and dtype, and the mlx / mlx-lm versions;
+* `--max-kv-size`;
+* the KV-cache quantization setting, for entries that were held quantized when saved (an entry saved
+  exactly is valid under any setting and is quantized on load like a fresh one).
+
+The tokenizer and chat template are not part of it (keys are token ids). Each entry is also checked
+against its own tokens on load, so a directory two servers wrote to, or a save that was interrupted,
+loads nothing for an entry whose KV does not belong to its tokens. Caches written before this check
+(`version` 4 and earlier) are refused once and rebuilt. Details: `docs/cache-state-signals.md`.
+
 ## What the server reports
 
 One startup line per model directory:
@@ -88,4 +106,4 @@ deleted).
   from an earlier, larger save (the index decides what is loaded). Use `--prefix-cache-reset start`
   or `stop` (with `none`) to start from an empty directory.
 * The runtime endpoints `DELETE /v1/cache` and `DELETE /v1/cache/prefix` clear the in-memory cache and
-  are a separate mechanism from the persisted directory.
+  the SSD tier (`--ssd-cache-dir`); they are a separate mechanism from the persisted directory.

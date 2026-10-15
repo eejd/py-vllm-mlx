@@ -963,6 +963,7 @@ class Scheduler:
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
+                    max_kv_size=self.config.max_kv_size,
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,
@@ -2940,11 +2941,14 @@ class Scheduler:
         self._close_batch_generator()
         self._current_sampler_params = None
 
+        # Close the SSD tier first. This is teardown (the engine is closing or
+        # being replaced), not a flush: the spilled entries stay on disk for the
+        # next start of the same model, and clearing the RAM cache below must not
+        # reach them through the tier it is still attached to.
+        self.close_ssd_tier()
+
         # Clear caches
         self.clear_runtime_caches()
-
-        # Close SSD tier on reset
-        self.close_ssd_tier()
 
     def deep_reset(self) -> None:
         """
@@ -2995,7 +2999,10 @@ class Scheduler:
         return 0
 
     def clear_prefix_cache(self) -> None:
-        """Clear the in-memory prefix cache (keeps disk cache untouched)."""
+        """Clear the in-memory prefix cache and the SSD tier.
+
+        The persisted cache on disk (``--prefix-cache-dir``) is left untouched.
+        """
         if self.memory_aware_cache is not None and hasattr(
             self.memory_aware_cache, "clear"
         ):
@@ -3017,6 +3024,7 @@ class Scheduler:
 
         ssd_config = SSDCacheConfig(
             cache_dir=self.config.ssd_cache_dir,
+            identity=self.memory_aware_cache.identity,
             max_size_gb=self.config.ssd_cache_max_gb,
         )
         tier = SSDCacheTier(ssd_config)
@@ -3218,7 +3226,12 @@ class Scheduler:
         Converts numpy arrays back to MLX arrays and creates KVCache objects.
         """
         try:
-            from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+            from mlx_lm.models.cache import (
+                ArraysCache,
+                CacheList,
+                KVCache,
+                RotatingKVCache,
+            )
 
             # Cast restored arrays back to their original dtype if the spill
             # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
@@ -3227,8 +3240,18 @@ class Scheduler:
                 return getattr(mx, name, None)
 
             def _mk_kv(d: dict):
-                """Rebuild a KVCache from a deserialized layer/sub dict."""
-                kv = KVCache()
+                """Rebuild a KVCache or RotatingKVCache from a layer/sub dict."""
+                max_size = d.get("max_size")
+                if isinstance(max_size, int) and max_size > 0:
+                    # The serializer stores both under one layout and tells them
+                    # apart by the window. Rebuilt as a plain KVCache with the
+                    # window attributes, a sliding-window layer is the wrong
+                    # class (and on read-back fails the topology check, so SSD
+                    # hits for such models, and under --max-kv-size, were never
+                    # usable).
+                    kv = RotatingKVCache(max_size=max_size, keep=d.get("keep", 0))
+                else:
+                    kv = KVCache()
                 kv.keys = mx.array(d["keys"])
                 kv.values = mx.array(d["values"])
                 keys_orig = d.get("keys_original_dtype")

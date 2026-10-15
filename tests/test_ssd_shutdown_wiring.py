@@ -18,7 +18,10 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
+from vllm_mlx.cache_identity import CacheIdentity
 from vllm_mlx.ssd_cache import SSDCacheConfig, SSDCacheTier
+
+IDENT = CacheIdentity(model="model-a", window="window-a", kv="kv-a")
 
 
 def _mock_tokenizer():
@@ -41,7 +44,7 @@ class _MockKVCacheLayer:
 
 def _tier_with_queued_spill(tmp_path):
     """A started SSDCacheTier with one spill already enqueued."""
-    tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path)))
+    tier = SSDCacheTier(SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path)))
     tier.start_writer()
     enqueued = tier.enqueue_spill(
         (1, 2, 3, 4), [_MockKVCacheLayer()], memory_bytes=1024
@@ -85,7 +88,7 @@ class TestEngineCoreStopClosesSSDTier:
 
         engine = EngineCore(MagicMock(), _mock_tokenizer())
 
-        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path)))
+        tier = SSDCacheTier(SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path)))
         tier.start_writer()
         writer_thread = tier._writer_thread
         engine.scheduler._ssd_tier = tier
@@ -235,7 +238,7 @@ class TestMLLMSchedulerStopClosesSSDTier:
     async def test_stop_joins_real_writer_thread(self, tmp_path):
         sched = self._bare_scheduler()
 
-        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path)))
+        tier = SSDCacheTier(SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path)))
         tier.start_writer()
         writer_thread = tier._writer_thread
         sched._ssd_tier = tier
@@ -314,6 +317,7 @@ class TestSchedulerSSDTierLifecycle:
         class FakeMemoryCache:
             def __init__(self):
                 self._ssd_tier = None
+                self.identity = IDENT
 
             def set_ssd_tier(self, tier):
                 self._ssd_tier = tier
@@ -343,3 +347,100 @@ class TestSchedulerSSDTierLifecycle:
         assert scheduler._ssd_tier.started
         assert scheduler._ssd_tier.reconciled
         assert scheduler.memory_aware_cache._ssd_tier is scheduler._ssd_tier
+        # the tier is namespaced by the identity of the cache it backs
+        assert scheduler._ssd_tier.config.identity is IDENT
+
+
+class TestSchedulerFlushesTheSSDTier:
+    """DELETE /v1/cache and cache-error recovery must not leave spilled entries
+    behind to be promoted straight back into the cache they just emptied."""
+
+    @staticmethod
+    def _scheduler_with_spilled_entry(tmp_path):
+        import time
+
+        import numpy as np
+
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.scheduler import Scheduler
+
+        cache = MemoryAwarePrefixCache(
+            MagicMock(), MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1)
+        )
+        tier = SSDCacheTier(
+            SSDCacheConfig(identity=cache.identity, cache_dir=str(tmp_path))
+        )
+        tier.start_writer()
+        cache.set_ssd_tier(tier)
+
+        class Layer:
+            keys = np.ones((1, 2, 16, 8), dtype=np.float16)
+            values = np.ones((1, 2, 16, 8), dtype=np.float16)
+            offset = 16
+
+        assert tier.enqueue_spill(tuple(range(16)), [Layer()], 1024)
+        deadline = time.monotonic() + 5.0
+        while tier.get_stats()["spill_count"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert cache.check_ssd(list(range(20))) is not None
+
+        scheduler = object.__new__(Scheduler)
+        scheduler.memory_aware_cache = cache
+        scheduler.block_aware_cache = None
+        scheduler.prefix_cache = None
+        scheduler._ssd_tier = tier
+        return scheduler, cache, tier
+
+    def test_clear_runtime_caches(self, tmp_path):
+        scheduler, cache, tier = self._scheduler_with_spilled_entry(tmp_path)
+        try:
+            scheduler.clear_runtime_caches()
+            assert cache.check_ssd(list(range(20))) is None
+        finally:
+            cache.set_ssd_tier(None)
+            tier.close()
+
+    def test_clear_prefix_cache(self, tmp_path):
+        scheduler, cache, tier = self._scheduler_with_spilled_entry(tmp_path)
+        try:
+            scheduler.clear_prefix_cache()
+            assert cache.check_ssd(list(range(20))) is None
+        finally:
+            cache.set_ssd_tier(None)
+            tier.close()
+
+    def test_cache_error_recovery(self, tmp_path):
+        scheduler, cache, tier = self._scheduler_with_spilled_entry(tmp_path)
+        scheduler._close_batch_generator = lambda: None
+        scheduler._current_sampler_params = None
+        scheduler.request_id_to_uid = {}
+        scheduler.uid_to_request_id = {}
+        try:
+            scheduler._recover_from_cache_error()
+            assert cache.check_ssd(list(range(20))) is None
+        finally:
+            cache.set_ssd_tier(None)
+            tier.close()
+
+    def test_teardown_keeps_the_spilled_entries_for_the_next_start(self, tmp_path):
+        """reset() is what closing an engine runs: that is not a flush."""
+        from collections import deque
+
+        scheduler, cache, tier = self._scheduler_with_spilled_entry(tmp_path)
+        scheduler._pending_abort_ids = set()
+        scheduler.requests, scheduler.running = {}, {}
+        scheduler.waiting, scheduler.finished_req_ids = deque(), set()
+        scheduler.request_id_to_uid, scheduler.uid_to_request_id = {}, {}
+        scheduler._detokenizer_pool = {}
+        scheduler._close_batch_generator = lambda: None
+        scheduler._current_sampler_params = None
+
+        scheduler.reset()
+
+        reopened = SSDCacheTier(
+            SSDCacheConfig(identity=cache.identity, cache_dir=str(tmp_path))
+        )
+        try:
+            assert reopened.lookup_ssd(tuple(range(16))) is not None
+        finally:
+            reopened.close()

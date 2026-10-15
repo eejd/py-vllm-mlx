@@ -437,7 +437,10 @@ def test_cache_get_stats_includes_how_the_limit_was_derived():
 
 
 def _quant_model(bits=4, group_size=64, quantized=True):
+    import mlx.core as mx
     import mlx.nn as nn
+
+    mx.random.seed(0)  # same checkpoint = same weights; the fingerprint covers them
 
     class M(nn.Module):
         def __init__(self):
@@ -694,7 +697,10 @@ def test_model_manager_lists_only_loaded_engines():
 
 
 def _moe_model(expert_bits, order=("a", "b")):
+    import mlx.core as mx
     import mlx.nn as nn
+
+    mx.random.seed(0)
     from mlx_lm.models.switch_layers import SwitchLinear
 
     class M(nn.Module):

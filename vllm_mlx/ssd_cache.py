@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -32,6 +33,7 @@ from typing import Any
 
 import numpy as np
 
+from .cache_identity import CacheIdentity
 from .mlx_cache_compat import recurrent_arrays
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,8 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_MB = 1024 * 1024
 _BYTES_PER_GB = 1024 * 1024 * 1024
 _PREFIX_FILTER_TOKENS = 16
+_LEGACY_ENTRY_RE = re.compile(r"^[0-9a-f]{64}(\.tmp)?$")
+_DIGEST_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 @dataclass(frozen=True)
@@ -46,23 +50,33 @@ class SSDCacheConfig:
     """Configuration for SSD cache tier.
 
     Attributes:
-        cache_dir: Directory for SSD cache files. None = auto-detect
-            (~/.cache/vllm-mlx/ssd_cache/{model}/).
-        max_size_gb: Maximum total size of SSD cache in GB.
+        cache_dir: Base directory for SSD cache files. The tier keeps its files in
+            ``cache_dir/<identity digest>/``, so servers, models and
+            configurations that share one base directory never read each
+            other's entries.
+        identity: What the entries are valid for (:class:`CacheIdentity` of the
+            prefix cache the tier backs: model weights, config, mlx/mlx-lm
+            versions, KV quantization, max-kv-size). Required.
+        max_size_gb: Maximum total size of SSD cache in GB (per identity).
         max_entries: Maximum number of entries in SSD cache.
         file_permissions: Unix permission bits for cache data files.
         dir_permissions: Unix permission bits for cache directories.
         spill_queue_size: Max pending spill operations before dropping.
         retention_seconds: Optional max age for cache entries (None = no expiry).
+        stale_namespace_days: Sibling identity directories (other models,
+            revisions, library versions) whose ``identity.json`` is older than
+            this are deleted when a tier starts (None = never).
     """
 
     cache_dir: str | None = None
+    identity: CacheIdentity | None = None
     max_size_gb: float = 10.0
     max_entries: int = 10000
     file_permissions: int = 0o600
     dir_permissions: int = 0o700
     spill_queue_size: int = 64
     retention_seconds: int | None = None
+    stale_namespace_days: float | None = 30.0
 
     def __post_init__(self) -> None:
         if self.max_size_gb <= 0:
@@ -353,6 +367,12 @@ class SSDIndex:
             self._conn.execute(
                 "DELETE FROM entries WHERE token_hash = ?", (token_hash,)
             )
+            self._conn.commit()
+
+    def delete_all(self) -> None:
+        """Drop every entry (the data directories are the caller's to remove)."""
+        with self._db_lock:
+            self._conn.execute("DELETE FROM entries")
             self._conn.commit()
 
     def get_lru(self, limit: int = 10) -> list[dict]:
@@ -801,6 +821,63 @@ def get_serializer_for_layer(layer: Any) -> LayerSerializer:
     )
 
 
+def _kv_dict_error(layer: dict, n: int, nested: bool = False) -> str | None:
+    """Why a deserialized KV layer is not ``n`` tokens of KV, or None if it is."""
+    offset = layer["offset"]
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        return f"offset {offset!r} is not an integer"
+    if offset != n and not (nested and offset == 0):
+        return f"offset {offset} != {n} tokens"
+    if offset == 0:
+        return None
+    keys = layer["keys"]
+    if keys.ndim < 3:
+        return f"keys of shape {tuple(keys.shape)} have no sequence axis"
+    max_size = layer.get("max_size")
+    # A rotating layer holds at most its window, whatever its offset.
+    needed = (
+        min(offset, max_size) if isinstance(max_size, int) and max_size > 0 else offset
+    )
+    if keys.shape[-2] < needed:
+        return f"keys hold {keys.shape[-2]} positions for offset {offset}"
+    return None
+
+
+def _layer_data_error(layer: dict, n: int) -> str | None:
+    """Why a deserialized layer does not belong to an ``n``-token entry."""
+    if "cachelist_subs" in layer:
+        for sub in layer["cachelist_subs"]:
+            error = _kv_dict_error(sub, n, nested=True)
+            if error is not None:
+                return error
+        return None
+    if "keys" in layer:
+        return _kv_dict_error(layer, n)
+    return None  # recurrent state carries no position
+
+
+def _manifest_error(
+    manifest: dict, entry_dir: str, tokens: tuple[int, ...]
+) -> str | None:
+    """Why an entry directory is not the entry for ``tokens``, or None if it is."""
+    if manifest.get("num_tokens") != len(tokens):
+        return (
+            f"manifest records {manifest.get('num_tokens')} tokens, "
+            f"key has {len(tokens)}"
+        )
+    layers = manifest.get("layers")
+    if not isinstance(layers, list) or manifest.get("num_layers") != len(layers):
+        return "manifest layer list does not match its layer count"
+    try:
+        with open(os.path.join(entry_dir, "tokens.bin"), "rb") as f:
+            stored = f.read()
+    except OSError as e:
+        return f"tokens.bin unreadable: {e}"
+    if stored != _tokens_to_blob(tokens):
+        return "tokens.bin differs from the key"
+    return None
+
+
 class SSDCacheTier:
     """Cold-tier disk cache for KV cache entries.
 
@@ -828,13 +905,24 @@ class SSDCacheTier:
 
         if config.cache_dir is None:
             raise ValueError("SSDCacheConfig.cache_dir must be set")
+        if config.identity is None:
+            raise ValueError(
+                "SSDCacheConfig.identity must be set: entries are only valid for the "
+                "model and configuration that computed them"
+            )
 
-        self._cache_dir = config.cache_dir
+        self._base_dir = config.cache_dir
+        self._identity = config.identity
+        self._cache_dir = os.path.join(self._base_dir, config.identity.digest)
         self._data_dir = os.path.join(self._cache_dir, "data")
 
         # Create directory structure
+        os.makedirs(self._base_dir, mode=config.dir_permissions, exist_ok=True)
+        self._discard_untagged_layout()
         os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
         os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
+        self._write_identity_file()
+        self._reclaim_stale_namespaces()
 
         try:
             # Open SQLite index
@@ -852,6 +940,11 @@ class SSDCacheTier:
             self._lifecycle_lock = threading.Lock()
             self._accepting_spills = True
             self._writer_shutdown_requested = False
+            # Held by the writer while it writes one entry and by clear(), so a
+            # flush never overlaps a write. ``_epoch`` counts flushes: a spill
+            # queued or promoted before one is dropped, never published after.
+            self._write_lock = threading.Lock()
+            self._epoch = 0
 
             # Spill queue and writer thread
             self._spill_queue: queue.Queue = queue.Queue(
@@ -868,6 +961,137 @@ class SSDCacheTier:
                         "ssd_cache: failed to close index during init cleanup"
                     )
             raise
+
+    def _discard_untagged_layout(self) -> None:
+        """Remove entries a build that keyed on tokens alone left in the base dir.
+
+        Those builds kept ``index.db`` and ``data/<sha256>/`` directly in the
+        base directory with nothing recording which model computed them, so none
+        of it can be attributed to the current identity. ``--ssd-cache-dir`` is
+        user-supplied and ``data`` / ``quarantine`` are generic names, so only
+        what is positively one of those entries goes: a SQLite ``index.db``
+        (with its WAL files), and ``<64 hex>`` (or ``.tmp``) directories that
+        hold a ``manifest.json``. Anything else, including the ``data`` and
+        ``quarantine`` directories themselves while they hold other files, is
+        left alone.
+        """
+        import shutil
+
+        removed: list[str] = []
+        index_db = os.path.join(self._base_dir, "index.db")
+        try:
+            with open(index_db, "rb") as f:
+                is_index = f.read(16) == b"SQLite format 3\x00"
+        except OSError:
+            is_index = False
+        if is_index:
+            for suffix in ("", "-wal", "-shm"):
+                path = index_db + suffix
+                try:
+                    os.unlink(path)
+                    removed.append(os.path.basename(path))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning(
+                        "[ssd_cache] failed to remove %s", path, exc_info=True
+                    )
+        for container in ("data", "quarantine"):
+            root = os.path.join(self._base_dir, container)
+            if os.path.islink(root) or not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                path = os.path.join(root, name)
+                if (
+                    _LEGACY_ENTRY_RE.match(name)
+                    and os.path.isdir(path)
+                    and not os.path.islink(path)
+                    and os.path.isfile(os.path.join(path, "manifest.json"))
+                ):
+                    try:
+                        shutil.rmtree(path)
+                        removed.append(f"{container}/{name}")
+                    except OSError:
+                        logger.warning(
+                            "[ssd_cache] failed to remove %s", path, exc_info=True
+                        )
+            try:
+                os.rmdir(root)  # only if nothing else is in it
+            except OSError:
+                pass
+        if removed:
+            logger.warning(
+                "[ssd_cache] removed %d entries of an older layout from %s: they "
+                "recorded no model identity",
+                len(removed),
+                self._base_dir,
+            )
+
+    def _reclaim_stale_namespaces(self) -> None:
+        """Delete sibling identity directories nobody has used for a while.
+
+        Every mlx / mlx-lm upgrade, model revision or config change names a new
+        directory, and the size budget is per directory, so without this each
+        of them strands a whole cache. A directory goes only when it is named
+        like an identity digest, has an ``identity.json`` (written, and so
+        touched, each time a tier starts on it) older than
+        ``stale_namespace_days``, and is not this tier's own.
+        """
+        import shutil
+        import time as _time
+
+        days = self._config.stale_namespace_days
+        if days is None:
+            return
+        cutoff = _time.time() - days * 86400
+        for name in os.listdir(self._base_dir):
+            path = os.path.join(self._base_dir, name)
+            if (
+                name == self._identity.digest
+                or not _DIGEST_DIR_RE.match(name)
+                or os.path.islink(path)
+                or not os.path.isdir(path)
+            ):
+                continue
+            marker = os.path.join(path, "identity.json")
+            try:
+                if os.stat(marker).st_mtime >= cutoff:
+                    continue
+                shutil.rmtree(path)
+            except OSError:
+                logger.warning(
+                    "[ssd_cache] could not reclaim stale namespace %s",
+                    path,
+                    exc_info=True,
+                )
+                continue
+            logger.info("[ssd_cache] reclaimed %s: not used for %s days", name, days)
+
+    def _write_identity_file(self) -> None:
+        """Record what this directory's entries are valid for (for operators)."""
+        path = os.path.join(self._cache_dir, "identity.json")
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(
+                    {
+                        "digest": self._identity.digest,
+                        "model": self._identity.model,
+                        "kv": self._identity.kv,
+                        "detail": self._identity.detail,
+                    },
+                    f,
+                    indent=2,
+                    default=str,
+                )
+            os.replace(tmp, path)
+        except OSError:
+            logger.warning("[ssd_cache] could not write %s", path, exc_info=True)
+
+    @property
+    def namespace_dir(self) -> str:
+        """The directory this tier's files live in (base dir + identity digest)."""
+        return self._cache_dir
 
     def _purge_data_dir(self) -> None:
         """Delete every spilled entry after an incompatible schema bump.
@@ -923,9 +1147,12 @@ class SSDCacheTier:
             if item is None:  # Poison pill for shutdown
                 break
 
-            tokens_key, layer_snapshots, memory_bytes = item
+            epoch, tokens_key, layer_snapshots, memory_bytes = item
             try:
-                self._write_entry(tokens_key, layer_snapshots, memory_bytes)
+                with self._write_lock:
+                    if epoch != self._epoch:
+                        continue  # queued before a flush; the flush dropped it
+                    self._write_entry(tokens_key, layer_snapshots, memory_bytes)
             except Exception:
                 logger.exception(
                     f"[ssd_cache] failed to write entry " f"({len(tokens_key)} tokens)"
@@ -945,6 +1172,9 @@ class SSDCacheTier:
 
         Returns True if enqueued, False if queue is full (entry dropped).
         """
+        # The epoch the entry was handed over in: a flush (clear()) that lands
+        # while it is being snapshotted or queued must drop it.
+        epoch = self._epoch
         with self._lifecycle_lock:
             if not self._accepting_spills:
                 return False
@@ -1052,7 +1282,9 @@ class SSDCacheTier:
             if not self._accepting_spills:
                 return False
             try:
-                self._spill_queue.put_nowait((tokens, layer_snapshots, memory_bytes))
+                self._spill_queue.put_nowait(
+                    (epoch, tokens, layer_snapshots, memory_bytes)
+                )
                 return True
             except queue.Full:
                 logger.warning(
@@ -1186,6 +1418,48 @@ class SSDCacheTier:
             )
         return True
 
+    def clear(self) -> int:
+        """Drop every entry of this tier (a cache flush), returning how many.
+
+        Spills still queued, one being written and promotions in flight are all
+        dropped: nothing written before the flush can be promoted after it.
+        Waits for the entry the writer is on, if any. A closed tier has nothing
+        left to drop.
+        """
+        import shutil
+
+        if self._closed:
+            return 0
+
+        with self._write_lock:
+            self._epoch += 1
+            while True:
+                try:
+                    item = self._spill_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    # close() is waiting on its shutdown sentinel; it stays queued.
+                    self._spill_queue.put_nowait(None)
+                    break
+            dropped = self._index.get_entry_count()
+            self._index.delete_all()
+            for name in os.listdir(self._data_dir):
+                path = os.path.join(self._data_dir, name)
+                try:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.unlink(path)
+                except OSError:
+                    logger.warning(
+                        "[ssd_cache] failed to remove %s during clear",
+                        path,
+                        exc_info=True,
+                    )
+        logger.info("[ssd_cache] cleared %d entries", dropped)
+        return dropped
+
     async def async_promote(
         self,
         tokens: tuple[int, ...],
@@ -1209,6 +1483,7 @@ class SSDCacheTier:
         """
         import asyncio
 
+        epoch = self._epoch
         # Step 1: Look up metadata (fast, SQLite)
         meta = self._index.lookup_exact(tokens)
         if meta is None:
@@ -1255,6 +1530,11 @@ class SSDCacheTier:
                 f"[ssd_cache] failed to read entry from disk "
                 f"({meta['num_tokens']} tokens)"
             )
+            return None
+
+        if epoch != self._epoch:
+            # A flush landed while the entry was being read.
+            release_budget_fn(memory_bytes)
             return None
 
         if cache_layers is None:
@@ -1309,6 +1589,14 @@ class SSDCacheTier:
             logger.warning(f"[ssd_cache] corrupt manifest for {relative_path}: {e}")
             self._quarantine_entry(tokens, relative_path)
             return None
+        # An entry is served as the KV of ``tokens`` and the request then
+        # prefills only what follows them, so one that holds anything else is a
+        # wrong answer, not a miss: check it against the key before using it.
+        error = _manifest_error(manifest, entry_dir, tokens)
+        if error is not None:
+            logger.warning(f"[ssd_cache] inconsistent entry {relative_path}: {error}")
+            self._quarantine_entry(tokens, relative_path)
+            return None
 
         cache_layers = []
         for layer_meta in manifest["layers"]:
@@ -1331,6 +1619,14 @@ class SSDCacheTier:
                     return None
 
                 layer_data = serializer.deserialize_layer(layer_path, layer_meta)
+                error = _layer_data_error(layer_data, len(tokens))
+                if error is not None:
+                    logger.warning(
+                        f"[ssd_cache] inconsistent layer {layer_idx} in "
+                        f"{relative_path}: {error}"
+                    )
+                    self._quarantine_entry(tokens, relative_path)
+                    return None
                 cache_layers.append(layer_data)
             except Exception as e:
                 logger.warning(

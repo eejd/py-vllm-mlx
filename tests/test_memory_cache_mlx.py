@@ -1603,7 +1603,7 @@ class TestNoReferenceCycles:
     def test_kv_quantize_save_to_disk_and_load(self, tmp_path):
         """Saving dequantizes the entries; loading quantizes them again."""
         source = self._quantizing_cache()
-        assert source.store([1, 2, 3], [self._kv(), self._kv()])
+        assert source.store([1, 2, 3], [self._kv(3), self._kv(3)])
         target = self._quantizing_cache()
 
         def round_trip():
