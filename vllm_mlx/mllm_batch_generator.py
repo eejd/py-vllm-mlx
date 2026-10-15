@@ -3756,11 +3756,11 @@ def install_mtp_mllm(
             _deferred_drafts.clear()
             _attempted_drafts_by_uid.clear()
 
-        # `_inner_next` may extend a text-only request into an active batch
-        # before the next `_mtp_step` call. That's fine: `_mtp_step` itself
-        # tolerates a batch whose UIDs only partially match verified skip
-        # state (it discards the stale entries and forces a full forward for
-        # that step), so no request needs to be held back here.
+        # `_inner_next` may extend a request into an active batch before the
+        # next `_mtp_step` call. The batch's `on_extend` hook (`_admit_joiners`,
+        # set at the end of this wrapper) brings the joining rows to the
+        # verified state first, so `_mtp_step` never sees a partially verified
+        # batch; if it does, that is a bug and the step raises.
 
         # Save deferred drafts from previous step. The base generator emits
         # its pending input token on this turn, so the verified suffix follows

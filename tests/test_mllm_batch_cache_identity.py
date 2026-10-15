@@ -15,6 +15,7 @@ from mlx_lm.models.cache import KVCache
 
 from tests.mllm_cache_sim import (
     LAYERS,
+    SimLanguageModel,
     VOCAB,
     chain_hashes,
     greedy_continuation,
@@ -221,6 +222,34 @@ class TestRequestsJoiningAnMtpBatch:
         assert out["resident"] == greedy_continuation(PROMPT, 14)
         assert out["joiner"] == greedy_continuation(list(range(20, 36)), 8)
         assert_entries_are_prompt_kv(gen)
+
+    def test_joiner_first_token_is_fed_with_its_own_rope_deltas(self, monkeypatch):
+        # An mRoPE model derives positions from request-local rope_deltas
+        # (here: the request's first prompt token, so every request has its
+        # own); the joiner's admission forward must carry its own, not none
+        # and not the resident's.
+        def get_rope_index(self, input_ids, *_args):
+            length = input_ids.shape[1]
+            positions = mx.broadcast_to(
+                mx.arange(length)[None, None, :], (3, input_ids.shape[0], length)
+            )
+            return positions, input_ids[:, :1].astype(mx.int32)
+
+        monkeypatch.setattr(
+            SimLanguageModel, "get_rope_index", get_rope_index, raising=False
+        )
+        gen, lm = make_generator(mtp=True, prefix_cache=False)
+        resident = make_request("resident", PROMPT, 14)  # starts with 3
+        joiner = make_request("joiner", list(range(20, 27)), 8)  # starts with 20
+
+        out = self.drive(gen, resident, joiner, 3)
+
+        assert out["resident"] == greedy_continuation(PROMPT, 14)
+        # (1, 1): one row, one token. Resident-only decode steps carry [[3]];
+        # after the join the batch carries [[3], [20]]; only the joiner's
+        # admission feeds a single row with [[20]].
+        single_row_steps = [d for shape, d in lm.rope_deltas_log if shape == (1, 1)]
+        assert [[20]] in single_row_steps
 
     def test_a_partially_verified_batch_is_refused_not_decoded(self):
         gen, _ = make_generator(mtp=True, prefix_cache=False)

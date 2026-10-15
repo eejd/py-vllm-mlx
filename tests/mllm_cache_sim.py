@@ -65,6 +65,8 @@ class SimLanguageModel:
         self.draft_correct = draft_correct
         self.hybrid = hybrid
         self.calls: list[list[list[int]]] = []
+        # (shape of the tokens fed, rope_deltas kwarg as a list or None) per call
+        self.rope_deltas_log: list[tuple] = []
         if with_mtp:
             self.mtp = object()
         else:
@@ -93,6 +95,10 @@ class SimLanguageModel:
         return cache_layer.keys[:, 0, cache_layer.offset - 1, 0].astype(mx.int32)
 
     def __call__(self, tokens, cache=None, return_hidden=False, **kwargs):
+        rope_deltas = kwargs.get("rope_deltas")
+        self.rope_deltas_log.append(
+            (tuple(tokens.shape), None if rope_deltas is None else rope_deltas.tolist())
+        )
         if tokens.ndim == 1:
             tokens = tokens[None, :]
         batch, length = tokens.shape
