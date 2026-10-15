@@ -31,7 +31,6 @@ from .memory_cache import (
 )
 from .mlx_cache_compat import (
     copy_state,
-    restore_from_state,
     set_recurrent_arrays,
     snapshot_state,
 )
@@ -199,12 +198,6 @@ class SchedulerConfig:
     # generation requests are not starved during long prefills.
     chunked_prefill_tokens: int = 0
 
-    # Mid-prefill cache saving: save intermediate KV cache every N tokens
-    # during chunked prefill. If the client disconnects mid-prefill, the
-    # saved cache is reused for the next request with the same prefix.
-    # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
-    mid_prefill_save_interval: int = 8192
-
     # SSD cache tiering
     ssd_cache_dir: Optional[str] = None  # None = disabled
     ssd_cache_max_gb: float = 10.0
@@ -288,8 +281,7 @@ def _configure_chunked_prefill(
     mlx-lm >= 0.31.2 chunks prefill itself: each ``next()`` call processes at
     most ``prefill_step_size`` prompt tokens, then returns to generation. The
     ``_process_prompts`` / ``active_batch`` layout this once patched is gone, so
-    there is nothing to monkey-patch; mid-prefill saves and prompt-cache
-    capture are driven from the responses ``next()`` returns instead.
+    there is nothing to monkey-patch.
     """
     native_api = all(
         hasattr(batch_gen, attribute)
@@ -1113,8 +1105,7 @@ class Scheduler:
             stream=mx.default_stream(mx.default_device()),
         )
         # Install chunked prefill only when explicitly configured.
-        # memory_aware_cache fetch/store works independently; the mid-prefill
-        # save callback is an optimisation, not a requirement.
+        # memory_aware_cache fetch/store works independently of chunked prefill.
         # When chunked_prefill_tokens == 0 (the default), honour the user's
         # intent — do NOT silently re-enable chunked prefill just because
         # memory_aware_cache is active (see #178).
@@ -1141,122 +1132,6 @@ class Scheduler:
                 )
 
         return bg
-
-    def _make_prompt_cache_save_callback(self):
-        """Create a callback that stores prompt-only KV/Mamba cache.
-
-        Called from ``_generation_step`` right before the first output token
-        is fed into the model.  At that point ``num_tokens == 0`` and the
-        batch cache contains the exact prompt-only state (correct for both
-        KVCache and MambaCache/ArraysCache layers).
-
-        The cache is stored with key = prompt_token_ids so that a future
-        request with the identical prompt gets an exact hit.
-        """
-        import time as _time
-
-        def _prompt_cache_save(uid, extracted_cache):
-            request_id = self.uid_to_request_id.get(uid)
-            if not request_id:
-                return
-            request = self.requests.get(request_id)
-            if not request or not request.prompt_token_ids:
-                return
-
-            prompt_tokens = list(request.prompt_token_ids)
-            # Trim cache by 1 so the stored KV has offset = N-1.
-            # On exact fetch the scheduler sends the last prompt token
-            # for reprocessing (lines 1872-1877).  Without this trim
-            # the last token would be placed at position N instead of N-1.
-            from .memory_cache import _trim_cache_offset
-
-            trimmed_cache = _trim_cache_offset(extracted_cache, 1)
-            _t0 = _time.monotonic()
-            # evict_prefixes=False: keep mid-prefill boundary entries so
-            # that future requests with the same prefix but different
-            # suffix get a prefix cache hit (critical for agentic multi-turn).
-            stored = self.memory_aware_cache.store(
-                prompt_tokens, trimmed_cache, evict_prefixes=False
-            )
-            _dt = _time.monotonic() - _t0
-            if stored:
-                logger.info(
-                    f"[prompt_cache_save] request={request_id[:12]} "
-                    f"prompt_tokens={len(prompt_tokens)} "
-                    f"store_time={_dt:.3f}s"
-                )
-
-        return _prompt_cache_save
-
-    def _make_mid_prefill_save_callback(self, save_interval: int):
-        """Create a callback for saving intermediate KV cache during chunked prefill.
-
-        The callback is called after each chunk with (uid, processed_tokens,
-        prompt_cache).  It extracts the cache state (immutable MLX array
-        snapshots), reconstructs KVCache objects, and stores them in the
-        memory-aware prefix cache so that a subsequent request with the same
-        prompt prefix can skip the already-computed tokens.
-        """
-        import time as _time
-
-        def _mid_prefill_save(uid, processed_tokens, prompt_cache):
-            request_id = self.uid_to_request_id.get(uid)
-            if not request_id:
-                return
-            request = self.requests.get(request_id)
-            if not request or not request.prompt_token_ids:
-                return
-
-            total_cached = (request.cached_tokens or 0) + processed_tokens
-
-            # Always save at prefix_boundary (message boundary for cache
-            # reuse with different final user messages).
-            prefix_boundary = getattr(request, "prefix_boundary", 0)
-            at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
-
-            # Throttle: only save every save_interval tokens,
-            # unless we're at the prefix boundary.
-            last_save = getattr(request, "_mid_prefill_last_save", 0)
-            if not at_prefix_boundary and total_cached - last_save < save_interval:
-                return
-
-            # Extract immutable state snapshots
-            extracted = self._extract_cache_states(prompt_cache)
-            if not extracted:
-                return
-
-            # Reconstruct cache objects (directly usable by BatchGenerator)
-            reconstructed = self._reconstruct_cache_from_states(extracted)
-            if not reconstructed:
-                return
-
-            prefix_tokens = list(request.prompt_token_ids[:total_cached])
-
-            # Remove previous intermediate entry to avoid memory waste
-            old_key = getattr(request, "_mid_prefill_cache_key", None)
-            if old_key is not None:
-                self.memory_aware_cache.remove(list(old_key))
-
-            _t0 = _time.monotonic()
-            stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
-            _dt = _time.monotonic() - _t0
-
-            if stored:
-                request._mid_prefill_last_save = total_cached
-                request._mid_prefill_cache_key = tuple(prefix_tokens)
-                logger.info(
-                    f"[mid_prefill_cache] request={request_id[:12]} "
-                    f"saved {total_cached}/{len(request.prompt_token_ids)} tokens "
-                    f"({total_cached * 100 // len(request.prompt_token_ids)}%) "
-                    f"store_time={_dt:.3f}s"
-                )
-            else:
-                logger.debug(
-                    f"[mid_prefill_cache] request={request_id[:12]} "
-                    f"store rejected for {total_cached} tokens"
-                )
-
-        return _mid_prefill_save
 
     def _close_batch_generator(self) -> None:
         """Properly close BatchGenerator to restore wired_limit."""
@@ -1552,59 +1427,6 @@ class Scheduler:
                 continue
 
         return extracted if len(extracted) == len(raw_cache) else []
-
-    def _reconstruct_cache_from_states(
-        self, extracted_states: List[Dict[str, Any]]
-    ) -> Optional[List[Any]]:
-        """
-        Reconstruct cache objects from extracted cache states.
-
-        This is the inverse of _extract_cache_states(). Uses mlx-lm's
-        _BaseCache.from_state() to reconstruct any cache type (KVCache,
-        MambaCache, etc.) from its state/meta_state.
-
-        Args:
-            extracted_states: List of dicts from _extract_cache_states()
-
-        Returns:
-            List of cache objects, or None if reconstruction fails
-        """
-        if not extracted_states:
-            return None
-
-        try:
-            caches = []
-            for layer_state in extracted_states:
-                state = layer_state.get("state")
-                meta_state = layer_state.get("meta_state")
-                cache_cls = layer_state.get("class_ref")
-                if state is None:
-                    return None
-
-                if cache_cls is not None and hasattr(cache_cls, "from_state"):
-                    # restore_from_state also turns a BatchKVCache snapshot
-                    # (always batch_size=1 here) into a plain KVCache, which
-                    # _merge_caches can handle.
-                    cache = restore_from_state(cache_cls, state, meta_state)
-                else:
-                    # Fallback: try KVCache manual reconstruction
-                    from mlx_lm.models.cache import KVCache
-
-                    if len(state) != 2:
-                        return None
-                    cache = KVCache()
-                    cache.keys, cache.values = state
-                    cache.offset = (
-                        int(meta_state[0]) if meta_state else cache.keys.shape[2]
-                    )
-
-                caches.append(cache)
-
-            return caches
-
-        except Exception as e:
-            logger.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
-            return None
 
     def add_request(self, request: Request) -> None:
         """
@@ -2560,9 +2382,9 @@ class Scheduler:
                     # unused blocks when under memory pressure.
 
                 elif self.memory_aware_cache is not None:
-                    # Keep mid-prefill entry as prefix cache for future
-                    # requests that share a common prefix (e.g. same system
-                    # prompt + tools but different user message).  LRU
+                    # Keep the finished request's entry as prefix cache for
+                    # future requests that share a common prefix (e.g. same
+                    # system prompt + tools but different user message).  LRU
                     # eviction handles memory pressure.
 
                     # Store in memory-aware prefix cache

@@ -6,8 +6,7 @@ BOS is literal text: ``<bos>`` for Gemma, ``<|begin_of_text|>`` for Llama-3).
 Tokenizing that string with a HF tokenizer's default ``add_special_tokens=True``
 prepends a second BOS, so the text scheduler fed ``[BOS, BOS, ...]`` to the
 model, keyed its prefix cache on it, reported ``usage.prompt_tokens`` one too
-high and (via the LCP in ``_compute_prefix_boundary``) put the shared-prefix
-boundary one past the real one.  Upstream vLLM tokenizes chat prompts with
+high.  Upstream vLLM tokenizes chat prompts with
 ``add_special_tokens=False`` and raw completion prompts with the tokenizer
 default (``vllm/renderers/base.py`` ``default_chat_tok_params`` /
 ``default_cmpl_tok_params``).
@@ -425,44 +424,6 @@ class TestBatchedEngineRequestKind:
         _run(_drain(engine.stream_chat(MESSAGES, max_tokens=2)))
         _run(_drain(engine.stream_generate(RAW_PROMPT, max_tokens=2)))
         assert [c["add_special_tokens"] for c in calls] == [False, None]
-
-
-class TestPrefixBoundary:
-    @pytest.mark.parametrize("bos_token", [BOS, None])
-    @pytest.mark.parametrize("template_bos", [True, False])
-    def test_boundary_is_the_shared_prefix_of_the_ids_the_model_sees(
-        self, bos_token, template_bos
-    ):
-        tok = FakeHFTokenizer(bos_token=bos_token)
-        engine = _engine(tok)
-        lead = [BOS] if template_bos else []
-        prefix = lead + ["<sys>", "be", "terse"]
-        engine._apply_chat_template = lambda messages, tools=None, **kw: " ".join(
-            prefix
-            + [f"<{m['role']}> {m['content']}" for m in messages[1:]]
-            + ["<model>"]
-        )
-        messages = [
-            {"role": "system", "content": "s"},
-            {"role": "user", "content": "first"},
-            {"role": "assistant", "content": "ok"},
-            {"role": "user", "content": "second question"},
-        ]
-        boundary = engine._compute_prefix_boundary(messages)
-
-        dummy = list(messages)
-        dummy[3] = {**messages[3], "content": "XXXXXXXXXX"}
-        # Chat requests are tokenized with add_special_tokens=False.
-        real_ids = _no_special(tok, engine._apply_chat_template(messages))
-        dummy_ids = _no_special(tok, engine._apply_chat_template(dummy))
-        expected = 0
-        for a, b in zip(real_ids, dummy_ids):
-            if a != b:
-                break
-            expected += 1
-        assert boundary == expected
-        assert real_ids[:boundary] == dummy_ids[:boundary]
-        assert real_ids[boundary] != dummy_ids[boundary]
 
 
 class TestWarmupTokenizesLikeChat:
