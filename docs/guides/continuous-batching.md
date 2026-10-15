@@ -88,6 +88,22 @@ ownership, not a throughput feature.
   hit; requests with images or video bypass the paged cache.
 - Blocks of a finished request are released but stay cached until the pool needs them
   (least recently used, deepest block first).
+- A cached block owns its tensors (copies, not views of the finished request's KV), so
+  `--max-cache-blocks` x `--paged-cache-block-size` x the model's KV bytes per token bounds
+  the memory the cache holds.
+
+**Limits of the paged cache (use the default prefix cache, `--enable-prefix-cache` without
+`--use-paged-cache`, when they matter):**
+
+- *Hybrid models with recurrent layers (Qwen3.5-style, Nemotron-3-Nano, ...):* a
+  recurrent layer's state exists only at the token where a request ended, so a prefix hit
+  needs a stored request that ended exactly on a block boundary (about 1 request length in
+  `--paged-cache-block-size`). Plain-attention models hit on every shared block. The server
+  logs this once when it first sees such a model.
+- *Sliding-window, chunked or quantized-KV layers (mlx-lm 0.32 layouts with integer cursors
+  or nested tuples):* they cannot be cut into blocks; nothing is cached for such a model
+  (logged once).
+- Requests with images or video are not cached.
 
 ## Performance Results
 
