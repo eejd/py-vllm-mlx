@@ -12,7 +12,11 @@ reconstructs values that differ from the cold ones, which is what these tests
 compare.
 """
 
+import gc
+import logging
+import random
 import threading
+from collections import Counter
 
 import pytest
 
@@ -388,6 +392,198 @@ class TestBlockLifecycle:
         assert manager.stats.allocated_blocks == 1
 
 
+class TestBlockMemory:
+    """A cached block owns its tensors; it does not pin the request's KV."""
+
+    HEADS, DIM, TOKENS = 8, 128, 1024  # 4 MiB per K or V of the whole request
+
+    @staticmethod
+    def _active():
+        mx.synchronize()
+        gc.collect()
+        mx.clear_cache()
+        return mx.get_active_memory()
+
+    def _big_layer(self, tokens):
+        vals = mx.random.normal((1, self.HEADS, len(tokens), self.DIM))
+        mx.eval(vals)
+        return {
+            "state": (vals, vals + 1.0),
+            "meta_state": (str(len(tokens)),),
+            "class_name": "KVCache",
+            "class_ref": cache_mod.KVCache,
+        }
+
+    def test_one_surviving_block_does_not_keep_the_whole_request_alive(self):
+        cache, manager = _cache(max_blocks=400)
+        tokens = [(i // BS) % 7 + 1 for i in range(self.TOKENS)]
+        before = self._active()
+        layer = self._big_layer(tokens)
+        mx.eval(layer["state"][1])
+        cache.store_cache("r", tokens + [9], [layer])
+        cache.release_cache("r")
+        # recycle everything but the first (shallowest) block of the chain
+        manager.get_new_blocks(manager.free_blocks - 1)
+        assert sum(1 for b in manager.blocks if b.block_hash is not None) == 1
+
+        del layer
+        held = self._active() - before
+
+        request_kv = 2 * self.HEADS * self.TOKENS * self.DIM * 4
+        block_kv = 2 * self.HEADS * BS * self.DIM * 4
+        assert held < 4 * block_kv, (held, block_kv, request_kv)
+        assert held < request_kv / 8
+
+    def test_a_block_completed_from_a_later_request_owns_its_tensors_too(self):
+        cache, manager = _cache(max_blocks=400)
+        tokens = [(i // BS) % 7 + 1 for i in range(self.TOKENS)]
+        # first request ends mid-block: its last full block has no snapshot...
+        cache.store_cache(
+            "a", tokens[: 2 * BS] + [9], [self._big_layer(tokens[: 2 * BS])]
+        )
+        cache.release_cache("a")
+        before = self._active()
+        layer = self._big_layer(tokens)
+        cache.store_cache("b", tokens + [9], [layer])
+        cache.release_cache("b")
+        manager.get_new_blocks(manager.free_blocks - 1)
+        del layer
+        assert self._active() - before < 4 * 2 * self.HEADS * BS * self.DIM * 4
+
+
+class TestUnsupportedLayouts:
+    """mlx-lm 0.32 rotating/chunked/quantized layers carry integer cursors or
+    nested tuples: they cannot be cut into blocks. Nothing is cached for such a
+    model (rather than a WARNING per finished request)."""
+
+    @staticmethod
+    def _extracted(layer):
+        from vllm_mlx.mlx_cache_compat import snapshot_state
+
+        state, meta = snapshot_state(layer)
+        return {
+            "state": state,
+            "meta_state": meta,
+            "class_name": type(layer).__name__,
+            "class_ref": type(layer),
+        }
+
+    @staticmethod
+    def _rotating():
+        layer = cache_mod.RotatingKVCache(max_size=8)
+        x = mx.ones((1, 2, 6, 4))
+        layer.update_and_fetch(x, x)
+        return layer
+
+    @staticmethod
+    def _quantized():
+        layer = cache_mod.QuantizedKVCache()
+        x = mx.ones((1, 2, 6, 64))
+        layer.update_and_fetch(x, x)
+        return layer
+
+    @pytest.mark.parametrize("make", ["_rotating", "_quantized"])
+    def test_nothing_is_cached_and_nothing_is_logged_per_request(self, make, caplog):
+        from vllm_mlx.mlx_cache_compat import snapshot_state
+
+        extracted = self._extracted(getattr(self, make)())
+        if all(
+            v is None or hasattr(v, "shape") for v in extracted["state"]
+        ):  # mlx-lm 0.31 layout: arrays only, see TestLayersThatCarryAPosition
+            pytest.skip("this mlx-lm keeps these layers' cursors in meta_state")
+        del snapshot_state
+
+        cache, manager = _cache()
+        tokens = A + B + [9]
+        with caplog.at_level(logging.INFO, logger="vllm_mlx.prefix_cache"):
+            assert cache.store_cache("r1", tokens, [extracted]) is None
+            assert cache.store_cache("r2", tokens, [extracted]) is None
+
+        assert manager.stats.allocated_blocks == 1
+        assert len(manager.cached_block_hash_to_block) == 0
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len([r for r in caplog.records if "cannot be stored" in r.message]) == 1
+
+    def test_a_model_with_one_such_layer_caches_nothing_at_all(self):
+        extracted = self._extracted(self._rotating())
+        if all(v is None or hasattr(v, "shape") for v in extracted["state"]):
+            pytest.skip("this mlx-lm keeps these layers' cursors in meta_state")
+        cache, manager = _cache()
+        tokens = A + B + [9]
+        cache.store_cache("r", tokens, [_kv_layer(tokens, 2 * BS), extracted])
+        assert len(manager.cached_block_hash_to_block) == 0
+
+
+class TestReleasePaths:
+    """Reference counts: every table reference is a ref, released exactly once."""
+
+    def test_block_without_data_is_not_findable(self, monkeypatch):
+        cache, manager = _cache()
+        tokens = A + B + [9]
+        real = cache._extract_block_tensor_slice
+        calls = []
+
+        def failing_second_block(*args, **kwargs):
+            calls.append(args[1])
+            return None if len(calls) == 2 else real(*args, **kwargs)
+
+        monkeypatch.setattr(cache, "_extract_block_tensor_slice", failing_second_block)
+        table = _serve(cache, "x1", tokens)
+
+        assert table.num_tokens == BS  # only the first block
+        assert manager.find_cached_block(B, compute_chain_hashes(A, BS)[0]) is None
+        assert len(manager.cached_block_hash_to_block) == 1
+        cache.release_cache("x1")
+        assert manager.stats.allocated_blocks == 1
+
+    def test_a_returning_request_id_does_not_leak_its_previous_references(self):
+        cache, manager = _cache()
+        tokens = A + B + [9]
+        _serve(cache, "x1", tokens)
+        cache.release_cache("x1")
+        for _ in range(3):  # fetch again and again under one id, never released
+            table, _ = cache.fetch_cache("again", tokens + [1])
+        assert all(manager.allocated_blocks[b].ref_count == 1 for b in table.block_ids)
+        cache.release_cache("again")
+        assert manager.stats.allocated_blocks == 1
+
+    def test_a_shared_block_stays_referenced_until_every_table_lets_go(self):
+        cache, manager = _cache()
+        _serve(cache, "x1", A + B + [9])
+        _serve(cache, "x2", A + C + [9])  # A deduplicated against x1's block
+        shared = manager.request_tables["x1"].block_ids[0]
+        assert manager.request_tables["x2"].block_ids[0] == shared
+        assert manager.allocated_blocks[shared].ref_count == 2
+
+        cache.release_cache("x2")
+        assert manager.allocated_blocks[shared].ref_count == 1  # x1 still holds it
+        assert shared not in [
+            b.block_id for b in manager.free_block_queue.get_all_free_blocks()
+        ]
+        cache.release_cache("x1")
+        assert manager.stats.allocated_blocks == 1
+
+    def test_truncating_a_table_frees_the_deepest_block_first(self):
+        cache, manager = _cache()
+        _serve(cache, "r", A + B + C + [9])
+        ids = list(manager.request_tables["r"].block_ids)
+        # the same request id comes back diverging after the first block
+        _serve(cache, "r", A + Z + Z1 + [9])
+        queue = [b.block_id for b in manager.free_block_queue.get_all_free_blocks()]
+        # B and C were dropped: C (deeper) is recycled before B, never B first
+        assert queue.index(ids[2]) < queue.index(ids[1])
+
+    def test_an_unhashed_block_is_scrubbed_when_recycled(self):
+        manager = PagedCacheManager(block_size=BS, max_blocks=3)
+        block = manager.allocate_block()
+        block.cache_data = ["tensors nobody registered"]
+        block.token_count = BS
+        manager.free_block(block.block_id)
+        recycled = [manager.allocate_block(), manager.allocate_block()]
+        got = next(b for b in recycled if b.block_id == block.block_id)
+        assert got.cache_data is None and got.token_count == 0
+
+
 # ---------------------------------------------------------------------------
 # Through the scheduler, with a model whose KV encodes its prefix
 # ---------------------------------------------------------------------------
@@ -534,3 +730,120 @@ class TestSchedulerStaleKV:
         _generate(other, "media", tokens, is_multimodal=True)
         _, request = _generate(other, "text", tokens)
         assert request.cached_tokens == 0
+
+
+class TestSchedulerReleasePaths:
+    def _primed(self):
+        warm = _scheduler()
+        _generate(warm, "prime", A + B + [1])
+        return warm
+
+    @staticmethod
+    def _request(rid, tokens, max_tokens=20):
+        return Request(
+            request_id=rid,
+            prompt=list(tokens),
+            sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0.0),
+        )
+
+    @staticmethod
+    def _idle(warm):
+        manager = warm.paged_cache_manager
+        return manager.request_tables == {} and manager.stats.allocated_blocks == 1
+
+    def test_aborting_a_waiting_request_releases_its_hit(self):
+        warm = self._primed()
+        warm.add_request(self._request("w", A + B + [2, 3]))
+        assert "w" in warm.paged_cache_manager.request_tables  # the hit is pinned
+        warm.abort_request("w")
+        warm.step()
+        assert self._idle(warm)
+
+    def test_aborting_a_running_request_releases_its_hit(self):
+        warm = self._primed()
+        warm.add_request(self._request("r", A + B + [2, 3]))
+        warm.step()
+        assert "r" in warm.running
+        warm.abort_request("r")
+        warm.step()
+        assert self._idle(warm)
+
+    def test_a_generation_error_releases_every_running_hit(self):
+        warm = self._primed()
+        warm.add_request(self._request("r", A + B + [2, 3]))
+        warm.step()
+        assert "r" in warm.running
+        warm._recover_from_generation_error()
+        assert self._idle(warm)
+
+    def test_a_hit_that_cannot_be_rebuilt_is_released_and_served_cold(
+        self, monkeypatch
+    ):
+        warm = self._primed()
+        monkeypatch.setattr(warm.block_aware_cache, "reconstruct_cache", lambda t: None)
+        request = self._request("m", A + B + [2, 3])
+        warm.add_request(request)
+        assert request.cache_hit_type == "miss"
+        assert self._idle(warm)
+
+
+class TestInvariants:
+    """Random store / fetch / release traffic on a pool smaller than the traffic."""
+
+    @staticmethod
+    def _check(manager):
+        refs = Counter(b for t in manager.request_tables.values() for b in t.block_ids)
+        for bid, block in manager.allocated_blocks.items():
+            if not block.is_null:
+                assert block.ref_count == refs[bid], (bid, block.ref_count, refs[bid])
+        free = manager.free_block_queue.get_all_free_blocks()
+        assert len(free) == manager.free_blocks
+        for block in free:
+            assert (
+                block.ref_count == 0 and block.block_id not in manager.allocated_blocks
+            )
+        assert len(manager.allocated_blocks) + len(free) == manager.max_blocks
+        for block_hash, entry in manager.cached_block_hash_to_block._cache.items():
+            for block in entry.values() if isinstance(entry, dict) else [entry]:
+                assert block.block_hash == block_hash
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_random_traffic_keeps_references_and_kv_consistent(self, hybrid):
+        rng = random.Random(1234 + hybrid)
+        cache, manager = _cache(max_blocks=10)
+        live = []
+        for step in range(400):
+            op = rng.choice(["store", "store", "fetch", "release"])
+            tokens = [
+                rng.randint(1, 3) for _ in range(rng.randint(1, 3)) for _ in range(BS)
+            ]
+            tokens += [rng.randint(5, 6) for _ in range(rng.randint(0, 3))]
+            rid = f"r{rng.randint(0, 5)}"
+            if op == "store":
+                extent = len(tokens) - rng.choice([0, 0, 1])
+                layers = [_kv_layer(tokens, extent)]
+                if hybrid:
+                    layers.append(_recurrent_layer(tokens, extent))
+                cache.store_cache(rid, tokens, layers)
+                live.append(rid)
+            elif op == "fetch":
+                table, remaining = cache.fetch_cache(rid, tokens)
+                if table is not None:
+                    n = table.num_tokens
+                    assert tokens[n:] == remaining
+                    rebuilt = cache.reconstruct_cache(table)
+                    if rebuilt is not None:
+                        _assert_is_cold_prefix(rebuilt, tokens, n)
+                        if hybrid:
+                            assert (
+                                rebuilt[1].cache[0].item()
+                                == _prefix_values(tokens)[n - 1]
+                            )
+                    live.append(rid)
+            elif live:
+                cache.release_cache(live.pop(rng.randrange(len(live))))
+            self._check(manager)
+        for rid in set(live):
+            cache.release_cache(rid)
+        self._check(manager)
+        assert manager.stats.allocated_blocks == 1

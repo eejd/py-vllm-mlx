@@ -23,6 +23,7 @@ try:
 
     HAS_MLX = True
 except ImportError:
+    mx = None
     HAS_MLX = False
 
 from .mlx_cache_compat import restore_from_state
@@ -381,6 +382,45 @@ def _under_pool_lock(method):
     return locked
 
 
+def _own(value: Any) -> Any:
+    """Copy every array of a (nested) cache state into a buffer of its own.
+
+    A slice of an evaluated MLX array is a view that keeps the whole parent
+    buffer alive. A cached block that merely sliced the finished request's KV
+    would pin all of that request's KV for as long as the block lives, so the
+    pool size (``max_cache_blocks``) would bound nothing: the memory held
+    could be many times the blocks' nominal size. Non-array values (the integer
+    cursors of a rotating layer) pass through.
+    """
+    if mx is not None and isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, tuple):
+        return tuple(_own(v) for v in value)
+    if isinstance(value, list):
+        return [_own(v) for v in value]
+    return value
+
+
+def _arrays_in(value: Any) -> List[Any]:
+    """Every array in a (nested) cache state."""
+    if mx is not None and isinstance(value, mx.array):
+        return [value]
+    if isinstance(value, (tuple, list)):
+        return [a for v in value for a in _arrays_in(v)]
+    return []
+
+
+def _is_array_state(state: Any) -> bool:
+    """A layer state made of arrays only (no integer cursors, no nesting)."""
+    return (
+        isinstance(state, (list, tuple))
+        and bool(state)
+        and all(
+            v is None or (mx is not None and isinstance(v, mx.array)) for v in state
+        )
+    )
+
+
 @dataclass
 class BlockCacheEntry:
     """Entry mapping a token sequence to cache blocks."""
@@ -438,6 +478,14 @@ class BlockAwarePrefixCache:
 
         # Request to block table mapping
         self._request_tables: Dict[str, BlockCacheEntry] = {}
+
+        # Layouts already reported (once per kind, not per request)
+        self._warned_layouts: set = set()
+        self._warned_recurrent = False
+
+        # Layouts already reported (once per kind, not per request)
+        self._warned_layouts: set = set()
+        self._warned_recurrent = False
 
         # Statistics
         self._hits = 0
@@ -525,6 +573,44 @@ class BlockAwarePrefixCache:
         data = block.cache_data
         return data is None or all(entry is not None for entry in data)
 
+    def _layout_supported(self, cache_data: List[Any]) -> bool:
+        """Can every layer of this cache be stored as blocks (and rebuilt)?
+
+        A layer's state is sliced along the sequence axis (plain KV), or kept
+        whole as the snapshot of the block where the request ended (recurrent
+        arrays). A layer whose state carries integer cursors (mlx-lm 0.32
+        rotating/chunked layers) or nested tuples (quantized KV) is neither:
+        slicing it fails. Nothing is cached for such a model, said once instead
+        of a warning per finished request.
+        """
+        for layer_state in cache_data:
+            state = layer_state.get("state") if isinstance(layer_state, dict) else None
+            if not _is_array_state(state):
+                name = (
+                    layer_state.get("class_name")
+                    if isinstance(layer_state, dict)
+                    else type(layer_state).__name__
+                )
+                if name not in self._warned_layouts:
+                    self._warned_layouts.add(name)
+                    logger.info(
+                        "Paged prefix cache: %s layers cannot be stored as "
+                        "blocks; requests of this model are not cached",
+                        name,
+                    )
+                return False
+        if not self._warned_recurrent and any(
+            self._cache_state_seq_axis(layer_state["state"]) is None
+            for layer_state in cache_data
+        ):
+            self._warned_recurrent = True
+            logger.info(
+                "Paged prefix cache: this model has recurrent layers; their "
+                "state exists only where a request ended, so a prefix hit "
+                "needs a stored request that ended on a block boundary"
+            )
+        return True
+
     def _cache_extent(self, cache_data: List[Any]) -> int:
         """Number of token positions the extracted cache actually holds.
 
@@ -587,6 +673,9 @@ class BlockAwarePrefixCache:
             and isinstance(cache_data[0], dict)
             and "state" in cache_data[0]
         )
+
+        if is_tensor_data and not self._layout_supported(cache_data):
+            return None
 
         # Positions whose KV really exists. Reference-only data (legacy) has
         # no tensors to bound it, nothing is sliced from it either.
@@ -783,7 +872,7 @@ class BlockAwarePrefixCache:
                 if end_idx == total_tokens:
                     block_slices.append(
                         {
-                            "state": state,
+                            "state": _own(state),
                             "meta_state": meta_state,
                             "class_ref": class_ref,
                             "class_name": class_name,
@@ -793,11 +882,17 @@ class BlockAwarePrefixCache:
                 else:
                     block_slices.append(None)
 
-            return (
-                block_slices
-                if any(entry is not None for entry in block_slices)
-                else None
-            )
+            if not any(entry is not None for entry in block_slices):
+                return None
+
+            # Materialize the copies now: a lazy copy would still reference
+            # the parent buffer until something evaluates it.
+            arrays = [
+                a for entry in block_slices if entry for a in _arrays_in(entry["state"])
+            ]
+            if arrays:
+                mx.eval(*arrays)
+            return block_slices
 
         except Exception as e:
             logger.warning(f"Failed to extract block tensor slice: {e}")
@@ -807,6 +902,8 @@ class BlockAwarePrefixCache:
         """Return the sequence axis for cache states that support block concat."""
         if not isinstance(state, (list, tuple)) or not state:
             return None
+        if not _is_array_state(state):
+            return None  # integer cursors / nested states: not block-sliceable
 
         ndims = {
             len(tensor.shape)
@@ -849,7 +946,7 @@ class BlockAwarePrefixCache:
             slices[seq_axis] = slice(start_idx, actual_end)
             return tensor[tuple(slices)]
 
-        sliced = [_slice_tensor(tensor) for tensor in state]
+        sliced = [_own(_slice_tensor(tensor)) for tensor in state]
         return tuple(sliced) if isinstance(state, tuple) else sliced
 
     def _concat_cache_states(
