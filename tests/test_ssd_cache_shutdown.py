@@ -7,12 +7,17 @@ import threading
 
 import pytest
 
+from vllm_mlx.cache_identity import CacheIdentity
 from vllm_mlx.ssd_cache import SSDCacheConfig, SSDCacheTier
+
+IDENT = CacheIdentity(model="model-a", window="window-a", kv="kv-a")
 
 
 class TestSSDCacheTierShutdown:
     def test_enqueue_spill_rejects_work_after_close(self, tmp_path):
-        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path / "closed_enqueue")))
+        tier = SSDCacheTier(
+            SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "closed_enqueue"))
+        )
         tier.close()
 
         assert tier.enqueue_spill((1,), [], memory_bytes=1) is False
@@ -30,7 +35,9 @@ class TestSSDCacheTierShutdown:
                     self.shutdown_requested.set()
                 return super().put(item, block=block, timeout=timeout)
 
-        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path / "drain_on_close")))
+        tier = SSDCacheTier(
+            SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "drain_on_close"))
+        )
         tier._spill_queue = ObservedQueue()
         first_write_started = threading.Event()
         release_first_write = threading.Event()
@@ -44,9 +51,9 @@ class TestSSDCacheTierShutdown:
 
         tier._write_entry = write_entry
         tier.start_writer()
-        tier._spill_queue.put(((1,), [], 1))
+        tier._spill_queue.put((tier._epoch, (1,), [], 1))
         assert first_write_started.wait(timeout=2.0)
-        tier._spill_queue.put(((2,), [], 1))
+        tier._spill_queue.put((tier._epoch, (2,), [], 1))
 
         close_thread = threading.Thread(target=tier.close)
         close_thread.start()
@@ -83,7 +90,9 @@ class TestSSDCacheTierShutdown:
                 self.closed = True
                 self.index.close()
 
-        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path / "writer_timeout")))
+        tier = SSDCacheTier(
+            SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "writer_timeout"))
+        )
         writer_thread = StillAliveThread()
         tracking_index = TrackingIndex(tier._index)
         tier._writer_thread = writer_thread
@@ -140,7 +149,7 @@ class TestSSDCacheTierShutdown:
                 self.index.close()
 
         tier = SSDCacheTier(
-            SSDCacheConfig(cache_dir=str(tmp_path / "sentinel_timeout"))
+            SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "sentinel_timeout"))
         )
         tracking_index = TrackingIndex(tier._index)
         shutdown_queue = FullShutdownQueue()
@@ -165,7 +174,9 @@ class TestSSDCacheTierShutdown:
     @pytest.mark.anyio
     async def test_aclose_keeps_event_loop_responsive(self, tmp_path, monkeypatch):
         """Async shutdown must move the blocking writer join off the loop."""
-        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path / "async_close")))
+        tier = SSDCacheTier(
+            SSDCacheConfig(identity=IDENT, cache_dir=str(tmp_path / "async_close"))
+        )
         original_close = tier.close
         release_close = threading.Event()
         close_finished = threading.Event()

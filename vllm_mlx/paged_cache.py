@@ -45,13 +45,21 @@ def compute_block_hash(
     """
     Compute hash for a block based on its content and parent block.
 
-    This enables prefix caching by creating a chain of hashes where
-    each block's hash depends on all previous blocks (similar to vLLM).
+    The hash identifies the block *in its context*: it covers the parent
+    block's hash (and through it every earlier block), the tokens of this
+    block and any extra keys. Two blocks with the same tokens behind different
+    prefixes therefore hash differently, which is what makes a cached block's
+    KV reusable only behind the exact prefix it was computed after (KV of a
+    token depends on every token before it). This is vLLM's block identity
+    (``vllm/v1/core/kv_cache_utils.py: hash_block_tokens``).
 
     Args:
         parent_hash: Hash of the previous block, or None for first block
         token_ids: Token IDs in this block
-        extra_keys: Additional keys (e.g., LoRA, multimodal)
+        extra_keys: Per-request inputs that change the KV of identical tokens
+            (multimodal content hashes, a cache salt, an adapter id, ...).
+            Every block of a request carries the same keys; they are folded in
+            at each block, as vLLM does.
 
     Returns:
         Content-based hash for this block
@@ -70,9 +78,36 @@ def compute_block_hash(
 
     # Include extra keys if present
     if extra_keys:
-        hasher.update(bytes(str(extra_keys), "utf-8"))
+        hasher.update(b"|extra|")
+        hasher.update(bytes(repr(tuple(extra_keys)), "utf-8"))
 
     return BlockHash(hasher.digest())
+
+
+def compute_chain_hashes(
+    token_ids: List[int],
+    block_size: int,
+    extra_keys: Optional[Tuple[Any, ...]] = None,
+    num_blocks: Optional[int] = None,
+) -> List[BlockHash]:
+    """
+    Chain hashes of the full ``block_size`` blocks of ``token_ids``.
+
+    ``result[i]`` identifies block ``i`` behind blocks ``0..i-1`` of this exact
+    token sequence. A trailing partial block has no hash (vLLM caches full
+    blocks only).
+    """
+    full = len(token_ids) // block_size
+    if num_blocks is not None:
+        full = min(full, num_blocks)
+    hashes: List[BlockHash] = []
+    parent: Optional[BlockHash] = None
+    for i in range(full):
+        parent = compute_block_hash(
+            parent, token_ids[i * block_size : (i + 1) * block_size], extra_keys
+        )
+        hashes.append(parent)
+    return hashes
 
 
 # =============================================================================
@@ -117,7 +152,6 @@ class CacheBlock:
 
     # Metadata
     token_count: int = 0
-    hash_value: Optional[str] = None  # Legacy string hash for compatibility
     last_access: float = field(default_factory=time.time)
 
     def is_full(self, block_size: int) -> bool:
@@ -131,7 +165,6 @@ class CacheBlock:
     def reset_hash(self) -> None:
         """Reset block hash when evicted from cache."""
         self.block_hash = None
-        self.hash_value = None
 
     def touch(self) -> None:
         """Update last access time."""
@@ -507,9 +540,6 @@ class PagedCacheManager:
         # Hash-to-block cache for prefix caching
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        # Legacy hash index for compatibility
-        self.hash_to_block: Dict[str, int] = {}
-
         # Request to block table mapping
         self.request_tables: Dict[str, BlockTable] = {}
 
@@ -537,6 +567,13 @@ class PagedCacheManager:
             f"max_blocks={max_blocks}, max_tokens={block_size * max_blocks}"
         )
 
+    @property
+    def lock(self) -> threading.RLock:
+        """The pool's (re-entrant) lock, for callers that need a lookup and the
+        pinning of what it found to be one step: a block found free can be
+        recycled by another thread before the caller references it."""
+        return self._lock
+
     # =========================================================================
     # Block Allocation (vLLM style)
     # =========================================================================
@@ -555,9 +592,8 @@ class PagedCacheManager:
 
             block = self.free_block_queue.popleft()
 
-            # Evict from hash cache if needed
-            if self.enable_caching:
-                self._maybe_evict_cached_block(block)
+            # A recycled block starts empty (hash cache entry and tensors)
+            self._maybe_evict_cached_block(block)
 
             block.ref_count = 1
             block.touch()
@@ -591,8 +627,7 @@ class PagedCacheManager:
             blocks = self.free_block_queue.popleft_n(num_blocks)
 
             for block in blocks:
-                if self.enable_caching:
-                    self._maybe_evict_cached_block(block)
+                self._maybe_evict_cached_block(block)
 
                 block.ref_count = 1
                 block.touch()
@@ -605,7 +640,14 @@ class PagedCacheManager:
 
     def _maybe_evict_cached_block(self, block: CacheBlock) -> bool:
         """
-        Evict a block from the hash cache if present.
+        Scrub a block that is about to be reused: drop it from the hash cache
+        and release whatever KV it still holds.
+
+        A block keeps its hash and tensors after it is freed (so that a later
+        request can still hit it) until it is handed out again. From then on
+        it must hold nothing of its previous life, hashed or not: a recycled
+        block whose stale tensors survived would be read back as the KV of
+        whatever tokens it is next given.
 
         Args:
             block: Block to evict
@@ -613,23 +655,19 @@ class PagedCacheManager:
         Returns:
             True if block was evicted from cache
         """
-        if block.block_hash is None:
-            return False
+        evicted = False
+        if block.block_hash is not None:
+            evicted = (
+                self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
+                is not None
+            )
+            if evicted:
+                self.stats.evictions += 1
 
-        evicted = self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
-
-        if evicted:
-            # Also remove from legacy hash index
-            if block.hash_value and block.hash_value in self.hash_to_block:
-                if self.hash_to_block[block.hash_value] == block.block_id:
-                    del self.hash_to_block[block.hash_value]
-
-            block.reset_hash()
-            block.cache_data = None  # Free tensor memory
-            self.stats.evictions += 1
-            return True
-
-        return False
+        block.reset_hash()
+        block.cache_data = None  # Free tensor memory
+        block.token_count = 0
+        return evicted
 
     def free_block(self, block_id: int) -> bool:
         """
@@ -710,6 +748,7 @@ class PagedCacheManager:
                         self.free_block_queue.remove(block)
                         self.stats.free_blocks -= 1
                         self.stats.allocated_blocks += 1
+                        self.stats.total_tokens_cached += block.token_count
                         self.allocated_blocks[block.block_id] = block
                     except RuntimeError:
                         pass  # Block not in queue
@@ -771,6 +810,7 @@ class PagedCacheManager:
         token_ids: List[int],
         num_cached_blocks: int,
         num_full_blocks: int,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> None:
         """
         Cache full blocks for prefix caching (vLLM style).
@@ -782,6 +822,7 @@ class PagedCacheManager:
             token_ids: All token IDs for the request
             num_cached_blocks: Number of blocks already cached
             num_full_blocks: Number of full blocks to cache
+            extra_keys: Per-request keys folded into every block hash
         """
         if not self.enable_caching:
             return
@@ -790,46 +831,37 @@ class PagedCacheManager:
             return
 
         with self._lock:
-            # Get parent hash from last cached block
-            parent_hash = None
-            if num_cached_blocks > 0:
-                parent_hash = blocks[num_cached_blocks - 1].block_hash
-
-            for i in range(num_cached_blocks, num_full_blocks):
+            # The chain is recomputed from the tokens, not read back from the
+            # previous block: a block's hash is only as trustworthy as the
+            # tokens it was derived from.
+            hashes = compute_chain_hashes(
+                token_ids, self.block_size, extra_keys, num_full_blocks
+            )
+            for i in range(num_cached_blocks, min(num_full_blocks, len(hashes))):
                 block = blocks[i]
                 if block.block_hash is not None:
-                    parent_hash = block.block_hash
                     continue  # Already cached
 
-                # Get tokens for this block
-                start = i * self.block_size
-                end = start + self.block_size
-                block_tokens = token_ids[start:end]
-
-                # Compute chain hash
-                block_hash = compute_block_hash(parent_hash, block_tokens)
-                block.block_hash = block_hash
-                block.token_count = len(block_tokens)
-
-                # Add to cache
-                self.cached_block_hash_to_block.insert(block_hash, block)
-
-                # Also maintain legacy hash for compatibility
-                legacy_hash = self.compute_block_hash(block_tokens)
-                block.hash_value = legacy_hash
-                self.hash_to_block[legacy_hash] = block.block_id
-
-                parent_hash = block_hash
+                block.block_hash = hashes[i]
+                block.token_count = self.block_size
+                self.cached_block_hash_to_block.insert(hashes[i], block)
 
     def get_computed_blocks(
         self,
         token_ids: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Tuple[List[CacheBlock], int]:
         """
         Find cached blocks for a token prefix (vLLM style).
 
+        Each block is looked up by its chain hash, so a block is returned only
+        when it was cached behind exactly the blocks before it in
+        ``token_ids``. The returned blocks may be free (``ref_count == 0``,
+        still evictable): pin them with :meth:`touch` before using them.
+
         Args:
             token_ids: Token IDs to look up
+            extra_keys: Per-request keys the blocks were cached under
 
         Returns:
             Tuple of (cached_blocks, num_cached_tokens)
@@ -838,21 +870,18 @@ class PagedCacheManager:
             return [], 0
 
         with self._lock:
-            cached_blocks = []
-            parent_hash = None
-            num_cached_tokens = 0
+            cached_blocks: List[CacheBlock] = []
+            parent_hash: Optional[BlockHash] = None
 
             num_full_blocks = len(token_ids) // self.block_size
 
             for i in range(num_full_blocks):
                 start = i * self.block_size
                 end = start + self.block_size
-                block_tokens = token_ids[start:end]
+                block_hash = compute_block_hash(
+                    parent_hash, token_ids[start:end], extra_keys
+                )
 
-                # Compute expected hash
-                block_hash = compute_block_hash(parent_hash, block_tokens)
-
-                # Look up in cache
                 cached_block = self.cached_block_hash_to_block.get_block(block_hash)
                 if cached_block is None:
                     self.stats.cache_misses += 1
@@ -860,45 +889,67 @@ class PagedCacheManager:
 
                 cached_blocks.append(cached_block)
                 parent_hash = block_hash
-                num_cached_tokens += self.block_size
                 self.stats.cache_hits += 1
 
-            return cached_blocks, num_cached_tokens
+            return cached_blocks, len(cached_blocks) * self.block_size
 
     # =========================================================================
-    # Legacy hash methods (for backwards compatibility)
+    # Single-block helpers (chain-hash keyed)
     # =========================================================================
 
-    @staticmethod
-    def compute_block_hash(tokens: List[int]) -> str:
-        """Compute legacy string hash for a sequence of tokens."""
-        token_bytes = b"".join(t.to_bytes(4, "big") for t in tokens)
-        return hashlib.sha256(token_bytes).hexdigest()[:16]
+    def find_cached_block(
+        self,
+        tokens: List[int],
+        parent_hash: Optional[BlockHash] = None,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
+    ) -> Optional[CacheBlock]:
+        """
+        Find the cached block holding ``tokens`` behind ``parent_hash``.
 
-    def find_cached_block(self, tokens: List[int]) -> Optional[CacheBlock]:
+        ``parent_hash`` is the chain hash of the preceding block (``None`` for
+        the first block). The same tokens behind a different parent are a
+        different block: their KV was computed in another context.
         """
-        Find a cached block matching the given tokens (legacy method).
-        """
+        if not self.enable_caching:
+            return None
+
         with self._lock:
-            hash_value = self.compute_block_hash(tokens)
-
-            if hash_value in self.hash_to_block:
-                block_id = self.hash_to_block[hash_value]
-                if block_id in self.allocated_blocks:
-                    block = self.allocated_blocks[block_id]
-                    block.touch()
-                    self.stats.cache_hits += 1
-                    return block
+            block_hash = compute_block_hash(parent_hash, tokens, extra_keys)
+            block = self.cached_block_hash_to_block.get_block(block_hash)
+            if block is not None:
+                block.touch()
+                self.stats.cache_hits += 1
+                return block
 
             self.stats.cache_misses += 1
             return None
 
-    def register_block_hash(self, block: CacheBlock, tokens: List[int]) -> None:
-        """Register a block's hash for deduplication (legacy method)."""
+    def register_block_hash(
+        self,
+        block: CacheBlock,
+        tokens: List[int],
+        parent_hash: Optional[BlockHash] = None,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
+    ) -> Optional[BlockHash]:
+        """
+        Make ``block`` findable as ``tokens`` behind ``parent_hash``.
+
+        Returns the block's chain hash (the ``parent_hash`` of the next block),
+        or ``None`` when caching is disabled.
+        """
+        if not self.enable_caching:
+            return None
+
         with self._lock:
-            hash_value = self.compute_block_hash(tokens)
-            block.hash_value = hash_value
-            self.hash_to_block[hash_value] = block.block_id
+            block_hash = compute_block_hash(parent_hash, tokens, extra_keys)
+            if block.block_hash != block_hash:
+                if block.block_hash is not None:
+                    self.cached_block_hash_to_block.pop(
+                        block.block_hash, block.block_id
+                    )
+                block.block_hash = block_hash
+                self.cached_block_hash_to_block.insert(block_hash, block)
+            return block_hash
 
     # =========================================================================
     # Block Table Management
@@ -928,7 +979,10 @@ class PagedCacheManager:
         with self._lock:
             table = self.request_tables.pop(request_id, None)
             if table:
-                for block_id in table.block_ids:
+                # Free the tail first: freed blocks are evicted front to back,
+                # and a block is only reachable behind its parents, so the
+                # deepest ones must go first.
+                for block_id in reversed(table.block_ids):
                     self.free_block(block_id)
 
     def add_block_to_table(
@@ -951,25 +1005,18 @@ class PagedCacheManager:
     def find_shared_prefix(
         self,
         tokens: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Tuple[List[int], List[int]]:
         """
         Find shared prefix blocks for a token sequence.
+
+        Returns the ids of the longest run of cached blocks that were cached
+        behind exactly the blocks before them in ``tokens`` (chain hash), and
+        the tokens left after them. The blocks are not pinned: see
+        :meth:`get_computed_blocks`.
         """
-        with self._lock:
-            shared_blocks = []
-            remaining_tokens = tokens.copy()
-
-            while len(remaining_tokens) >= self.block_size:
-                chunk = remaining_tokens[: self.block_size]
-                cached_block = self.find_cached_block(chunk)
-
-                if cached_block:
-                    shared_blocks.append(cached_block.block_id)
-                    remaining_tokens = remaining_tokens[self.block_size :]
-                else:
-                    break
-
-            return shared_blocks, remaining_tokens
+        blocks, num_cached = self.get_computed_blocks(tokens, extra_keys)
+        return [block.block_id for block in blocks], list(tokens[num_cached:])
 
     def fork_block_table(
         self,
@@ -1113,6 +1160,13 @@ class PagedCacheManager:
     def get_stats(self) -> CacheStats:
         """Get current cache statistics."""
         with self._lock:
+            # Derived from the pool, not from running counters: blocks are
+            # shared between tables and revived from the free queue, which a
+            # counter bumped at add/free time cannot follow.
+            self.stats.allocated_blocks = len(self.allocated_blocks)
+            self.stats.total_tokens_cached = sum(
+                b.token_count for b in self.allocated_blocks.values() if not b.is_null
+            )
             self.stats.shared_blocks = sum(
                 1 for b in self.allocated_blocks.values() if b.ref_count > 1
             )
@@ -1155,7 +1209,6 @@ class PagedCacheManager:
                 return False
 
             self.cached_block_hash_to_block.clear()
-            self.hash_to_block.clear()
 
             for block in self.blocks:
                 block.reset_hash()
@@ -1176,7 +1229,6 @@ class PagedCacheManager:
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
             self.cached_block_hash_to_block.clear()
-            self.hash_to_block.clear()
             self.request_tables.clear()
             self.allocated_blocks.clear()
 

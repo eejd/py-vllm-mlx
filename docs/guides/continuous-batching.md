@@ -38,6 +38,24 @@ that envelope fall back to the normal scheduler path instead of using MTP. This
 keeps sampling correctness ahead of throughput until the MLLM verifier is
 sampler-aware.
 
+A speculative verify step runs the cache past the tokens that have been emitted
+(the primary token and the draft after it are already cached when the next step
+starts). Two rules keep that from leaking into reuse or into other requests:
+
+- The text-only prompt-KV prefix cache stores a finished request's cache cut back
+  to exactly its prompt. The cut is measured from the positions the cache holds,
+  not from the number of tokens emitted. A store or a hit is refused (and the
+  request prefilled in full) unless every layer holds exactly the positions of
+  the tokens the entry is keyed by.
+- A request that joins a batch that is already speculating is brought to the
+  batch's verified state before it joins: its first token is fed while it is
+  still a batch of its own, so the merged batch never feeds a resident
+  request's input token a second time. A step that finds a partially verified
+  batch fails the batch rather than decode from a cache holding a duplicated
+  token. A failure after the verify forward (the cache already holds the
+  verified positions) stops the batch for the same reason; a failure of the
+  draft head before it only costs that step's speculation.
+
 An external mlx-vlm assistant drafter can be configured for either simple or
 continuous-batching mode:
 
@@ -81,6 +99,32 @@ ownership, not a throughput feature.
 - KV cache stored in fixed-size blocks
 - Shared system prompts use same blocks
 - Memory savings: 80%+ for 10+ concurrent users
+- A block is identified by its chain hash (the hash of the previous block, the block's
+  tokens and any per-request extra keys), as in vLLM. The same tokens behind a different
+  prefix, or at a different position, are a different block, so a hit is always KV that was
+  computed behind exactly this prefix (py-vllm-mlx#104). Only full blocks are cached and
+  hit; requests with images or video bypass the paged cache.
+- Blocks of a finished request are released but stay cached until the pool needs them
+  (least recently used, deepest block first).
+- A cached block owns its tensors (copies, not views of the finished request's KV), so
+  `--max-cache-blocks` x `--paged-cache-block-size` x the model's KV bytes per token bounds
+  the memory the cache holds.
+
+**Limits of the paged cache (use the default prefix cache, `--enable-prefix-cache` without
+`--use-paged-cache`, when they matter):**
+
+- *Hybrid models with recurrent layers (Qwen3.5-style, Nemotron-3-Nano, ...):* the scheduler
+  keeps a finished request's cache only when it can be trimmed, and a recurrent layer cannot
+  be. With `--use-paged-cache` nothing is stored for such a model and it never hits (measured
+  through the scheduler with a one-KV-layer, one-ArraysCache model: zero stores and zero hits
+  over 14 requests; the server logs it once). It is served cold, as correctly as without a
+  cache. The block store itself can hold a recurrent snapshot (taken where a request ended,
+  so a prefix hit would need a request that ended exactly on a block boundary), but the
+  scheduler does not feed it one.
+- *Sliding-window, chunked or quantized-KV layers (mlx-lm 0.32 layouts with integer cursors
+  or nested tuples):* they cannot be cut into blocks; nothing is cached for such a model
+  (logged once).
+- Requests with images or video are not cached.
 
 ## Performance Results
 

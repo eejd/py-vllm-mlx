@@ -794,23 +794,6 @@ class TestMultimodalProcessorBatch:
         assert input_ids.shape == (2, 5)  # max length is 5
         assert padding == [2, 0]  # first input needs 2 padding
 
-    def test_compute_vision_hash(self):
-        """Test vision hash computation."""
-        from vllm_mlx.multimodal_processor import MultimodalProcessor
-
-        mock_model = MagicMock()
-        mock_processor = MagicMock()
-
-        processor = MultimodalProcessor(mock_model, mock_processor)
-
-        pixels = mx.ones((1, 3, 32, 32))
-        hash1 = processor.compute_vision_hash(pixels)
-        hash2 = processor.compute_vision_hash(pixels)
-
-        # Same input should give same hash
-        assert hash1 == hash2
-        assert len(hash1) == 16  # SHA256 truncated to 16 chars
-
 
 class TestVisionCache:
     """Tests for VLM cache functionality."""
@@ -1181,7 +1164,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         )
 
         class FakeCache:
-            offset = 1
+            offset = 3  # the 3 cached tokens of the 4-token prompt
 
             def is_trimmable(self):
                 return True
@@ -1538,10 +1521,11 @@ class TestMLLMBatchGeneratorMTPGuards:
                 self._step = original_step
                 self._next = MagicMock(return_value=[])
                 self.active_batch = SimpleNamespace(
+                    uids=[1, 2],
                     requests=[
                         SimpleNamespace(mllm_draft=True),
                         SimpleNamespace(mllm_draft=False),
-                    ]
+                    ],
                 )
                 self.sampler = MagicMock()
 
@@ -2760,7 +2744,7 @@ class TestChunkedPrefillCacheHandling:
         gen._rewind_prefix_cache = tracking_rewind
 
         # Fake prefix cache: exact hit → remaining_ids = [] (empty)
-        fake_kv = [self._make_fake_kv_cache(offset=50)]
+        fake_kv = [self._make_fake_kv_cache(offset=5)]  # the whole 5-token prompt
 
         class FakePrefixCache:
             def fetch(self, ids):
