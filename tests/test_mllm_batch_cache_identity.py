@@ -118,6 +118,50 @@ class TestMtpStoresPromptKv:
         assert_entries_are_prompt_kv(gen)
 
 
+class TestMtpStepFailures:
+    """Whether a failed step may be survived depends on where it failed."""
+
+    def test_draft_head_failure_costs_one_step_not_the_answer(self):
+        gen, lm = make_generator(mtp=True, prefix_cache=False)
+        real_head = lm.mtp_forward
+        heads = []
+
+        def flaky_head(*args, **kwargs):
+            heads.append(1)
+            if len(heads) == 2:
+                raise RuntimeError("draft head failed")
+            return real_head(*args, **kwargs)
+
+        lm.mtp_forward = flaky_head
+
+        assert serve(gen, "a", PROMPT, 10) == greedy_continuation(PROMPT, 10)
+        assert gen.get_mtp_stats()["errors"] == 1
+
+    def test_failure_after_the_verify_forward_stops_the_batch(self, monkeypatch):
+        # The verify forward has put two positions into the cache; carrying on
+        # would feed the input token again and change the answer.
+        import vllm_mlx.mllm_batch_generator as module
+
+        gen, _ = make_generator(mtp=True, prefix_cache=False)
+        real = module._sampling_logprobs
+        calls = []
+
+        def failing_after_verify(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:  # the verify distribution of the first step
+                raise RuntimeError("failed after the verify forward")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, "_sampling_logprobs", failing_after_verify)
+        request = make_request("a", PROMPT, 10)
+        request.temperature = 0.7
+        gen.insert([request])
+
+        with pytest.raises(RuntimeError, match="after the verify forward"):
+            for _ in range(10):
+                gen.next()
+
+
 class TestRequestsJoiningAnMtpBatch:
     """A request that joins while others decode must not disturb them."""
 

@@ -3436,6 +3436,7 @@ def install_mtp_mllm(
             primary_tokens = batch_gen.sampler(logprobs)
 
         # MTP draft + always-advance verify
+        verify_started = False
         try:
             with _mtp_stats_lock:
                 _mtp_stats["attempted"] += 1
@@ -3515,6 +3516,7 @@ def install_mtp_mllm(
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
             )
+            verify_started = True
             verify_output = language_model(
                 verify_input, cache=cache, return_hidden=True, **model_kwargs
             )
@@ -3717,6 +3719,13 @@ def install_mtp_mllm(
                     draft_model.draft_lens.append(1)
 
         except Exception as e:
+            if verify_started:
+                # The verify forward writes two positions into the cache and
+                # the accept/reject bookkeeping rolls them back. A failure
+                # anywhere after it leaves the cache in a state no later step
+                # knows about (the input token would be fed again); stop the
+                # batch instead of decoding from it.
+                raise
             logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")
             _skip_state_by_uid.clear()
             with _mtp_stats_lock:

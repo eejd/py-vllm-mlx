@@ -40,7 +40,7 @@ sampler-aware.
 
 A speculative verify step runs the cache past the tokens that have been emitted
 (the primary token and the draft after it are already cached when the next step
-starts). Two rules keep that from leaking into reuse:
+starts). Two rules keep that from leaking into reuse or into other requests:
 
 - The text-only prompt-KV prefix cache stores a finished request's cache cut back
   to exactly its prompt. The cut is measured from the positions the cache holds,
@@ -52,7 +52,9 @@ starts). Two rules keep that from leaking into reuse:
   still a batch of its own, so the merged batch never feeds a resident
   request's input token a second time. A step that finds a partially verified
   batch fails the batch rather than decode from a cache holding a duplicated
-  token.
+  token. A failure after the verify forward (the cache already holds the
+  verified positions) stops the batch for the same reason; a failure of the
+  draft head before it only costs that step's speculation.
 
 An external mlx-vlm assistant drafter can be configured for either simple or
 continuous-batching mode:
