@@ -320,6 +320,7 @@ class MLLMScheduler:
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
+                    max_kv_size=self.config.max_kv_size,
                 )
 
             self.batch_generator = MLLMBatchGenerator(
@@ -362,6 +363,7 @@ class MLLMScheduler:
 
                 ssd_config = SSDCacheConfig(
                     cache_dir=self.config.ssd_cache_dir,
+                    identity=prefix_cache.identity,
                     max_size_gb=self.config.ssd_cache_max_gb,
                 )
                 self._ssd_tier = SSDCacheTier(ssd_config)

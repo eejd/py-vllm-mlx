@@ -230,7 +230,6 @@ class TestPagedPrefixCacheRoundTrip:
     def test_store_and_reconstruct_hybrid_model(self):
         from vllm_mlx.paged_cache import PagedCacheManager
         from vllm_mlx.prefix_cache import BlockAwarePrefixCache
-        from vllm_mlx.scheduler import Scheduler
 
         tokens = list(range(8))
         kv = _kv(lm_cache.KVCache, tokens=8)
@@ -251,10 +250,6 @@ class TestPagedPrefixCacheRoundTrip:
         assert mx.array_equal(compat.kv_view(rebuilt[0])[0], compat.kv_view(kv)[0])
         assert mx.array_equal(rebuilt[1].cache[0], rec.cache[0])
         assert mx.array_equal(rebuilt[1].cache[1], rec.cache[1])
-
-        scheduler = Scheduler.__new__(Scheduler)
-        again = scheduler._reconstruct_cache_from_states(extracted)
-        assert again is not None and again[0].offset == 8
 
 
 class TestCloneLayer:

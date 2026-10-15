@@ -18,10 +18,11 @@ import hashlib
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
+
+from .mllm_cache import compute_images_hash, is_remote_source
 
 logger = logging.getLogger(__name__)
 
@@ -96,53 +97,18 @@ class EncodingCacheEntry:
     encoding_time: float = 0.0
 
 
-def compute_image_hash(image_path: str) -> str:
-    """
-    Compute hash of image content.
-
-    For files: hash the actual content
-    For URLs/base64: hash the string
-    """
-    try:
-        path = Path(image_path)
-        if path.exists() and path.is_file():
-            # Hash full file content (not truncated — truncation can
-            # cause collisions for images with identical headers)
-            with open(path, "rb") as f:
-                content = f.read()
-            return hashlib.sha256(content).hexdigest()[:16]
-        else:
-            # Hash the string (URL or base64)
-            return hashlib.sha256(image_path.encode()).hexdigest()[:16]
-    except Exception:
-        return hashlib.sha256(str(image_path).encode()).hexdigest()[:16]
-
-
-def compute_images_hash(images: List[str]) -> str:
-    """Compute combined hash for multiple images.
-
-    Order matters: ``[A, B]`` and ``[B, A]`` are different requests (the
-    k-th image fills the k-th placeholder, so the pixels and the prompt tokens
-    differ), and must never share a cache entry.
-    """
-    if not images:
-        return "no_images"
-    hashes = [compute_image_hash(img) for img in images]
-    return hashlib.sha256("_".join(hashes).encode()).hexdigest()[:16]
-
-
 class VisionEmbeddingCache:
     """
     Two-level cache for vision processing in MLLM.
 
     Level 1 (Pixel Cache):
         - Caches output of prepare_inputs() (pixel_values, input_ids, etc.)
-        - Key: hash(images) + hash(prompt)
+        - Key: image bytes + prompt text + tokenisation kind (add_special_tokens)
         - Saves: Image loading, resizing, normalization time (~0.5-1s)
 
     Level 2 (Encoding Cache):
         - Caches output of VLM forward pass (logits, first token)
-        - Key: hash(images) + hash(prompt)
+        - Key: image bytes + prompt text + tokenisation kind (add_special_tokens)
         - Saves: Vision encoder computation time (~1-2s)
 
     Example:
@@ -183,12 +149,30 @@ class VisionEmbeddingCache:
 
         self.stats = VisionCacheStats()
 
-    def _make_key(self, images: List[str], prompt: str) -> str:
-        """Create cache key from images and prompt."""
+    def _usable(self, images: List[str]) -> bool:
+        """Whether ``images`` can be looked up / stored: enabled, non-empty, and
+        every source's content pinned (a remote URL names no bytes)."""
+        return (
+            self.enabled
+            and bool(images)
+            and not any(is_remote_source(image) for image in images)
+        )
+
+    def _make_key(
+        self,
+        images: List[str],
+        prompt: str,
+        add_special_tokens: Optional[bool] = None,
+    ) -> str:
+        """Create cache key from images, prompt text and the request kind.
+
+        The pixel entry holds the prompt's ``input_ids``, which differ between
+        the kinds (``add_special_tokens`` adds the tokenizer's BOS to the same
+        text), so the kind is part of the key.
+        """
         img_hash = compute_images_hash(images)
-        # Use shorter prompt hash for cache key
-        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:12]
-        return f"{img_hash}_{prompt_hash}"
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        return f"{img_hash}_{prompt_hash}_{add_special_tokens}"
 
     def _make_image_only_key(self, images: List[str]) -> str:
         """Create cache key from images only (prompt-independent)."""
@@ -200,6 +184,7 @@ class VisionEmbeddingCache:
         self,
         images: List[str],
         prompt: str,
+        add_special_tokens: Optional[bool] = None,
     ) -> Optional[PixelCacheEntry]:
         """
         Get cached pixel values for images+prompt.
@@ -207,10 +192,10 @@ class VisionEmbeddingCache:
         Returns:
             PixelCacheEntry if found, None otherwise
         """
-        if not self.enabled or not images:
+        if not self._usable(images):
             return None
 
-        key = self._make_key(images, prompt)
+        key = self._make_key(images, prompt, add_special_tokens)
 
         if key in self._pixel_cache:
             # Move to end (most recently used)
@@ -237,12 +222,13 @@ class VisionEmbeddingCache:
         image_grid_thw: Optional[mx.array] = None,
         extra_kwargs: Optional[Dict[str, Any]] = None,
         processing_time: float = 0.0,
+        add_special_tokens: Optional[bool] = None,
     ) -> None:
         """Store pixel values in cache."""
-        if not self.enabled or not images:
+        if not self._usable(images):
             return
 
-        key = self._make_key(images, prompt)
+        key = self._make_key(images, prompt, add_special_tokens)
 
         # Evict oldest if at capacity
         while len(self._pixel_cache) >= self.max_pixel_entries:
@@ -279,7 +265,7 @@ class VisionEmbeddingCache:
         Returns:
             PixelOnlyCacheEntry if found, None otherwise
         """
-        if not self.enabled or not images:
+        if not self._usable(images):
             return None
 
         key = self._make_image_only_key(images)
@@ -307,7 +293,7 @@ class VisionEmbeddingCache:
         processing_time: float = 0.0,
     ) -> None:
         """Store pixel values in cache (prompt-independent)."""
-        if not self.enabled or not images:
+        if not self._usable(images):
             return
 
         key = self._make_image_only_key(images)
@@ -332,6 +318,7 @@ class VisionEmbeddingCache:
         self,
         images: List[str],
         prompt: str,
+        add_special_tokens: Optional[bool] = None,
     ) -> Optional[EncodingCacheEntry]:
         """
         Get cached vision encoding output.
@@ -339,10 +326,10 @@ class VisionEmbeddingCache:
         Returns:
             EncodingCacheEntry if found, None otherwise
         """
-        if not self.enabled or not images:
+        if not self._usable(images):
             return None
 
-        key = self._make_key(images, prompt)
+        key = self._make_key(images, prompt, add_special_tokens)
 
         if key in self._encoding_cache:
             entry = self._encoding_cache.pop(key)
@@ -366,12 +353,13 @@ class VisionEmbeddingCache:
         first_token: int,
         logprobs: mx.array,
         encoding_time: float = 0.0,
+        add_special_tokens: Optional[bool] = None,
     ) -> None:
         """Store vision encoding output in cache."""
-        if not self.enabled or not images:
+        if not self._usable(images):
             return
 
-        key = self._make_key(images, prompt)
+        key = self._make_key(images, prompt, add_special_tokens)
 
         # Evict oldest if at capacity
         while len(self._encoding_cache) >= self.max_encoding_entries:

@@ -288,9 +288,7 @@ def test_llm_mtp_counters_reach_api_metadata_after_aggregation(
         async def generate(self, *, prompt, sampling_params, add_special_tokens):
             return collector.get_nowait()
 
-        async def add_request(
-            self, *, prompt, sampling_params, prefix_boundary, add_special_tokens
-        ):
+        async def add_request(self, *, prompt, sampling_params, add_special_tokens):
             return "test-1"
 
         async def stream_outputs(self, request_id):

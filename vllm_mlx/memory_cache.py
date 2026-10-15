@@ -28,12 +28,19 @@ import bisect
 import copy
 import logging
 import math
+import re
 import threading
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
-from .mlx_cache_compat import prompt_cache_format, recurrent_arrays
+from .cache_identity import (
+    CacheIdentity,
+    kv_identity,
+    model_identity,
+    window_identity,
+)
+from .mlx_cache_compat import kv_view, prompt_cache_format, recurrent_arrays
 
 
 def is_text_only_prefix_cache_request(request: Any) -> bool:
@@ -52,7 +59,11 @@ _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 # Bump this when the cache on-disk format or KV semantics change.
 # Loading a cache with a different version is rejected automatically.
-_CACHE_PERSIST_VERSION = 4
+# 5: the index records the full cache identity (weights digest, whole model
+#    config, mlx/mlx-lm versions, KV quantization, max-kv-size) instead of a
+#    16-hex digest of seven config fields, and each entry's file is checked
+#    against the token count recorded for it.
+_CACHE_PERSIST_VERSION = 5
 
 
 def _get_available_memory() -> int:
@@ -233,6 +244,9 @@ class MemoryCacheConfig:
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
     min_prefix_tokens: int = 128
+    # ``--max-kv-size``: the window the cached KV was computed under. Part of
+    # the identity of persisted and SSD entries; 0 = unbounded.
+    max_kv_size: int = 0
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -1066,46 +1080,82 @@ def _quantization_signature(model: Any) -> str:
     )
 
 
-def _compute_model_fingerprint(model: Any) -> str:
-    """Compute a fingerprint from model architecture for cache compatibility.
+def _compute_model_identity(model: Any) -> tuple[str, dict[str, Any]]:
+    """The identity of what ``model`` computes, as ``(digest, description)``.
 
-    Used to reject disk-persisted caches created by a different model or
-    a different quantisation of the same model.  The fingerprint is a
-    short hex digest of the architecture (num_layers, hidden_size, vocab_size,
-    num_kv_heads, head_dim, ...) and of the weight quantization actually present
-    in the loaded model (see :func:`_quantization_signature`) — lightweight and
-    deterministic.  Two checkpoints of one architecture quantized differently
-    (4-bit vs 6-bit, different group size or mode) therefore do not share a cache.
+    Used to refuse entries that outlive the process (the persisted prefix cache,
+    the SSD tier) when they were written by a different model: same
+    architecture and dimensions but other weights (instruct vs base, a new
+    revision at the same path), another rope or sliding-window setting, another
+    dtype or weight quantization, or other mlx / mlx-lm code. See
+    :mod:`vllm_mlx.cache_identity` for what is covered and how weights are
+    identified.
     """
+    digest, detail = model_identity(model, _quantization_signature(model))
+    logger.debug("[model_fingerprint] %s (%s)", digest, detail)
+    return digest, detail
+
+
+def _compute_model_fingerprint(model: Any) -> str:
+    """Digest of the model-side cache identity (see :func:`_compute_model_identity`)."""
+    return _compute_model_identity(model)[0]
+
+
+def _tokens_digest(tokens: tuple[int, ...] | list[int]) -> str:
+    """SHA-256 of a token sequence as stored beside its KV (32-bit ints)."""
+    import array
     import hashlib
 
-    parts: list[str] = []
-    # Walk model.config / model.args / direct attributes
-    for cfg_attr in ("config", "args", "model_config"):
-        cfg = getattr(model, cfg_attr, None)
-        if cfg is not None:
-            break
-    if cfg is None:
-        cfg = model  # fallback: attributes on the model itself
+    return hashlib.sha256(array.array("i", tokens).tobytes()).hexdigest()
 
-    for key in (
-        "num_hidden_layers",
-        "hidden_size",
-        "vocab_size",
-        "num_key_value_heads",
-        "head_dim",
-        "intermediate_size",
-        "model_type",
-    ):
-        val = getattr(cfg, key, None)
-        if val is not None:
-            parts.append(f"{key}={val}")
 
-    parts.append(f"quant={_quantization_signature(model)}")
+def _layer_length_error(layer: Any, n: int, nested: bool = False) -> str | None:
+    """Why ``layer`` does not hold exactly ``n`` tokens, or None if it does.
 
-    fingerprint = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-    logger.debug(f"[model_fingerprint] {fingerprint} ({', '.join(parts)})")
-    return fingerprint
+    A sub-cache inside a container may be empty (the dense-mode DSA indexer),
+    so ``0`` is accepted there.
+    """
+    children = getattr(layer, "caches", None)
+    if children:
+        for child in children:
+            error = _layer_length_error(child, n, nested=True)
+            if error is not None:
+                return error
+        return None
+    offset = getattr(layer, "offset", None)
+    if isinstance(offset, int) and not isinstance(offset, bool):
+        if offset != n and not (nested and offset == 0):
+            return f"{type(layer).__name__} offset {offset} != {n} tokens"
+        view = kv_view(layer) if offset == n else None
+        if view is not None and view[0].shape[-2] != n:
+            return (
+                f"{type(layer).__name__} holds {view[0].shape[-2]} positions "
+                f"for {n} tokens"
+            )
+    return None
+
+
+def _entry_inconsistency(
+    cache: list[Any], tokens: list[int], metadata: dict[str, str]
+) -> str | None:
+    """Why a restored ``cache`` is not the KV of ``tokens``, or None if it is.
+
+    The tokens live in a file beside the KV and the count in an index, written
+    at different moments, so a save that was interrupted, or two writers
+    sharing a directory, can pair KV with tokens it was not computed for.
+    Serving that is a wrong answer, not a miss. Checked: the token count and
+    digest recorded in the KV file, and the length every layer actually holds.
+    """
+    n = len(tokens)
+    if metadata.get("num_tokens") != str(n):
+        return f"file records {metadata.get('num_tokens')} tokens, key has {n}"
+    if metadata.get("tokens_sha256") != _tokens_digest(tokens):
+        return "token digest differs from the one recorded with the KV"
+    for index, layer in enumerate(cache):
+        error = _layer_length_error(layer, n)
+        if error is not None:
+            return f"layer {index}: {error}"
+    return None
 
 
 class MemoryAwarePrefixCache:
@@ -1140,7 +1190,20 @@ class MemoryAwarePrefixCache:
         """
         self._model_id = id(model)
         self._config = config or MemoryCacheConfig()
-        self._model_fingerprint = _compute_model_fingerprint(model)
+        model_digest, model_detail = _compute_model_identity(model)
+        kv_digest, kv_detail = kv_identity(
+            kv_quantize=self._config.kv_quantize,
+            kv_bits=self._config.kv_bits,
+            kv_group_size=self._config.kv_group_size,
+            kv_min_quantize_tokens=self._config.kv_min_quantize_tokens,
+        )
+        window_digest, window_detail = window_identity(self._config.max_kv_size)
+        self._identity = CacheIdentity(
+            model=model_digest,
+            window=window_digest,
+            kv=kv_digest,
+            detail={"model": model_detail, "window": window_detail, "kv": kv_detail},
+        )
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -1700,13 +1763,25 @@ class MemoryAwarePrefixCache:
 
         return removed
 
+    @property
+    def identity(self) -> CacheIdentity:
+        """What the entries of this cache are valid for (model, KV config)."""
+        return self._identity
+
     def clear(self) -> None:
-        """Clear all cached entries."""
+        """Clear all cached entries, including the SSD tier's.
+
+        A flush (``DELETE /v1/cache``, cache-error recovery) that left the cold
+        tier alone would let the next lookup promote an entry the flush was
+        meant to drop back into RAM, so the tier is emptied with the RAM cache.
+        """
         with self._memory_lock:
             self._entries.clear()
             self._sorted_keys.clear()
             self._current_memory = 0
             self._stats = CacheStats(max_memory_bytes=self._max_memory)
+        if self._ssd_tier is not None:
+            self._ssd_tier.clear()
         logger.debug("Cache cleared")
 
     def get_stats(self) -> dict[str, Any]:
@@ -1840,12 +1915,27 @@ class MemoryAwarePrefixCache:
             logger.warning("[cache_persist] mlx_lm not available, cannot save")
             return False
 
+        index_path = os.path.join(cache_dir, "index.json")
+        # The index is what makes the entry files readable. Drop the old one
+        # before overwriting any of them: a save that dies half-way then leaves
+        # a directory with nothing to load rather than an old index describing
+        # new files.
+        try:
+            os.unlink(index_path)
+        except FileNotFoundError:
+            pass
+
         index = {
             "version": _CACHE_PERSIST_VERSION,
             # save_prompt_cache writes a different file layout on mlx-lm 0.32
             # (no meta_state) than on 0.31; neither can read the other's.
             "cache_format": prompt_cache_format(),
-            "model_fingerprint": self._model_fingerprint,
+            "identity": {
+                "model": self._identity.model,
+                "window": self._identity.window,
+                "kv": self._identity.kv,
+                "detail": self._identity.detail,
+            },
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
             "entries": [],
@@ -1859,15 +1949,19 @@ class MemoryAwarePrefixCache:
                 # save_prompt_cache requires .state and .meta_state which
                 # the wrapper does not provide; dequantizing restores the
                 # original cache types that do.
+                held_quantized = any(
+                    isinstance(c, _QuantizedCacheWrapper) for c in entry.cache
+                )
                 persist_cache = (
-                    _dequantize_cache(entry.cache)
-                    if any(isinstance(c, _QuantizedCacheWrapper) for c in entry.cache)
-                    else entry.cache
+                    _dequantize_cache(entry.cache) if held_quantized else entry.cache
                 )
                 save_prompt_cache(
                     entry_path,
                     persist_cache,
-                    metadata={"num_tokens": str(len(tokens_key))},
+                    metadata={
+                        "num_tokens": str(len(tokens_key)),
+                        "tokens_sha256": _tokens_digest(tokens_key),
+                    },
                 )
                 # Save tokens separately (can be 100K+ ints → binary is smaller)
                 tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
@@ -1882,6 +1976,9 @@ class MemoryAwarePrefixCache:
                         "index": i,
                         "num_tokens": len(tokens_key),
                         "memory_bytes": entry.memory_bytes,
+                        # Held quantized: the saved KV is the dequantized copy,
+                        # which carries that setting's rounding (see load).
+                        "kv_quantized": held_quantized,
                     }
                 )
                 saved += 1
@@ -1894,9 +1991,24 @@ class MemoryAwarePrefixCache:
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to save entry {i}: {e}")
 
-        index_path = os.path.join(cache_dir, "index.json")
-        with open(index_path, "w") as f:
-            json.dump(index, f, indent=2)
+        # Publish atomically: a reader sees the old index or the new one.
+        tmp_index_path = index_path + ".tmp"
+        with open(tmp_index_path, "w") as f:
+            json.dump(index, f, indent=2, default=str)
+        os.replace(tmp_index_path, index_path)
+        # Entry files this save did not write (a larger earlier save, or the
+        # files of an index that was refused) are unreadable without an index
+        # that names them: remove them rather than strand them.
+        written = {f"entry_{e['index']}" for e in index["entries"]}
+        for name in os.listdir(cache_dir):
+            m = re.match(r"^(entry_\d+)(\.safetensors|_tokens\.bin)$", name)
+            if m and m.group(1) not in written:
+                try:
+                    os.unlink(os.path.join(cache_dir, name))
+                except OSError:
+                    logger.warning(
+                        "[cache_persist] could not remove stale %s", name, exc_info=True
+                    )
 
         dt = _time.monotonic() - t0
         logger.info(
@@ -1950,18 +2062,39 @@ class MemoryAwarePrefixCache:
             logger.warning("[cache_persist] mlx_lm not available, cannot load")
             return 0
 
-        disk_fp = index.get("model_fingerprint", "")
-        if disk_fp and disk_fp != self._model_fingerprint:
+        recorded = index.get("identity") or {}
+        differs = self._identity.mismatch(recorded.get("model"), recorded.get("window"))
+        if differs:
             logger.warning(
-                f"[cache_persist] model fingerprint mismatch: "
-                f"disk={disk_fp} current={self._model_fingerprint}, "
-                f"discarding incompatible cache"
+                "[cache_persist] cache identity mismatch (%s): disk=%s/%s "
+                "current=%s/%s, discarding the entries written by a different "
+                "model or configuration",
+                "; ".join(differs),
+                recorded.get("model"),
+                recorded.get("window"),
+                self._identity.model,
+                self._identity.window,
             )
             return 0
+        # An entry saved while held quantized is the dequantized copy of
+        # quantized KV: it carries that setting's rounding. Under the same
+        # setting it is what this run would hold anyway (quantized once more on
+        # the way in, which re-rounds it: mx.quantize is not idempotent). Under
+        # another setting, quantization off included, it would serve KV rounded
+        # for a configuration this run does not have. An entry saved exactly is
+        # quantized like a fresh one, whatever the setting.
+        same_kv_setting = recorded.get("kv") == self._identity.kv
 
         loaded = 0
         for entry_meta in index.get("entries", []):
             i = entry_meta["index"]
+            if entry_meta.get("kv_quantized", True) and not same_kv_setting:
+                logger.info(
+                    "[cache_persist] skipping entry %s: saved quantized under another "
+                    "KV quantization setting",
+                    i,
+                )
+                continue
             entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
             tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
 
@@ -1988,7 +2121,18 @@ class MemoryAwarePrefixCache:
                     continue
 
                 # Load KV cache
-                cache = load_prompt_cache(entry_path)
+                cache, entry_meta_file = load_prompt_cache(
+                    entry_path, return_metadata=True
+                )
+                inconsistent = _entry_inconsistency(cache, tokens, entry_meta_file)
+                if inconsistent is not None:
+                    logger.warning(
+                        "[cache_persist] entry %s does not describe its tokens "
+                        "(%s), skipping",
+                        i,
+                        inconsistent,
+                    )
+                    continue
 
                 # Same rule as prepare_store(): a restored entry must be
                 # held (and accounted) as a freshly computed one is.

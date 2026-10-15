@@ -400,25 +400,3 @@ class MultimodalProcessor:
             embeddings = vision_encoder(pixel_values)
 
         return embeddings
-
-    def compute_vision_hash(
-        self,
-        pixel_values: mx.array,
-    ) -> str:
-        """
-        Compute a hash for pixel values for caching purposes.
-
-        Args:
-            pixel_values: Processed image tensors
-
-        Returns:
-            Hash string for the vision inputs
-        """
-        import hashlib
-
-        # Use shape and a sample of values for hashing
-        shape_str = str(pixel_values.shape)
-        sample_values = pixel_values.reshape(-1)[:100].tolist()
-        hash_input = f"{shape_str}_{sample_values}"
-
-        return hashlib.sha256(hash_input.encode()).hexdigest()[:16]

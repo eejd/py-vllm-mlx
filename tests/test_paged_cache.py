@@ -25,7 +25,7 @@ class TestCacheBlock:
         assert block.block_id == 0
         assert block.token_count == 0
         assert block.ref_count == 0  # vLLM style: starts at 0, set to 1 when allocated
-        assert block.hash_value is None
+        assert block.block_hash is None
         assert block.cache_data is None
 
     def test_cache_block_is_full(self):
@@ -243,19 +243,19 @@ class TestHashBasedDeduplication:
 
     def test_compute_block_hash(self):
         """Test hash computation."""
-        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.paged_cache import compute_block_hash
 
         tokens1 = [1, 2, 3, 4, 5]
         tokens2 = [1, 2, 3, 4, 5]
         tokens3 = [1, 2, 3, 4, 6]
 
-        hash1 = PagedCacheManager.compute_block_hash(tokens1)
-        hash2 = PagedCacheManager.compute_block_hash(tokens2)
-        hash3 = PagedCacheManager.compute_block_hash(tokens3)
+        hash1 = compute_block_hash(None, tokens1)
+        hash2 = compute_block_hash(None, tokens2)
+        hash3 = compute_block_hash(None, tokens3)
 
-        assert hash1 == hash2  # Same tokens = same hash
+        assert hash1 == hash2  # Same tokens, same parent = same hash
         assert hash1 != hash3  # Different tokens = different hash
-        assert len(hash1) == 16  # 16 char hex string
+        assert len(hash1) == 32  # sha256 digest
 
     def test_find_cached_block(self):
         """Test finding cached block by tokens."""
@@ -516,7 +516,7 @@ class TestStatistics:
         assert usage["allocated_blocks"] == 26  # null block + 25
         assert usage["free_blocks"] == 74  # 99 - 25
         assert usage["utilization"] == 0.26  # 26/100
-        assert usage["total_tokens_cached"] == 0  # Not added via add_block_to_table
+        assert usage["total_tokens_cached"] == 25 * 64  # tokens held by live blocks
 
     def test_reset_stats(self):
         """Test resetting statistics."""
@@ -551,7 +551,7 @@ class TestStatistics:
         assert manager.free_blocks == 9  # 10 - 1 null block
         assert len(manager.allocated_blocks) == 1  # only null block
         assert len(manager.request_tables) == 0
-        assert len(manager.hash_to_block) == 0
+        assert len(manager.cached_block_hash_to_block) == 0
 
 
 class TestThreadSafety:

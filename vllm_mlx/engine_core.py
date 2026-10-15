@@ -432,7 +432,6 @@ class EngineCore:
         request_id: Optional[str] = None,
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
-        prefix_boundary: int = 0,
         add_special_tokens: Optional[bool] = None,
     ) -> str:
         """
@@ -444,7 +443,6 @@ class EngineCore:
             request_id: Optional custom request ID
             images: Optional images for multimodal
             videos: Optional videos for multimodal
-            prefix_boundary: Token count for shared prefix (for cache)
             add_special_tokens: False when ``prompt`` was rendered by the chat
                 template (it owns the BOS); None for a raw completion prompt
 
@@ -463,7 +461,6 @@ class EngineCore:
             sampling_params=sampling_params,
             images=images,
             videos=videos,
-            prefix_boundary=prefix_boundary,
             add_special_tokens=add_special_tokens,
         )
 
