@@ -278,7 +278,13 @@ class TestHybridLayers:
 
 
 class _WindowLayer:
-    """A layer that carries its own position, rebuilt from meta_state."""
+    """A layer that carries its own position, rebuilt from meta_state.
+
+    This is the mlx-lm 0.31 layout of a rotating window: ``state`` is the array
+    pair and the cursors live in ``meta_state``. mlx-lm 0.32 puts integer
+    cursors inside ``state`` instead, which ``_layout_supported`` refuses
+    (TestUnsupportedLayouts), so on 0.32 this guard is never reached.
+    """
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -289,6 +295,8 @@ class _WindowLayer:
 
 
 class TestLayersThatCarryAPosition:
+    """mlx-lm 0.31 layout only (see ``_WindowLayer``)."""
+
     def test_prefix_of_such_a_layer_is_not_rebuilt_at_the_wrong_offset(self):
         cache, _ = _cache()
         tokens = A + B + [9]
