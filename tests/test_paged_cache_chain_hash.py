@@ -855,3 +855,75 @@ class TestInvariants:
             cache.release_cache(rid)
         self._check(manager)
         assert manager.stats.allocated_blocks == 1
+
+
+class _HybridModel(nn.Module):
+    """One KV layer and one recurrent layer: what Qwen3-Next/Nemotron-H look
+    like to the scheduler (ArraysCache cannot be trimmed)."""
+
+    def __init__(self):
+        super().__init__()
+        self.layers = [object(), object()]
+
+    def make_cache(self):
+        return [cache_mod.KVCache(), cache_mod.ArraysCache(1)]
+
+    def __call__(self, tokens, cache=None):
+        values = tokens.astype(mx.float32)
+        kv, rec = cache
+        prior = mx.zeros((values.shape[0], 1)) if rec[0] is None else rec[0]
+        cumulative = prior + mx.cumsum(values, axis=1)
+        rec[0] = cumulative[:, -1:]
+        keys = values[:, None, :, None]
+        kv.update_and_fetch(keys, keys)
+        selected = cumulative.astype(mx.int32) % 8
+        vocabulary = mx.arange(8)[None, None, :]
+        return mx.where(vocabulary == selected[:, :, None], 10.0, -10.0)
+
+
+class TestHybridThroughTheScheduler:
+    """What a hybrid model really does with ``--use-paged-cache``."""
+
+    @staticmethod
+    def _hybrid_scheduler():
+        return Scheduler(
+            _HybridModel(),
+            _Tokenizer(),
+            SchedulerConfig(
+                enable_prefix_cache=True,
+                use_paged_cache=True,
+                paged_cache_block_size=BS,
+                max_cache_blocks=64,
+                max_num_seqs=1,
+                prefill_batch_size=1,
+                completion_batch_size=1,
+            ),
+        )
+
+    def test_nothing_is_stored_and_nothing_hits_and_it_is_said_once(self, caplog):
+        if cache_mod.can_trim_prompt_cache([cache_mod.ArraysCache(1)]):
+            pytest.skip("this mlx-lm can trim recurrent layers")
+        warm = self._hybrid_scheduler()
+        stores = []
+        real_store = warm.block_aware_cache.store_cache
+        warm.block_aware_cache.store_cache = lambda *a, **k: (
+            stores.append(a[0]),
+            real_store(*a, **k),
+        )[1]
+
+        with caplog.at_level(logging.INFO, logger="vllm_mlx.scheduler"):
+            for i, length in enumerate([2 * BS, 2 * BS + 1, 3 * BS - 1, 3 * BS]):
+                prompt = [1 + (j % 5) for j in range(length)]
+                tokens, _ = _generate(warm, f"a{i}", prompt, max_tokens=3)
+                _, again = _generate(warm, f"b{i}", prompt + tokens + [2], max_tokens=2)
+                assert again.cached_tokens == 0
+
+        assert stores == []
+        assert len(warm.paged_cache_manager.cached_block_hash_to_block) == 0
+        said = [r for r in caplog.records if "cannot be trimmed" in r.message]
+        assert len(said) == 1 and "ArraysCache" in said[0].message
+
+    def test_a_plain_model_does_not_log_it(self, caplog):
+        with caplog.at_level(logging.INFO, logger="vllm_mlx.scheduler"):
+            _generate(_scheduler(), "a", A + B + [1])
+        assert not [r for r in caplog.records if "cannot be trimmed" in r.message]

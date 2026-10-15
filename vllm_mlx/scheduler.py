@@ -944,6 +944,7 @@ class Scheduler:
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
+        self._paged_skip_logged = False
         self._ssd_tier: Optional[SSDCacheTier] = None
 
         if self.config.enable_prefix_cache:
@@ -2499,6 +2500,10 @@ class Scheduler:
                         else:
                             raw_cache = response.prompt_cache
 
+                        if raw_cache and self._prompt_output_entry_is_useless(
+                            raw_cache
+                        ):
+                            self._note_paged_cache_skips_untrimmable(raw_cache)
                         if raw_cache and not self._prompt_output_entry_is_useless(
                             raw_cache
                         ):
@@ -2529,6 +2534,26 @@ class Scheduler:
             outputs.append(output)
 
         return outputs, finished_ids
+
+    def _note_paged_cache_skips_untrimmable(self, raw_cache: Any) -> None:
+        """Say once that the paged cache stores nothing for this model.
+
+        The finished request's cache is only kept when it can be trimmed
+        (``_prompt_output_entry_is_useless``). Hybrid/recurrent layers
+        (ArraysCache: Qwen3-Next/Qwen3.5, Nemotron-H) and full sliding windows
+        cannot, so with ``--use-paged-cache`` every request of such a model is
+        served cold and nothing is ever stored or hit; the hit counters stay
+        at zero without any other sign.
+        """
+        if self.block_aware_cache is None or self._paged_skip_logged:
+            return
+        self._paged_skip_logged = True
+        kinds = sorted({type(layer).__name__ for layer in raw_cache})
+        logger.info(
+            "Paged prefix cache: this model's cache (%s) cannot be trimmed, so "
+            "requests are not stored and never hit it",
+            ", ".join(kinds),
+        )
 
     def _release_paged_request(self, request_id: str) -> None:
         """Drop a request's references on its paged-cache blocks.

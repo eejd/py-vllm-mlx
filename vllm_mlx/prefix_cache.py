@@ -481,11 +481,6 @@ class BlockAwarePrefixCache:
 
         # Layouts already reported (once per kind, not per request)
         self._warned_layouts: set = set()
-        self._warned_recurrent = False
-
-        # Layouts already reported (once per kind, not per request)
-        self._warned_layouts: set = set()
-        self._warned_recurrent = False
 
         # Statistics
         self._hits = 0
@@ -599,16 +594,6 @@ class BlockAwarePrefixCache:
                         name,
                     )
                 return False
-        if not self._warned_recurrent and any(
-            self._cache_state_seq_axis(layer_state["state"]) is None
-            for layer_state in cache_data
-        ):
-            self._warned_recurrent = True
-            logger.info(
-                "Paged prefix cache: this model has recurrent layers; their "
-                "state exists only where a request ended, so a prefix hit "
-                "needs a stored request that ended on a block boundary"
-            )
         return True
 
     def _cache_extent(self, cache_data: List[Any]) -> int:

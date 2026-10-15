@@ -95,11 +95,14 @@ ownership, not a throughput feature.
 **Limits of the paged cache (use the default prefix cache, `--enable-prefix-cache` without
 `--use-paged-cache`, when they matter):**
 
-- *Hybrid models with recurrent layers (Qwen3.5-style, Nemotron-3-Nano, ...):* a
-  recurrent layer's state exists only at the token where a request ended, so a prefix hit
-  needs a stored request that ended exactly on a block boundary (about 1 request length in
-  `--paged-cache-block-size`). Plain-attention models hit on every shared block. The server
-  logs this once when it first sees such a model.
+- *Hybrid models with recurrent layers (Qwen3.5-style, Nemotron-3-Nano, ...):* the scheduler
+  keeps a finished request's cache only when it can be trimmed, and a recurrent layer cannot
+  be. With `--use-paged-cache` nothing is stored for such a model and it never hits (measured
+  through the scheduler with a one-KV-layer, one-ArraysCache model: zero stores and zero hits
+  over 14 requests; the server logs it once). It is served cold, as correctly as without a
+  cache. The block store itself can hold a recurrent snapshot (taken where a request ended,
+  so a prefix hit would need a request that ended exactly on a block boundary), but the
+  scheduler does not feed it one.
 - *Sliding-window, chunked or quantized-KV layers (mlx-lm 0.32 layouts with integer cursors
   or nested tuples):* they cannot be cut into blocks; nothing is cached for such a model
   (logged once).
