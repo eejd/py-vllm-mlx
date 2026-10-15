@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_MB = 1024 * 1024
 _BYTES_PER_GB = 1024 * 1024 * 1024
 _PREFIX_FILTER_TOKENS = 16
+_TOKEN_BYTES = _array.array("i").itemsize
 _LEGACY_ENTRY_RE = re.compile(r"^[0-9a-f]{64}(\.tmp)?$")
 _DIGEST_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -105,7 +106,9 @@ class SSDCacheStats:
         ssd_misses: Number of SSD cache lookup misses.
         reload_latency_sum: Sum of reload latencies in seconds.
         reload_bytes: Total bytes read from SSD.
-        promotion_failures: Number of failed promotions (RAM budget exhausted).
+        promotion_failures: Number of failed promotions (no RAM budget, read error).
+        promotions_rejected_oversized: Promotions refused because the entry is
+            larger than the whole in-memory cache budget (it could never fit).
     """
 
     spill_count: int = 0
@@ -115,6 +118,7 @@ class SSDCacheStats:
     reload_latency_sum: float = 0.0
     reload_bytes: int = 0
     promotion_failures: int = 0
+    promotions_rejected_oversized: int = 0
 
     def to_dict(self) -> dict:
         total_lookups = self.ssd_hits + self.ssd_misses
@@ -134,6 +138,7 @@ class SSDCacheStats:
             "avg_reload_latency_ms": round(avg_latency_ms, 2),
             "reload_bytes": self.reload_bytes,
             "promotion_failures": self.promotion_failures,
+            "promotions_rejected_oversized": self.promotions_rejected_oversized,
         }
 
 
@@ -214,6 +219,10 @@ class SSDIndex:
             """
         self._conn.executescript(schema_sql)
         self._ensure_column("entries", "prefix_hash", "TEXT")
+        # 1 = every layer of the entry is a plain KV layer, so the entry can be
+        # cut back to a shorter shared prefix; NULL (entries written by an
+        # older build) and 0 = it cannot, or is not known to.
+        self._ensure_column("entries", "trimmable", "INTEGER")
         self._conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_entries_accessed
                 ON entries(accessed_at);
@@ -272,6 +281,7 @@ class SSDIndex:
         file_path: str,
         memory_bytes: int,
         num_tokens: int,
+        trimmable: bool = False,
     ) -> None:
         """Insert or replace a cache entry in the index."""
         now = time.time()
@@ -283,8 +293,8 @@ class SSDIndex:
                 """
                 INSERT OR REPLACE INTO entries
                     (token_hash, tokens_blob, prefix_hash, num_tokens, file_path,
-                     memory_bytes, created_at, accessed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     memory_bytes, created_at, accessed_at, trimmable)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token_hash,
@@ -295,6 +305,7 @@ class SSDIndex:
                     memory_bytes,
                     now,
                     now,
+                    1 if trimmable else 0,
                 ),
             )
             self._conn.commit()
@@ -359,6 +370,65 @@ class SSDIndex:
                     }
                 )
         return results
+
+    def lookup_lcp(self, query_tokens: tuple[int, ...], min_tokens: int) -> dict | None:
+        """Find the entry sharing the longest token prefix with the query.
+
+        Serves what ``lookup_prefix`` cannot: a stored key that is *longer* than
+        the query (an exact repeat of a prompt whose entry also holds the reply
+        it generated) or that diverges from it after a shared head. Only
+        entries written as trimmable (plain KV layers) qualify, since the
+        caller cuts the entry back to the shared prefix.
+
+        The shared prefix must be at least ``min_tokens`` long (and at least
+        ``_PREFIX_FILTER_TOKENS``, the head the index hashes). Returns the
+        entry's metadata plus ``lcp`` (the shared length) and ``tokens`` (its
+        full key); the longest shared prefix wins, the shortest entry on a tie.
+        """
+        floor = max(int(min_tokens), _PREFIX_FILTER_TOKENS)
+        if len(query_tokens) < floor:
+            return None
+        query_blob = _tokens_to_blob(query_tokens)
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+                "FROM entries WHERE trimmable = 1 AND num_tokens > ? "
+                "AND prefix_hash = ? AND substr(tokens_blob, 1, ?) = ?",
+                (
+                    floor,
+                    _prefix_hash(query_tokens),
+                    floor * _TOKEN_BYTES,
+                    query_blob[: floor * _TOKEN_BYTES],
+                ),
+            )
+            rows = cur.fetchall()
+
+        query = np.frombuffer(query_blob, dtype=np.intc)
+        best: dict | None = None
+        for row in rows:
+            stored = np.frombuffer(row["tokens_blob"], dtype=np.intc)
+            n = min(len(stored), len(query))
+            differs = np.flatnonzero(stored[:n] != query[:n])
+            lcp = int(differs[0]) if len(differs) else n
+            # A stored key that is a prefix of the query needs no trimming and
+            # belongs to lookup_prefix; one that stops short of the floor is
+            # too little to reuse.
+            if lcp < floor or lcp >= row["num_tokens"]:
+                continue
+            if (
+                best is None
+                or lcp > best["lcp"]
+                or (lcp == best["lcp"] and row["num_tokens"] < best["num_tokens"])
+            ):
+                best = {
+                    "token_hash": row["token_hash"],
+                    "file_path": row["file_path"],
+                    "memory_bytes": row["memory_bytes"],
+                    "num_tokens": row["num_tokens"],
+                    "lcp": lcp,
+                    "tokens": _blob_to_tokens(row["tokens_blob"]),
+                }
+        return best
 
     def delete_entry(self, tokens_key: tuple[int, ...]) -> None:
         """Delete an entry by token sequence."""
@@ -1355,6 +1425,10 @@ class SSDCacheTier:
             file_path=relative_path,
             memory_bytes=memory_bytes,
             num_tokens=len(tokens_key),
+            trimmable=all(
+                isinstance(serializer, KVCacheSerializer) and "max_size" not in snapshot
+                for serializer, snapshot in layer_snapshots
+            ),
         )
 
         # Update stats
@@ -1393,6 +1467,15 @@ class SSDCacheTier:
         if results:
             return results[0]  # Already sorted by num_tokens DESC
         return None
+
+    def lookup_ssd_lcp(self, tokens: tuple[int, ...], min_tokens: int) -> dict | None:
+        """Find the entry sharing the longest prefix with ``tokens``.
+
+        For a stored key longer than the query or diverging from it (see
+        ``SSDIndex.lookup_lcp``). The entry's data covers its whole key; the
+        caller reads it and cuts it back to the shared ``lcp`` tokens.
+        """
+        return self._index.lookup_lcp(tokens, min_tokens)
 
     def remove(self, tokens: tuple[int, ...]) -> bool:
         """Remove an entry from both the SSD index and its data directory."""

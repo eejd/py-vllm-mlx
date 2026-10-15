@@ -31,6 +31,7 @@ import math
 import re
 import threading
 from collections import OrderedDict
+from collections.abc import Collection
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -1708,18 +1709,18 @@ class MemoryAwarePrefixCache:
         if idx < len(self._sorted_keys) and self._sorted_keys[idx] == key:
             self._sorted_keys.pop(idx)
 
-    def _evict_lru(self) -> None:
-        """Evict the least recently used entry.
+    def _evict_lru(self, protect: Collection[tuple[int, ...]] = ()) -> bool:
+        """Evict the least recently used entry that is not in ``protect``.
 
         If an SSD tier is attached, the entry is spilled to disk instead
-        of being discarded.
+        of being discarded. Returns whether an entry was evicted.
         """
         with self._memory_lock:
-            if not self._entries:
-                return
+            tokens_key = next((k for k in self._entries if k not in protect), None)
+            if tokens_key is None:
+                return False
 
-            # popitem(last=False) removes oldest entry (FIFO order = LRU)
-            tokens_key, entry = self._entries.popitem(last=False)
+            entry = self._entries.pop(tokens_key)
             self._current_memory -= entry.memory_bytes
             self._remove_from_sorted(tokens_key)
             self._stats.evictions += 1
@@ -1735,6 +1736,7 @@ class MemoryAwarePrefixCache:
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
             f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )
+        return True
 
     def remove(self, tokens: list[int], *, include_ssd: bool = False) -> bool:
         """
@@ -1809,11 +1811,36 @@ class MemoryAwarePrefixCache:
         """Memory limit in MB."""
         return self._max_memory / _BYTES_PER_MB
 
-    def try_reserve_memory(self, nbytes: int) -> bool:
-        """Tentatively reserve cache memory for an upcoming promotion."""
+    @property
+    def memory_limit_bytes(self) -> int:
+        """Memory limit in bytes."""
+        return self._max_memory
+
+    def try_reserve_memory(
+        self, nbytes: int, protect: Collection[tuple[int, ...]] = ()
+    ) -> bool:
+        """Reserve cache memory for an upcoming promotion, evicting to make room.
+
+        A cold-tier hit is worth more than the coldest resident entries, so
+        least-recently-used entries are evicted (spilled to the SSD tier, as in
+        ``store()``) until ``nbytes`` fit within the budget. Entries in
+        ``protect`` (for example those promoted for other requests in the same
+        pass) are never evicted for it. Returns False, with nothing evicted for
+        a request that can never fit, when ``nbytes`` exceeds the whole budget
+        or the unprotected entries cannot make enough room.
+
+        The reserved bytes count against the budget until
+        ``release_reserved_memory()``, so concurrent stores cannot take them.
+        """
         with self._memory_lock:
-            if self._current_memory + nbytes > self._max_memory:
+            reclaimable = sum(
+                e.memory_bytes for k, e in self._entries.items() if k not in protect
+            )
+            if self._current_memory - reclaimable + nbytes > self._max_memory:
                 return False
+            while self._current_memory + nbytes > self._max_memory:
+                if not self._evict_lru(protect):
+                    return False
             self._current_memory += nbytes
             self._stats.current_memory_bytes = self._current_memory
             return True
@@ -1847,10 +1874,18 @@ class MemoryAwarePrefixCache:
     def check_ssd(self, tokens: list[int]) -> dict | None:
         """Check if tokens have an SSD cache hit (without reading data).
 
-        Returns metadata dict with 'match_type' ('exact' or 'prefix') if
-        found in SSD tier, None if not found. For prefix matches, the dict
-        also includes 'matched_tokens' (the count of tokens the SSD entry
-        covers).
+        Returns a metadata dict if found in the SSD tier, None if not found.
+        ``matched_key`` is the stored entry's key, ``matched_tokens`` the
+        number of tokens of the query it serves, and ``match_type`` one of:
+
+        - ``exact``: the entry is the query.
+        - ``prefix``: the entry's key is a prefix of the query.
+        - ``lcp``: the entry's key is longer than, or diverges from, the query
+          and shares ``matched_tokens`` leading tokens with it (an exact repeat
+          of a prompt whose entry also holds the reply generated after it).
+          Only for trimmable entries; the caller cuts the entry back to
+          ``matched_tokens``. Chosen only when it covers more of the query
+          than the best ``prefix`` entry.
 
         This is a fast synchronous call (SQLite lookup only).
         The actual data read happens via the scheduler handoff.
@@ -1877,9 +1912,17 @@ class MemoryAwarePrefixCache:
             prefix["match_type"] = "prefix"
             prefix["matched_tokens"] = prefix["num_tokens"]
             prefix["matched_key"] = tokens_key[: prefix["num_tokens"]]
-            return prefix
 
-        return None
+        lcp = self._ssd_tier.lookup_ssd_lcp(tokens_key, self._config.min_prefix_tokens)
+        if lcp is not None and (
+            prefix is None or lcp["lcp"] > prefix["matched_tokens"]
+        ):
+            lcp["match_type"] = "lcp"
+            lcp["matched_tokens"] = lcp["lcp"]
+            lcp["matched_key"] = lcp["tokens"]
+            return lcp
+
+        return prefix
 
     # -----------------------------------------------------------------
     # Disk persistence — survives server restarts

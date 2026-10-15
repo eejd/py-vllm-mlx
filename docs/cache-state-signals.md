@@ -151,6 +151,19 @@ upgrades do not strand a cache each; until then it is left, because another serv
 refreshes its own `identity.json` at every start). Delete directories you no longer need sooner by hand. no longer need. Each spilled entry is checked on promotion (manifest token count, `tokens.bin`, and each
 layer's offset against the key) and a mismatching one is quarantined and counted as a miss.
 
+A hit in the SSD tier is promoted into RAM even when the memory cache is full: the least recently used entries are
+evicted (and spilled, as a store would) until the promoted entry fits the `--cache-memory-mb` budget, except entries
+promoted for other requests in the same scheduling pass; if the rest of the cache cannot make room the request is a
+miss (`[ssd_promote] ... budget denied`, counted in `promotion_failures`). An entry larger than the whole budget is
+never read: it is logged (`exceeds the whole cache budget`), counted in `promotions_rejected_oversized` and the
+request is a miss. The tier matches a request exactly, by a stored key that is a prefix of it, or (`lcp`) by an entry
+whose key is longer than the prompt or diverges from it after a shared head: a finished request spills its prompt
+*and* its reply, so the exact repeat of that prompt is only a prefix of the stored key. The request then gets the
+entry cut back to the shared tokens (at least the cache's `min_prefix_tokens`, 128 by default); the whole entry is promoted.
+Only entries made of plain KV layers qualify (the index records it at spill time); sliding-window, recurrent and
+container layers cannot be cut back and are matched only by an exact or prefix key, and entries spilled by an
+older build, which did not record it, are not used for `lcp`.
+
 `DELETE /v1/cache`, `DELETE /v1/cache/prefix` and cache-error recovery empty the SSD tier together with the
 RAM cache: spills still queued, a write in flight and a promotion in flight when the flush lands are dropped,
 so nothing written before a flush can come back after it. The persisted cache on disk is not touched by a flush

@@ -164,6 +164,61 @@ class TestSSDIndex:
             )
             assert cur.fetchone()[0] == 1
 
+    def test_lookup_lcp_serves_a_stored_key_longer_than_the_query(self, index):
+        stored = tuple(range(100, 200))
+        index.insert_entry(stored, "long", 1000, len(stored), trimmable=True)
+
+        hit = index.lookup_lcp(stored[:60], min_tokens=16)
+
+        assert hit["file_path"] == "long"
+        assert hit["lcp"] == 60
+        assert hit["tokens"] == stored
+
+    def test_lookup_lcp_serves_a_diverging_key_up_to_the_shared_head(self, index):
+        stored = tuple(range(100, 200))
+        index.insert_entry(stored, "long", 1000, len(stored), trimmable=True)
+
+        hit = index.lookup_lcp(stored[:40] + (7, 8, 9, 10), min_tokens=16)
+
+        assert hit["lcp"] == 40
+
+    def test_lookup_lcp_prefers_the_longest_shared_prefix_then_the_shorter_entry(
+        self, index
+    ):
+        base = tuple(range(100, 220))
+        index.insert_entry(base[:90] + (1, 2), "diverges-at-90", 1, 92, trimmable=True)
+        index.insert_entry(base, "long", 1, 120, trimmable=True)
+        index.insert_entry(base[:110], "shorter", 1, 110, trimmable=True)
+
+        assert index.lookup_lcp(base[:100], 16)["file_path"] == "shorter"
+        assert index.lookup_lcp(base[:90] + (5,) * 5, 16)["lcp"] == 90
+
+    def test_lookup_lcp_never_returns_what_cannot_be_cut_back(self, index):
+        stored = tuple(range(100, 200))
+        index.insert_entry(stored, "rotating", 1000, len(stored), trimmable=False)
+        index.insert_entry(stored[:50] + (3,) * 60, "legacy", 1, 110)  # no layout known
+        with index._db_lock:
+            index._conn.execute(
+                "UPDATE entries SET trimmable = NULL WHERE file_path = 'legacy'"
+            )
+            index._conn.commit()
+
+        assert index.lookup_lcp(stored[:40], min_tokens=16) is None
+
+    def test_lookup_lcp_leaves_prefix_keys_and_short_matches_alone(self, index):
+        stored = tuple(range(100, 200))
+        index.insert_entry(stored, "long", 1000, len(stored), trimmable=True)
+
+        # the stored key is a prefix of the query: lookup_prefix's, nothing to cut
+        assert index.lookup_lcp(stored + (1, 2, 3), 16) is None
+        # the same key: lookup_exact's
+        assert index.lookup_lcp(stored, 16) is None
+        # shares 30 tokens: below the caller's minimum, and a head of another key
+        assert index.lookup_lcp(stored[:30] + (5,) * 40, min_tokens=32) is None
+        assert index.lookup_lcp((9,) + stored[1:60], min_tokens=16) is None
+        # a query shorter than the minimum has no shared prefix long enough
+        assert index.lookup_lcp(stored[:20], min_tokens=32) is None
+
     def test_legacy_index_backfills_prefix_hashes(self, db_dir):
         import sqlite3
         import time

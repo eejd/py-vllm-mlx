@@ -604,6 +604,7 @@ class TestMemoryAwarePrefixCache:
     def test_ssd_prefix_candidate_includes_the_actual_key(self, small_cache):
         ssd_tier = MagicMock()
         ssd_tier.lookup_ssd.return_value = None
+        ssd_tier.lookup_ssd_lcp.return_value = None
         ssd_tier.lookup_ssd_prefix.return_value = {
             "num_tokens": 3,
             "memory_bytes": 128,
