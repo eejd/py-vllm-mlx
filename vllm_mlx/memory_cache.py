@@ -1885,7 +1885,9 @@ class MemoryAwarePrefixCache:
           of a prompt whose entry also holds the reply generated after it).
           Only for trimmable entries; the caller cuts the entry back to
           ``matched_tokens``. Chosen only when it covers more of the query
-          than the best ``prefix`` entry.
+          than the best ``prefix`` entry, which then rides along as
+          ``fallback`` for a caller that cannot use the ``lcp`` entry (it does
+          not fit the budget, or its layers cannot be cut back).
 
         This is a fast synchronous call (SQLite lookup only).
         The actual data read happens via the scheduler handoff.
@@ -1920,9 +1922,30 @@ class MemoryAwarePrefixCache:
             lcp["match_type"] = "lcp"
             lcp["matched_tokens"] = lcp["lcp"]
             lcp["matched_key"] = lcp["tokens"]
+            if prefix is not None:
+                lcp["fallback"] = prefix
             return lcp
 
         return prefix
+
+    def fetch_resident(self, key: tuple[int, ...]) -> list[Any] | None:
+        """The resident entry stored under exactly ``key`` (marked recently used).
+
+        For a request whose cold-tier candidate was promoted by an earlier
+        request: the entry is already in RAM, so nothing is reserved or read.
+        Like ``fetch()``, the stored state is handed out as is (dequantized
+        under KV quantization); the caller clones or trims before replay.
+        """
+        with self._memory_lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            self._entries.move_to_end(key)
+            return (
+                _dequantize_cache(entry.cache)
+                if self._config.kv_quantize
+                else entry.cache
+            )
 
     # -----------------------------------------------------------------
     # Disk persistence — survives server restarts

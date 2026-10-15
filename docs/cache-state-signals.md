@@ -162,7 +162,11 @@ whose key is longer than the prompt or diverges from it after a shared head: a f
 entry cut back to the shared tokens (at least the cache's `min_prefix_tokens`, 128 by default); the whole entry is promoted.
 Only entries made of plain KV layers qualify (the index records it at spill time); sliding-window, recurrent and
 container layers cannot be cut back and are matched only by an exact or prefix key, and entries spilled by an
-older build, which did not record it, are not used for `lcp`.
+older build, which did not record it, are not used for `lcp`. When the `lcp` entry cannot be used (it exceeds the budget, or its
+layers turn out not to be cuttable) the `prefix` entry the lookup also found is tried; a request whose entry an earlier request of
+the same pass promoted is served from the resident entry (nothing is reserved or read twice). Spilled entries are write-once: an
+entry whose key is already on the tier is not written again when it is evicted from RAM (it is only marked recently used), so a
+workload cycling through more conversations than the cache holds reads entries back instead of rewriting them.
 
 `DELETE /v1/cache`, `DELETE /v1/cache/prefix` and cache-error recovery empty the SSD tier together with the
 RAM cache: spills still queued, a write in flight and a promotion in flight when the flush lands are dropped,

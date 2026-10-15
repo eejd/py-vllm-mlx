@@ -1240,7 +1240,15 @@ class SSDCacheTier:
         owns the layer's Stream(gpu, N)) — the snapshot below materializes
         MLX → numpy here so the writer thread never has to.
 
-        Returns True if enqueued, False if queue is full (entry dropped).
+        Entries are write-once: the KV of a token key is fixed by the cache
+        identity (the tier's directory), so a key that is already indexed is
+        not written again (it is marked recently used). Without this an entry
+        promoted into RAM and evicted again, by a workload cycling through
+        more conversations than the memory cache holds, would be re-snapshotted
+        and rewritten in full on every round trip.
+
+        Returns True if the entry is on the tier or enqueued, False if it was
+        dropped (queue full, tier closing, snapshot failure).
         """
         # The epoch the entry was handed over in: a flush (clear()) that lands
         # while it is being snapshotted or queued must drop it.
@@ -1248,6 +1256,10 @@ class SSDCacheTier:
         with self._lifecycle_lock:
             if not self._accepting_spills:
                 return False
+
+        if self._index.lookup_exact(tokens) is not None:
+            self._index.touch(tokens)
+            return True
 
         # Dequantize on the CALLER's thread, which owns the MLX GPU stream.
         # mx.dequantize is a GPU compute op; running it on the writer thread

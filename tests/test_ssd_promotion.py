@@ -66,6 +66,16 @@ def _wait_spilled(tier, count):
     assert tier.get_stats()["spill_count"] >= count
 
 
+def _drain(tier):
+    """Wait until every queued spill is on disk (the writer takes the write lock)."""
+    deadline = time.monotonic() + 15
+    while not tier._spill_queue.empty() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    with tier._write_lock:
+        pass
+
+
 class World:
     """A 1 MB memory cache backed by an SSD tier, behind a scheduler."""
 
@@ -416,6 +426,179 @@ def test_protected_entries_are_not_evicted_for_a_reservation(world):
     assert not w.cache.try_reserve_memory(w.cache._max_memory, protect=keys)
     assert list(w.cache._entries) == [keys[0]]
     _within_budget(w.cache)
+
+
+# --- review of PR #115 ------------------------------------------------------------------------
+
+
+def test_requests_sharing_one_entry_in_a_pass_are_all_served(world):
+    """The second request's entry is the one the first just promoted: it is resident,
+    not 'denied because the cache is held for requests promoted in this pass'."""
+    w = world(entry_tokens=600)  # the cache holds one such entry
+    w.fill([0, 1], spilled=1)
+    prompt, reply = w.conversations[0]
+    turn_two = prompt + reply + [7001 + i for i in range(40)]
+
+    first = w.request(turn_two, "first")
+    second = w.request(turn_two, "second")
+    repeat = w.request(prompt, "repeat")  # the same entry, cut back
+    assert {r.cache_hit_type for r in (first, second, repeat)} == {"ssd_pending"}
+    w.promote()
+
+    for request in (first, second):
+        assert request.cache_hit_type == "ssd_hit"
+        assert request.cached_tokens == len(prompt) + len(reply)
+        _assert_cold_kv(request, turn_two, request.cached_tokens)
+    assert repeat.cache_hit_type == "ssd_hit"
+    assert repeat.cached_tokens == len(prompt)
+    _assert_cold_kv(repeat, prompt, len(prompt))
+    assert w.cache._entries[tuple(prompt + reply)].cache[0].offset == len(
+        prompt + reply
+    )
+    assert w.tier.get_stats()["promotion_failures"] == 0
+    assert w.tier.get_stats()["ssd_hits"] == 1, "the entry was read from disk once"
+    _within_budget(w.cache)
+
+
+@pytest.mark.parametrize("why", ["oversized", "uncuttable"])
+def test_an_lcp_entry_that_cannot_be_used_falls_back_to_the_prefix_entry(world, why):
+    w = world()
+    prompt, reply = _conversation(0, 400)
+    short, long_ = prompt[:100], prompt + reply
+    assert w.tier.enqueue_spill(tuple(short), _kv(short), 1024)
+    if why == "oversized":
+        assert w.tier.enqueue_spill(tuple(long_), _kv(long_), 1_200_000)
+    else:
+        layers = []
+        for _ in range(2):
+            layer = cache_mod.RotatingKVCache(max_size=512)
+            layer.update_and_fetch(
+                mx.zeros((1, 2, len(long_), HEAD_DIM)),
+                mx.zeros((1, 2, len(long_), HEAD_DIM)),
+            )
+            layers.append(layer)
+        assert w.tier.enqueue_spill(tuple(long_), layers, 1024)
+    _wait_spilled(w.tier, 2)
+    if why == "uncuttable":  # the index claims a layout the data does not have
+        with w.tier._index._db_lock:
+            w.tier._index._conn.execute("UPDATE entries SET trimmable = 1")
+            w.tier._index._conn.commit()
+
+    query = prompt[:350] + [9001 + i for i in range(30)]
+    request = w.request(query)
+    assert request._ssd_candidate["match_type"] == "lcp"
+    assert request._ssd_candidate["fallback"]["match_type"] == "prefix"
+    w.promote()
+
+    assert request.cache_hit_type == "ssd_hit"
+    assert request.cached_tokens == 100
+    assert request.remaining_tokens == query[100:]
+    _assert_cold_kv(request, query, 100)
+    _within_budget(w.cache)
+
+
+def test_the_async_promotion_falls_back_too(world):
+    import asyncio
+
+    w = world()
+    prompt, reply = _conversation(0, 400)
+    short, long_ = prompt[:100], prompt + reply
+    assert w.tier.enqueue_spill(tuple(short), _kv(short), 1024)
+    assert w.tier.enqueue_spill(tuple(long_), _kv(long_), 1_200_000)
+    _wait_spilled(w.tier, 2)
+    request = w.request(prompt[:350] + [9001])
+
+    assert asyncio.run(w.sched.promote_from_ssd(request))
+
+    assert request.cache_hit_type == "ssd_hit" and request.cached_tokens == 100
+
+
+def test_the_async_promotion_serves_a_resident_entry_without_reading_it_again(world):
+    import asyncio
+
+    w = world(entry_tokens=600)
+    w.fill([0, 1], spilled=1)
+    prompt, reply = w.conversations[0]
+    query = prompt + reply + [7001 + i for i in range(40)]
+    first, second = w.request(query, "first"), w.request(query, "second")
+
+    assert asyncio.run(w.sched.promote_from_ssd(first))
+    assert asyncio.run(w.sched.promote_from_ssd(second))
+
+    assert second.cache_hit_type == "ssd_hit"
+    assert second.cached_tokens == len(prompt) + len(reply)
+    _assert_cold_kv(second, query, second.cached_tokens)
+    assert w.tier.get_stats()["ssd_hits"] == 1, "the entry was read from disk twice"
+    _within_budget(w.cache)
+
+
+def test_without_a_usable_fallback_the_request_is_a_miss(world):
+    w = world()
+    prompt, reply = _conversation(0, 400)
+    long_ = prompt + reply
+    assert w.tier.enqueue_spill(tuple(long_), _kv(long_), 1_200_000)
+    _wait_spilled(w.tier, 1)
+    request = w.request(prompt[:350] + [9001])
+    assert "fallback" not in request._ssd_candidate
+    w.promote()
+    assert request.cache_hit_type == "miss" and request.cached_tokens == 0
+
+
+def test_an_entry_already_on_the_tier_is_not_written_again(world):
+    w = world()
+    key = tuple(_conversation(0, 400)[0])
+    assert w.tier.enqueue_spill(key, _kv(list(key)), 1024)
+    _wait_spilled(w.tier, 1)
+    written = w.tier.get_stats()["spill_bytes"]
+
+    assert w.tier.enqueue_spill(key, _kv(list(key)), 1024)
+    time.sleep(0.5)
+
+    assert w.tier.get_stats()["spill_count"] == 1
+    assert w.tier.get_stats()["spill_bytes"] == written
+
+
+def test_cycling_through_more_conversations_than_fit_writes_each_entry_once(world):
+    """The thrash case: three conversations round-robin through a cache that holds two.
+    Every request promotes its entry back and evicts another; the evicted ones are on
+    the tier already, so nothing is rewritten."""
+    w = world()  # 408 KiB entries: two fit in 1 MB
+    w.fill([0, 1, 2], spilled=1)
+    served = []
+    for round_ in range(3):
+        for index in (0, 1, 2):
+            prompt, reply = w.conversations[index]
+            _drain(w.tier)  # what the previous request evicted is on the tier
+            request = w.request(prompt, f"r{round_}-{index}")
+            if request.cache_hit_type == "ssd_pending":
+                w.promote()
+            served.append(request.cached_tokens)
+            w.sched.waiting.clear()
+            w.cache.fetch(prompt + reply)  # what a running request leaves behind
+    _drain(w.tier)
+
+    assert all(n >= 400 - 1 for n in served), served
+    stats = w.tier.get_stats()
+    assert stats["spill_count"] == 3, "an entry was rewritten after it was promoted"
+    _within_budget(w.cache)
+
+
+def test_a_rejected_ssd_hit_evicts_the_entry_it_came_from(world):
+    """``_evict_incompatible_entry`` removes what the request was served from: the
+    entry's key, which for an lcp hit is longer than the tokens the request reused."""
+    w = world()
+    w.fill([0, 1, 2], spilled=1)
+    prompt, reply = w.conversations[0]
+    request = w.request(prompt)
+    w.promote()
+    assert request.cache_hit_type == "ssd_hit"
+    assert request.cached_tokens == len(prompt)
+    assert (prompt + reply) in w.cache
+
+    w.sched._evict_incompatible_entry(request)
+
+    assert (prompt + reply) not in w.cache
+    assert w.tier.lookup_ssd(tuple(prompt + reply)) is None
 
 
 # --- real model: cold and warm answer alike ---------------------------------------------------
