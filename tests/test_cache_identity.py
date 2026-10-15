@@ -388,3 +388,96 @@ def test_ssd_tiers_of_different_models_sharing_a_directory_do_not_see_each_other
         assert a2.check_ssd(TOKENS + [999]) is not None
     finally:
         tier_a2.close()
+
+
+# --- the weight digest -------------------------------------------------------------------------
+
+
+def _holder(**arrays):
+    class Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name, value in arrays.items():
+                setattr(self, name, value)
+
+    return Holder()
+
+
+def test_permuting_a_tensor_changes_the_digest():
+    """Plain and squared sums cannot tell rows apart; the positional term can."""
+    w = mx.arange(24, dtype=mx.float32).reshape(6, 4)
+    swapped = mx.concatenate([w[1:2], w[0:1], w[2:]])
+    assert weights_digest(_holder(w=w)) != weights_digest(_holder(w=swapped))
+    bf = w.astype(mx.bfloat16)
+    flipped = bf.reshape(-1)[::-1].reshape(6, 4)
+    assert weights_digest(_holder(w=bf)) != weights_digest(_holder(w=flipped))
+
+
+def test_the_squared_term_separates_equal_sum_equal_position_sum_tensors():
+    a = mx.array([1, 4, 1], dtype=mx.uint32)  # sum 6, sum(i * x) 12
+    b = mx.array([2, 2, 2], dtype=mx.uint32)  # sum 6, sum(i * x) 12
+    assert weights_digest(_holder(w=a)) != weights_digest(_holder(w=b))
+
+
+def test_shape_dtype_and_name_are_part_of_the_digest():
+    data = mx.arange(6, dtype=mx.uint32)
+    base = weights_digest(_holder(w=data.reshape(2, 3)))
+    assert weights_digest(_holder(w=data.reshape(3, 2))) != base  # shape
+    assert (
+        weights_digest(_holder(w=data.astype(mx.int32).reshape(2, 3))) != base
+    )  # dtype
+    assert weights_digest(_holder(v=data.reshape(2, 3))) != base  # name
+
+
+def test_the_model_class_is_part_of_the_identity():
+    class A(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = mx.arange(6, dtype=mx.float32)
+
+    class B(A):
+        pass
+
+    assert _compute_model_fingerprint(A()) != _compute_model_fingerprint(B())
+
+
+# --- the scheduler hands --max-kv-size to the cache that persists entries ------------------------
+
+
+def test_the_scheduler_names_max_kv_size_in_the_cache_identity():
+    from unittest.mock import MagicMock
+
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+    def window(max_kv_size):
+        scheduler = Scheduler(
+            tiny_llama(1),
+            MagicMock(),
+            SchedulerConfig(
+                enable_prefix_cache=True,
+                use_memory_aware_cache=True,
+                cache_memory_mb=64,
+                max_kv_size=max_kv_size,
+            ),
+        )
+        return scheduler.memory_aware_cache.identity.window
+
+    assert window(64) == window_identity(64)[0]
+    assert window(64) != window(0)
+
+
+# --- entry files of refused or larger earlier saves -------------------------------------------
+
+
+def test_a_save_removes_entry_files_it_did_not_write(tmp_path):
+    big = cache_for(tiny_llama(1))
+    a, b = TOKENS, [t + 1000 for t in TOKENS]
+    assert big.store(a, prefix_kv(a)) and big.store(b, prefix_kv(b))
+    assert big.save_to_disk(str(tmp_path))
+    assert (tmp_path / "entry_1.safetensors").exists()
+
+    small = cache_for(tiny_llama(1))
+    assert small.store(a, prefix_kv(a))
+    assert small.save_to_disk(str(tmp_path))
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["entry_0.safetensors", "entry_0_tokens.bin", "index.json"]

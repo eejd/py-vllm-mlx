@@ -28,6 +28,7 @@ import bisect
 import copy
 import logging
 import math
+import re
 import threading
 from collections import OrderedDict
 from contextlib import nullcontext
@@ -1995,6 +1996,19 @@ class MemoryAwarePrefixCache:
         with open(tmp_index_path, "w") as f:
             json.dump(index, f, indent=2, default=str)
         os.replace(tmp_index_path, index_path)
+        # Entry files this save did not write (a larger earlier save, or the
+        # files of an index that was refused) are unreadable without an index
+        # that names them: remove them rather than strand them.
+        written = {f"entry_{e['index']}" for e in index["entries"]}
+        for name in os.listdir(cache_dir):
+            m = re.match(r"^(entry_\d+)(\.safetensors|_tokens\.bin)$", name)
+            if m and m.group(1) not in written:
+                try:
+                    os.unlink(os.path.join(cache_dir, name))
+                except OSError:
+                    logger.warning(
+                        "[cache_persist] could not remove stale %s", name, exc_info=True
+                    )
 
         dt = _time.monotonic() - t0
         logger.info(

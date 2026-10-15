@@ -137,3 +137,11 @@ def test_prefix_cache_uses_configured_memory_percent(monkeypatch):
 
     prefix_cache_config = generator_kwargs[0]["prefix_cache_config"]
     assert prefix_cache_config.max_memory_percent == 0.35
+
+
+def test_max_kv_size_reaches_the_prefix_cache_config(monkeypatch):
+    """The persisted/SSD identity names the window the KV was computed under."""
+    _, _, generator_kwargs = _install_fakes(monkeypatch, SimpleNamespace())
+    sched = _bare_scheduler(MLLMSchedulerConfig(max_kv_size=512))
+    sched._ensure_batch_generator()
+    assert generator_kwargs[0]["prefix_cache_config"].max_kv_size == 512

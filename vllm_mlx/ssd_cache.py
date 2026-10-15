@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -40,6 +41,8 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_MB = 1024 * 1024
 _BYTES_PER_GB = 1024 * 1024 * 1024
 _PREFIX_FILTER_TOKENS = 16
+_LEGACY_ENTRY_RE = re.compile(r"^[0-9a-f]{64}(\.tmp)?$")
+_DIGEST_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,9 @@ class SSDCacheConfig:
         dir_permissions: Unix permission bits for cache directories.
         spill_queue_size: Max pending spill operations before dropping.
         retention_seconds: Optional max age for cache entries (None = no expiry).
+        stale_namespace_days: Sibling identity directories (other models,
+            revisions, library versions) whose ``identity.json`` is older than
+            this are deleted when a tier starts (None = never).
     """
 
     cache_dir: str | None = None
@@ -70,6 +76,7 @@ class SSDCacheConfig:
     dir_permissions: int = 0o700
     spill_queue_size: int = 64
     retention_seconds: int | None = None
+    stale_namespace_days: float | None = 30.0
 
     def __post_init__(self) -> None:
         if self.max_size_gb <= 0:
@@ -915,6 +922,7 @@ class SSDCacheTier:
         os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
         os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
         self._write_identity_file()
+        self._reclaim_stale_namespaces()
 
         try:
             # Open SQLite index
@@ -957,46 +965,107 @@ class SSDCacheTier:
     def _discard_untagged_layout(self) -> None:
         """Remove entries a build that keyed on tokens alone left in the base dir.
 
-        Those builds kept ``index.db`` and ``data/`` directly in the base
-        directory with nothing recording which model computed them, so none of
-        it can be attributed to the current identity. Left in place it would
-        also count against the disk budget of nobody. Only the names that layout
-        used are touched.
+        Those builds kept ``index.db`` and ``data/<sha256>/`` directly in the
+        base directory with nothing recording which model computed them, so none
+        of it can be attributed to the current identity. ``--ssd-cache-dir`` is
+        user-supplied and ``data`` / ``quarantine`` are generic names, so only
+        what is positively one of those entries goes: a SQLite ``index.db``
+        (with its WAL files), and ``<64 hex>`` (or ``.tmp``) directories that
+        hold a ``manifest.json``. Anything else, including the ``data`` and
+        ``quarantine`` directories themselves while they hold other files, is
+        left alone.
         """
         import shutil
 
-        legacy = [
-            name
-            for name in (
-                "index.db",
-                "index.db-wal",
-                "index.db-shm",
-                "data",
-                "quarantine",
-            )
-            if os.path.lexists(os.path.join(self._base_dir, name))
-        ]
-        if not legacy:
-            return
-        for name in legacy:
-            path = os.path.join(self._base_dir, name)
-            try:
-                if os.path.isdir(path) and not os.path.islink(path):
-                    shutil.rmtree(path)
-                else:
+        removed: list[str] = []
+        index_db = os.path.join(self._base_dir, "index.db")
+        try:
+            with open(index_db, "rb") as f:
+                is_index = f.read(16) == b"SQLite format 3\x00"
+        except OSError:
+            is_index = False
+        if is_index:
+            for suffix in ("", "-wal", "-shm"):
+                path = index_db + suffix
+                try:
                     os.unlink(path)
+                    removed.append(os.path.basename(path))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning(
+                        "[ssd_cache] failed to remove %s", path, exc_info=True
+                    )
+        for container in ("data", "quarantine"):
+            root = os.path.join(self._base_dir, container)
+            if os.path.islink(root) or not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                path = os.path.join(root, name)
+                if (
+                    _LEGACY_ENTRY_RE.match(name)
+                    and os.path.isdir(path)
+                    and not os.path.islink(path)
+                    and os.path.isfile(os.path.join(path, "manifest.json"))
+                ):
+                    try:
+                        shutil.rmtree(path)
+                        removed.append(f"{container}/{name}")
+                    except OSError:
+                        logger.warning(
+                            "[ssd_cache] failed to remove %s", path, exc_info=True
+                        )
+            try:
+                os.rmdir(root)  # only if nothing else is in it
+            except OSError:
+                pass
+        if removed:
+            logger.warning(
+                "[ssd_cache] removed %d entries of an older layout from %s: they "
+                "recorded no model identity",
+                len(removed),
+                self._base_dir,
+            )
+
+    def _reclaim_stale_namespaces(self) -> None:
+        """Delete sibling identity directories nobody has used for a while.
+
+        Every mlx / mlx-lm upgrade, model revision or config change names a new
+        directory, and the size budget is per directory, so without this each
+        of them strands a whole cache. A directory goes only when it is named
+        like an identity digest, has an ``identity.json`` (written, and so
+        touched, each time a tier starts on it) older than
+        ``stale_namespace_days``, and is not this tier's own.
+        """
+        import shutil
+        import time as _time
+
+        days = self._config.stale_namespace_days
+        if days is None:
+            return
+        cutoff = _time.time() - days * 86400
+        for name in os.listdir(self._base_dir):
+            path = os.path.join(self._base_dir, name)
+            if (
+                name == self._identity.digest
+                or not _DIGEST_DIR_RE.match(name)
+                or os.path.islink(path)
+                or not os.path.isdir(path)
+            ):
+                continue
+            marker = os.path.join(path, "identity.json")
+            try:
+                if os.stat(marker).st_mtime >= cutoff:
+                    continue
+                shutil.rmtree(path)
             except OSError:
                 logger.warning(
-                    "[ssd_cache] failed to remove untagged entry %s",
+                    "[ssd_cache] could not reclaim stale namespace %s",
                     path,
                     exc_info=True,
                 )
-        logger.warning(
-            "[ssd_cache] removed entries of an older layout from %s: they recorded "
-            "no model identity (%s)",
-            self._base_dir,
-            ", ".join(legacy),
-        )
+                continue
+            logger.info("[ssd_cache] reclaimed %s: not used for %s days", name, days)
 
     def _write_identity_file(self) -> None:
         """Record what this directory's entries are valid for (for operators)."""

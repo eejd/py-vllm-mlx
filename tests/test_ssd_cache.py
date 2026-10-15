@@ -1701,18 +1701,116 @@ class TestIdentityNamespacing:
         finally:
             b.close()
 
+    @staticmethod
+    def _legacy_layout(base):
+        import sqlite3
+
+        entry = base / "data" / ("ab" * 32)
+        entry.mkdir(parents=True)
+        (entry / "manifest.json").write_text("{}")
+        (base / "quarantine" / ("cd" * 32)).mkdir(parents=True)
+        (base / "quarantine" / ("cd" * 32) / "manifest.json").write_text("{}")
+        conn = sqlite3.connect(base / "index.db")
+        conn.execute("CREATE TABLE entries (token_hash TEXT)")
+        conn.commit()
+        conn.close()
+
     def test_entries_of_the_untagged_layout_are_discarded(self, tmp_path):
         """A build that keyed on tokens alone left index.db and data/ in the base
         dir, with nothing saying which model wrote them."""
-        data = tmp_path / "data" / ("ab" * 32)
-        data.mkdir(parents=True)
-        (data / "manifest.json").write_text("{}")
-        (tmp_path / "index.db").write_bytes(b"not a database anymore")
+        self._legacy_layout(tmp_path)
         tier = _tier(tmp_path)
         try:
             assert not (tmp_path / "index.db").exists()
             assert not (tmp_path / "data").exists()
+            assert not (tmp_path / "quarantine").exists()
             assert tier.get_stats()["spill_count"] == 0
+        finally:
+            tier.close()
+
+    def test_unrelated_files_in_the_base_dir_are_never_removed(self, tmp_path):
+        """--ssd-cache-dir is user-supplied; data/ and quarantine/ are generic names."""
+        mine = tmp_path / "data" / "mine"
+        mine.mkdir(parents=True)
+        (mine / "x.csv").write_text("1,2,3")
+        (mine / "manifest.json").write_text("{}")  # a manifest alone is not enough
+        (tmp_path / "data" / "notes.txt").write_text("keep")
+        # a 64-hex directory without a manifest is not one of ours either
+        lookalike = tmp_path / "data" / ("ef" * 32)
+        lookalike.mkdir()
+        (lookalike / "payload.bin").write_text("keep")
+        (tmp_path / "quarantine").mkdir()
+        (tmp_path / "quarantine" / "mine.txt").write_text("keep")
+        (tmp_path / "index.db").write_text("not a sqlite file")
+        tier = _tier(tmp_path)
+        try:
+            assert (mine / "x.csv").read_text() == "1,2,3"
+            assert (tmp_path / "data" / "notes.txt").exists()
+            assert (lookalike / "payload.bin").exists()
+            assert (tmp_path / "quarantine" / "mine.txt").exists()
+            assert (tmp_path / "index.db").read_text() == "not a sqlite file"
+        finally:
+            tier.close()
+
+    def test_the_legacy_entries_go_and_the_user_files_beside_them_stay(self, tmp_path):
+        self._legacy_layout(tmp_path)
+        (tmp_path / "data" / "mine.txt").write_text("keep")
+        tier = _tier(tmp_path)
+        try:
+            assert not (tmp_path / "data" / ("ab" * 32)).exists()
+            assert (tmp_path / "data" / "mine.txt").exists()
+            assert not (tmp_path / "index.db").exists()
+        finally:
+            tier.close()
+
+    @staticmethod
+    def _stale_namespace(base, age_days, name="1" * 32, with_marker=True):
+        d = base / name
+        (d / "data" / ("ab" * 32)).mkdir(parents=True)
+        if with_marker:
+            marker = d / "identity.json"
+            marker.write_text("{}")
+            t = time.time() - age_days * 86400
+            os.utime(marker, (t, t))
+        return d
+
+    def test_namespaces_of_old_identities_are_reclaimed_after_the_retention(
+        self, tmp_path
+    ):
+        old = self._stale_namespace(tmp_path, 45, "1" * 32)
+        recent = self._stale_namespace(tmp_path, 3, "2" * 32)
+        no_marker = self._stale_namespace(tmp_path, 0, "3" * 32, with_marker=False)
+        other = tmp_path / "my-own-dir"
+        other.mkdir()
+        (other / "identity.json").write_text("{}")
+        os.utime(other / "identity.json", (1, 1))
+        tier = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert not old.exists()
+            assert recent.exists() and no_marker.exists() and other.exists()
+            assert os.path.isdir(tier.namespace_dir)
+        finally:
+            tier.close()
+
+    def test_a_tier_never_reclaims_its_own_namespace_and_refreshes_its_marker(
+        self, tmp_path
+    ):
+        tier = _tier(tmp_path)
+        tier.close()
+        marker = os.path.join(tier.namespace_dir, "identity.json")
+        os.utime(marker, (1, 1))  # looks ancient
+        again = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert os.path.isdir(again.namespace_dir)
+            assert os.stat(marker).st_mtime > time.time() - 60
+        finally:
+            again.close()
+
+    def test_reclaiming_can_be_turned_off(self, tmp_path):
+        old = self._stale_namespace(tmp_path, 400)
+        tier = _tier(tmp_path, stale_namespace_days=None)
+        try:
+            assert old.exists()
         finally:
             tier.close()
 

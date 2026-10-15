@@ -18,8 +18,8 @@ to those ids.
 Weights are identified by content, not by path or modification time: a
 different fine-tune of one architecture, or a new revision downloaded over the
 same path, has the same file names and the same tensor shapes. Each parameter
-contributes two wrapping integer sums over its raw bits (the sum and the sum of
-squares). The reduction runs once over every weight on the device, at the speed
+contributes three wrapping integer sums over its raw bits (the sum, the sum of
+squares and a position-weighted sum, so element order counts). The reduction runs once over every weight on the device, at the speed
 of one pass over the weights, and is exact and independent of reduction order,
 so the digest is reproducible. It is a change detector for accidentally
 different checkpoints, not a cryptographic hash.
@@ -120,7 +120,7 @@ def weights_digest(model: Any) -> str | None:
             raise ValueError("the model exposes no parameter arrays")
         leaves.sort(key=lambda item: item[0])
 
-        # (leaf index, pair of wrapping sums) for every slice of every parameter
+        # (leaf index, triple of wrapping sums) for every slice of every parameter
         partial: list[tuple[int, mx.array]] = []
         pending: list[mx.array] = []
         pending_bytes = 0
@@ -137,26 +137,30 @@ def weights_digest(model: Any) -> str | None:
                     bits = mx.zeros((1,), dtype=mx.uint32)
                 else:
                     bits = piece.view(view_dtype).astype(mx.uint32)
-                pair = mx.stack([mx.sum(bits), mx.sum(bits * bits)])
+                # Plain and squared sums do not depend on element order; the
+                # position-weighted one does, so permuted rows change the digest.
+                positions = mx.arange(start + 1, start + 1 + bits.size, dtype=mx.uint32)
+                pair = mx.stack(
+                    [mx.sum(bits), mx.sum(bits * bits), mx.sum(bits * positions)]
+                )
                 partial.append((index, pair))
                 pending.append(pair)
-                # the widened copy and its square, 4 bytes each per element
-                pending_bytes += piece.size * 8
+                # the widened copy, its square and the positions, 4 bytes each
+                pending_bytes += piece.size * 12
                 if pending_bytes >= _CHECKSUM_CHUNK_BYTES:
                     mx.eval(*pending)
                     pending, pending_bytes = [], 0
         if pending:
             mx.eval(*pending)
 
-        totals = [[0, 0] for _ in leaves]
+        totals = [[0, 0, 0] for _ in leaves]
         for index, pair in partial:
-            s1, s2 = pair.tolist()
-            totals[index][0] = (totals[index][0] + s1) % (1 << 32)
-            totals[index][1] = (totals[index][1] + s2) % (1 << 32)
+            for k, part in enumerate(pair.tolist()):
+                totals[index][k] = (totals[index][k] + part) % (1 << 32)
 
         h = hashlib.sha256()
-        for (name, arr), (s1, s2) in zip(leaves, totals):
-            h.update(f"{name}|{arr.dtype}|{tuple(arr.shape)}|{s1}|{s2}\n".encode())
+        for (name, arr), (s1, s2, s3) in zip(leaves, totals):
+            h.update(f"{name}|{arr.dtype}|{tuple(arr.shape)}|{s1}|{s2}|{s3}\n".encode())
         return h.hexdigest()[:32]
     except Exception as exc:  # noqa: BLE001
         logger.warning(

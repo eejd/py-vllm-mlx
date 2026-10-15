@@ -117,7 +117,7 @@ written under another (`vllm_mlx/cache_identity.py`):
 
 | Part | What it covers | Rule |
 |---|---|---|
-| `model` | every field of the model config (rope theta and scaling, sliding window, head layout, norm epsilon, tied embeddings, ...), the model class, the weight quantization present in the loaded model (count of quantized layers by kind, bits, group size and mode, MoE experts included), a **content digest of every weight** (names, shapes, dtypes and two exact wrapping integer sums per tensor, computed on the device in one pass over the weights; about 0.02 s per GB, so well under a second for a 30B 4-bit model), and the mlx / mlx-lm (mlx-vlm for a VLM text model) versions | must match |
+| `model` | every field of the model config (rope theta and scaling, sliding window, head layout, norm epsilon, tied embeddings, ...), the model class, the weight quantization present in the loaded model (count of quantized layers by kind, bits, group size and mode, MoE experts included), a **content digest of every weight** (names, shapes, dtypes and three exact wrapping integer sums per tensor (plain, squared and position-weighted, so element order counts), computed on the device in slices; measured 0.15 s for 4 GB, about 0.6 s for a 30B 4-bit model), and the mlx / mlx-lm (mlx-vlm for a VLM text model) versions | must match |
 | `window` | `--max-kv-size` (a bounded run keeps rotating layers, an unbounded one does not) | must match |
 | `kv` | whether KV is quantized while held, and its bits, group size and minimum length | entries saved **while held quantized** need the same setting; entries saved exactly are valid under any (they are quantized on the way in like a fresh one) |
 
@@ -133,15 +133,18 @@ persisted entry is also checked against itself before it is used: the token coun
 are written into the entry's KV file and compared with the tokens file, and every layer must hold exactly the
 key's length, so a save that was interrupted or two servers writing one directory cannot pair KV with tokens
 it was not computed for. A save drops the old `index.json` before writing entry files and publishes the new
-one atomically. **Existing persisted caches (version 4 and earlier) are refused once and rebuilt.**
+one atomically, then removes entry files it did not write (a larger earlier save, or the files of a refused index). **Existing persisted caches (version 4 and earlier) are refused once and rebuilt.**
 
 The SSD tier keeps its files in `<--ssd-cache-dir>/<identity digest>/` (`identity.json` there says what the
 digest stands for), so servers, models and settings sharing one directory never index or promote each
 other's entries; the whole identity (all three parts) names the directory, because a spilled entry is not
-tracked per KV setting. `--ssd-cache-max-gb` applies to each such subdirectory. The `index.db` and `data/` an
-older build left directly in the directory recorded no model and are removed. Subdirectories of other models
-and revisions are left alone (another server may be using them) and are not cleaned up: delete the ones you
-no longer need. Each spilled entry is checked on promotion (manifest token count, `tokens.bin`, and each
+tracked per KV setting. `--ssd-cache-max-gb` applies to each such subdirectory. Of the layout an older build left directly in the directory (`index.db`, `data/<sha256>/`,
+`quarantine/<sha256>/`; it recorded no model) only what is positively that is removed: a SQLite `index.db` and
+64-hex directories holding a `manifest.json`; any other file in `data/` or `quarantine/` is left alone. A sibling
+identity directory (another model, revision, mlx/mlx-lm version or setting) whose `identity.json` has not been
+refreshed by a tier start for 30 days (`SSDCacheConfig.stale_namespace_days`) is deleted when a tier starts, so
+upgrades do not strand a cache each; until then it is left, because another server may be using it (a tier
+refreshes its own `identity.json` at every start). Delete directories you no longer need sooner by hand. no longer need. Each spilled entry is checked on promotion (manifest token count, `tokens.bin`, and each
 layer's offset against the key) and a mismatching one is quarantined and counted as a miss.
 
 `DELETE /v1/cache`, `DELETE /v1/cache/prefix` and cache-error recovery empty the SSD tier together with the
