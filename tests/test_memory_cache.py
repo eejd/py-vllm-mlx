@@ -769,4 +769,6 @@ def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
         },
     ):
         assert cache.load_from_disk(str(tmp_path)) == 0
-    assert "version mismatch: disk=3 current=4" in caplog.text
+    from vllm_mlx.memory_cache import _CACHE_PERSIST_VERSION
+
+    assert f"version mismatch: disk=3 current={_CACHE_PERSIST_VERSION}" in caplog.text

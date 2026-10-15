@@ -31,7 +31,6 @@ from .memory_cache import (
 )
 from .mlx_cache_compat import (
     copy_state,
-    restore_from_state,
     set_recurrent_arrays,
     snapshot_state,
 )
@@ -199,12 +198,6 @@ class SchedulerConfig:
     # generation requests are not starved during long prefills.
     chunked_prefill_tokens: int = 0
 
-    # Mid-prefill cache saving: save intermediate KV cache every N tokens
-    # during chunked prefill. If the client disconnects mid-prefill, the
-    # saved cache is reused for the next request with the same prefix.
-    # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
-    mid_prefill_save_interval: int = 8192
-
     # SSD cache tiering
     ssd_cache_dir: Optional[str] = None  # None = disabled
     ssd_cache_max_gb: float = 10.0
@@ -288,8 +281,7 @@ def _configure_chunked_prefill(
     mlx-lm >= 0.31.2 chunks prefill itself: each ``next()`` call processes at
     most ``prefill_step_size`` prompt tokens, then returns to generation. The
     ``_process_prompts`` / ``active_batch`` layout this once patched is gone, so
-    there is nothing to monkey-patch; mid-prefill saves and prompt-cache
-    capture are driven from the responses ``next()`` returns instead.
+    there is nothing to monkey-patch.
     """
     native_api = all(
         hasattr(batch_gen, attribute)
@@ -944,6 +936,7 @@ class Scheduler:
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
+        self._paged_skip_logged = False
         self._ssd_tier: Optional[SSDCacheTier] = None
 
         if self.config.enable_prefix_cache:
@@ -970,6 +963,7 @@ class Scheduler:
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
+                    max_kv_size=self.config.max_kv_size,
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,
@@ -1113,8 +1107,7 @@ class Scheduler:
             stream=mx.default_stream(mx.default_device()),
         )
         # Install chunked prefill only when explicitly configured.
-        # memory_aware_cache fetch/store works independently; the mid-prefill
-        # save callback is an optimisation, not a requirement.
+        # memory_aware_cache fetch/store works independently of chunked prefill.
         # When chunked_prefill_tokens == 0 (the default), honour the user's
         # intent — do NOT silently re-enable chunked prefill just because
         # memory_aware_cache is active (see #178).
@@ -1141,122 +1134,6 @@ class Scheduler:
                 )
 
         return bg
-
-    def _make_prompt_cache_save_callback(self):
-        """Create a callback that stores prompt-only KV/Mamba cache.
-
-        Called from ``_generation_step`` right before the first output token
-        is fed into the model.  At that point ``num_tokens == 0`` and the
-        batch cache contains the exact prompt-only state (correct for both
-        KVCache and MambaCache/ArraysCache layers).
-
-        The cache is stored with key = prompt_token_ids so that a future
-        request with the identical prompt gets an exact hit.
-        """
-        import time as _time
-
-        def _prompt_cache_save(uid, extracted_cache):
-            request_id = self.uid_to_request_id.get(uid)
-            if not request_id:
-                return
-            request = self.requests.get(request_id)
-            if not request or not request.prompt_token_ids:
-                return
-
-            prompt_tokens = list(request.prompt_token_ids)
-            # Trim cache by 1 so the stored KV has offset = N-1.
-            # On exact fetch the scheduler sends the last prompt token
-            # for reprocessing (lines 1872-1877).  Without this trim
-            # the last token would be placed at position N instead of N-1.
-            from .memory_cache import _trim_cache_offset
-
-            trimmed_cache = _trim_cache_offset(extracted_cache, 1)
-            _t0 = _time.monotonic()
-            # evict_prefixes=False: keep mid-prefill boundary entries so
-            # that future requests with the same prefix but different
-            # suffix get a prefix cache hit (critical for agentic multi-turn).
-            stored = self.memory_aware_cache.store(
-                prompt_tokens, trimmed_cache, evict_prefixes=False
-            )
-            _dt = _time.monotonic() - _t0
-            if stored:
-                logger.info(
-                    f"[prompt_cache_save] request={request_id[:12]} "
-                    f"prompt_tokens={len(prompt_tokens)} "
-                    f"store_time={_dt:.3f}s"
-                )
-
-        return _prompt_cache_save
-
-    def _make_mid_prefill_save_callback(self, save_interval: int):
-        """Create a callback for saving intermediate KV cache during chunked prefill.
-
-        The callback is called after each chunk with (uid, processed_tokens,
-        prompt_cache).  It extracts the cache state (immutable MLX array
-        snapshots), reconstructs KVCache objects, and stores them in the
-        memory-aware prefix cache so that a subsequent request with the same
-        prompt prefix can skip the already-computed tokens.
-        """
-        import time as _time
-
-        def _mid_prefill_save(uid, processed_tokens, prompt_cache):
-            request_id = self.uid_to_request_id.get(uid)
-            if not request_id:
-                return
-            request = self.requests.get(request_id)
-            if not request or not request.prompt_token_ids:
-                return
-
-            total_cached = (request.cached_tokens or 0) + processed_tokens
-
-            # Always save at prefix_boundary (message boundary for cache
-            # reuse with different final user messages).
-            prefix_boundary = getattr(request, "prefix_boundary", 0)
-            at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
-
-            # Throttle: only save every save_interval tokens,
-            # unless we're at the prefix boundary.
-            last_save = getattr(request, "_mid_prefill_last_save", 0)
-            if not at_prefix_boundary and total_cached - last_save < save_interval:
-                return
-
-            # Extract immutable state snapshots
-            extracted = self._extract_cache_states(prompt_cache)
-            if not extracted:
-                return
-
-            # Reconstruct cache objects (directly usable by BatchGenerator)
-            reconstructed = self._reconstruct_cache_from_states(extracted)
-            if not reconstructed:
-                return
-
-            prefix_tokens = list(request.prompt_token_ids[:total_cached])
-
-            # Remove previous intermediate entry to avoid memory waste
-            old_key = getattr(request, "_mid_prefill_cache_key", None)
-            if old_key is not None:
-                self.memory_aware_cache.remove(list(old_key))
-
-            _t0 = _time.monotonic()
-            stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
-            _dt = _time.monotonic() - _t0
-
-            if stored:
-                request._mid_prefill_last_save = total_cached
-                request._mid_prefill_cache_key = tuple(prefix_tokens)
-                logger.info(
-                    f"[mid_prefill_cache] request={request_id[:12]} "
-                    f"saved {total_cached}/{len(request.prompt_token_ids)} tokens "
-                    f"({total_cached * 100 // len(request.prompt_token_ids)}%) "
-                    f"store_time={_dt:.3f}s"
-                )
-            else:
-                logger.debug(
-                    f"[mid_prefill_cache] request={request_id[:12]} "
-                    f"store rejected for {total_cached} tokens"
-                )
-
-        return _mid_prefill_save
 
     def _close_batch_generator(self) -> None:
         """Properly close BatchGenerator to restore wired_limit."""
@@ -1553,59 +1430,6 @@ class Scheduler:
 
         return extracted if len(extracted) == len(raw_cache) else []
 
-    def _reconstruct_cache_from_states(
-        self, extracted_states: List[Dict[str, Any]]
-    ) -> Optional[List[Any]]:
-        """
-        Reconstruct cache objects from extracted cache states.
-
-        This is the inverse of _extract_cache_states(). Uses mlx-lm's
-        _BaseCache.from_state() to reconstruct any cache type (KVCache,
-        MambaCache, etc.) from its state/meta_state.
-
-        Args:
-            extracted_states: List of dicts from _extract_cache_states()
-
-        Returns:
-            List of cache objects, or None if reconstruction fails
-        """
-        if not extracted_states:
-            return None
-
-        try:
-            caches = []
-            for layer_state in extracted_states:
-                state = layer_state.get("state")
-                meta_state = layer_state.get("meta_state")
-                cache_cls = layer_state.get("class_ref")
-                if state is None:
-                    return None
-
-                if cache_cls is not None and hasattr(cache_cls, "from_state"):
-                    # restore_from_state also turns a BatchKVCache snapshot
-                    # (always batch_size=1 here) into a plain KVCache, which
-                    # _merge_caches can handle.
-                    cache = restore_from_state(cache_cls, state, meta_state)
-                else:
-                    # Fallback: try KVCache manual reconstruction
-                    from mlx_lm.models.cache import KVCache
-
-                    if len(state) != 2:
-                        return None
-                    cache = KVCache()
-                    cache.keys, cache.values = state
-                    cache.offset = (
-                        int(meta_state[0]) if meta_state else cache.keys.shape[2]
-                    )
-
-                caches.append(cache)
-
-            return caches
-
-        except Exception as e:
-            logger.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
-            return None
-
     def add_request(self, request: Request) -> None:
         """
         Add a new request to the scheduler.
@@ -1647,10 +1471,13 @@ class Scheduler:
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
-            block_table, remaining = self.block_aware_cache.fetch_cache(
-                request.request_id,
-                request.prompt_token_ids,
-            )
+            if self._paged_cache_bypassed(request):
+                block_table, remaining = None, request.prompt_token_ids
+            else:
+                block_table, remaining = self.block_aware_cache.fetch_cache(
+                    request.request_id,
+                    request.prompt_token_ids,
+                )
             if block_table and block_table.num_tokens > 0:
                 request.cache_hit_type = "hit"
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -1668,6 +1495,7 @@ class Scheduler:
                     )
                 else:
                     # Reconstruction failed, treat as cache miss
+                    self._release_paged_request(request.request_id)
                     request.cache_hit_type = "miss"
                     request.remaining_tokens = request.prompt_token_ids
                     logger.debug(
@@ -1820,6 +1648,8 @@ class Scheduler:
             # Release cache references so Metal buffers can be freed
             request.prompt_cache = None
             request._extracted_cache = None
+            request.block_table = None
+        self._release_paged_request(request_id)
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
 
@@ -2508,6 +2338,10 @@ class Scheduler:
                         else:
                             raw_cache = response.prompt_cache
 
+                        if raw_cache and self._prompt_output_entry_is_useless(
+                            raw_cache
+                        ):
+                            self._note_paged_cache_skips_untrimmable(raw_cache)
                         if raw_cache and not self._prompt_output_entry_is_useless(
                             raw_cache
                         ):
@@ -2539,6 +2373,53 @@ class Scheduler:
 
         return outputs, finished_ids
 
+    def _note_paged_cache_skips_untrimmable(self, raw_cache: Any) -> None:
+        """Say once that the paged cache stores nothing for this model.
+
+        The finished request's cache is only kept when it can be trimmed
+        (``_prompt_output_entry_is_useless``). Hybrid/recurrent layers
+        (ArraysCache: Qwen3-Next/Qwen3.5, Nemotron-H) and full sliding windows
+        cannot, so with ``--use-paged-cache`` every request of such a model is
+        served cold and nothing is ever stored or hit; the hit counters stay
+        at zero without any other sign.
+        """
+        if self.block_aware_cache is None or self._paged_skip_logged:
+            return
+        self._paged_skip_logged = True
+        kinds = sorted({type(layer).__name__ for layer in raw_cache})
+        logger.info(
+            "Paged prefix cache: this model's cache (%s) cannot be trimmed, so "
+            "requests are not stored and never hit it",
+            ", ".join(kinds),
+        )
+
+    def _release_paged_request(self, request_id: str) -> None:
+        """Drop a request's references on its paged-cache blocks.
+
+        A block table is only needed while the request is being served (the
+        reconstructed KV does not depend on it afterwards); holding it for good
+        pins its blocks, so the pool fills up with unevictable blocks and stops
+        caching, and the full-length KV kept for the request stays in memory.
+        """
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.release_cache(request_id)
+
+    @staticmethod
+    def _paged_cache_bypassed(request: Request) -> bool:
+        """Requests whose KV depends on more than their token ids.
+
+        Blocks are keyed by tokens (and per-request extra keys). Media
+        placeholders are the same tokens whatever the image, so a block cached
+        behind one image would be served behind another: such a request
+        neither reads nor writes the paged cache.
+        """
+        return bool(
+            request.is_multimodal
+            or request.images
+            or request.videos
+            or request.pixel_values is not None
+        )
+
     def _cleanup_finished(self, finished_ids: Set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
         for request_id in finished_ids:
@@ -2550,7 +2431,8 @@ class Scheduler:
                     # Store in paged cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     if (
-                        hasattr(request, "_extracted_cache")
+                        not self._paged_cache_bypassed(request)
+                        and hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
                     ):
                         try:
@@ -2570,14 +2452,15 @@ class Scheduler:
                             logger.debug(
                                 f"Failed to store paged cache for {request_id}: {e}"
                             )
-                    # NOTE: Do NOT call release_cache here - blocks should persist
-                    # for future requests to share. The LRU eviction will clean up
-                    # unused blocks when under memory pressure.
+                    # The request's block references are dropped below, once
+                    # per finished request: unreferenced blocks stay cached
+                    # (hash and tensors) until the pool recycles them, least
+                    # recently used first.
 
                 elif self.memory_aware_cache is not None:
-                    # Keep mid-prefill entry as prefix cache for future
-                    # requests that share a common prefix (e.g. same system
-                    # prompt + tools but different user message).  LRU
+                    # Keep the finished request's entry as prefix cache for
+                    # future requests that share a common prefix (e.g. same
+                    # system prompt + tools but different user message).  LRU
                     # eviction handles memory pressure.
 
                     # Store in memory-aware prefix cache
@@ -2675,6 +2558,8 @@ class Scheduler:
             if request is not None:
                 request.prompt_cache = None
                 request._extracted_cache = None
+                request.block_table = None
+            self._release_paged_request(request_id)
 
             # Remove from running
             if request_id in self.running:
@@ -2744,6 +2629,7 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is not None:
                 request.set_finished(RequestStatus.FINISHED_ABORTED)
+            self._release_paged_request(request_id)
             aborted_ids.add(request_id)
             self.finished_req_ids.add(request_id)
         self.running.clear()
@@ -3070,11 +2956,14 @@ class Scheduler:
         self._close_batch_generator()
         self._current_sampler_params = None
 
+        # Close the SSD tier first. This is teardown (the engine is closing or
+        # being replaced), not a flush: the spilled entries stay on disk for the
+        # next start of the same model, and clearing the RAM cache below must not
+        # reach them through the tier it is still attached to.
+        self.close_ssd_tier()
+
         # Clear caches
         self.clear_runtime_caches()
-
-        # Close SSD tier on reset
-        self.close_ssd_tier()
 
     def deep_reset(self) -> None:
         """
@@ -3125,7 +3014,10 @@ class Scheduler:
         return 0
 
     def clear_prefix_cache(self) -> None:
-        """Clear the in-memory prefix cache (keeps disk cache untouched)."""
+        """Clear the in-memory prefix cache and the SSD tier.
+
+        The persisted cache on disk (``--prefix-cache-dir``) is left untouched.
+        """
         if self.memory_aware_cache is not None and hasattr(
             self.memory_aware_cache, "clear"
         ):
@@ -3147,6 +3039,7 @@ class Scheduler:
 
         ssd_config = SSDCacheConfig(
             cache_dir=self.config.ssd_cache_dir,
+            identity=self.memory_aware_cache.identity,
             max_size_gb=self.config.ssd_cache_max_gb,
         )
         tier = SSDCacheTier(ssd_config)
@@ -3348,7 +3241,12 @@ class Scheduler:
         Converts numpy arrays back to MLX arrays and creates KVCache objects.
         """
         try:
-            from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+            from mlx_lm.models.cache import (
+                ArraysCache,
+                CacheList,
+                KVCache,
+                RotatingKVCache,
+            )
 
             # Cast restored arrays back to their original dtype if the spill
             # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
@@ -3357,8 +3255,18 @@ class Scheduler:
                 return getattr(mx, name, None)
 
             def _mk_kv(d: dict):
-                """Rebuild a KVCache from a deserialized layer/sub dict."""
-                kv = KVCache()
+                """Rebuild a KVCache or RotatingKVCache from a layer/sub dict."""
+                max_size = d.get("max_size")
+                if isinstance(max_size, int) and max_size > 0:
+                    # The serializer stores both under one layout and tells them
+                    # apart by the window. Rebuilt as a plain KVCache with the
+                    # window attributes, a sliding-window layer is the wrong
+                    # class (and on read-back fails the topology check, so SSD
+                    # hits for such models, and under --max-kv-size, were never
+                    # usable).
+                    kv = RotatingKVCache(max_size=max_size, keep=d.get("keep", 0))
+                else:
+                    kv = KVCache()
                 kv.keys = mx.array(d["keys"])
                 kv.values = mx.array(d["values"])
                 keys_orig = d.get("keys_original_dtype")

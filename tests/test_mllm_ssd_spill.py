@@ -13,6 +13,7 @@ import sys
 import types
 from types import SimpleNamespace
 
+from vllm_mlx.cache_identity import CacheIdentity
 from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
 
@@ -44,9 +45,10 @@ def _install_fakes(monkeypatch, prefix_cache_obj):
             self.reconciled = True
 
     class FakeTierConfig:
-        def __init__(self, cache_dir=None, max_size_gb=10.0):
+        def __init__(self, cache_dir=None, max_size_gb=10.0, identity=None):
             self.cache_dir = cache_dir
             self.max_size_gb = max_size_gb
+            self.identity = identity
 
     if prefix_cache_obj is not None:
         monkeypatch.setattr(
@@ -84,7 +86,7 @@ def _bare_scheduler(config):
 
 
 def test_ssd_tier_attached_when_dir_set(monkeypatch, tmp_path):
-    prefix_cache = SimpleNamespace()
+    prefix_cache = SimpleNamespace(identity=CacheIdentity("m", "w", "k"))
     set_calls, tiers, _ = _install_fakes(monkeypatch, prefix_cache)
 
     cfg = MLLMSchedulerConfig(ssd_cache_dir=str(tmp_path), ssd_cache_max_gb=7.0)
@@ -94,6 +96,7 @@ def test_ssd_tier_attached_when_dir_set(monkeypatch, tmp_path):
     assert len(tiers) == 1
     assert tiers[0].started and tiers[0].reconciled
     assert tiers[0].config.cache_dir == str(tmp_path)
+    assert tiers[0].config.identity is prefix_cache.identity
     assert tiers[0].config.max_size_gb == 7.0
     assert len(set_calls) == 1
     assert set_calls[0] is tiers[0]
@@ -134,3 +137,11 @@ def test_prefix_cache_uses_configured_memory_percent(monkeypatch):
 
     prefix_cache_config = generator_kwargs[0]["prefix_cache_config"]
     assert prefix_cache_config.max_memory_percent == 0.35
+
+
+def test_max_kv_size_reaches_the_prefix_cache_config(monkeypatch):
+    """The persisted/SSD identity names the window the KV was computed under."""
+    _, _, generator_kwargs = _install_fakes(monkeypatch, SimpleNamespace())
+    sched = _bare_scheduler(MLLMSchedulerConfig(max_kv_size=512))
+    sched._ensure_batch_generator()
+    assert generator_kwargs[0]["prefix_cache_config"].max_kv_size == 512
