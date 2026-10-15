@@ -77,6 +77,12 @@ def _mark_mtp_attempts_on_primary_responses(
     attempted_drafts_by_uid.clear()
 
 
+_PARTIAL_VERIFIED_STATE_MESSAGE = (
+    "MTP batch is partially verified: some rows already hold their input "
+    "token in the cache and others do not; stepping would feed it twice"
+)
+
+
 def _drop_retired_processors(
     processors: Optional[List[Callable]],
 ) -> tuple[Optional[List[Callable]], int]:
@@ -324,6 +330,10 @@ class MLLMBatch:
     logits_processors: Optional[List[Optional[List[Callable]]]] = None
     samplers: Optional[List[Optional[Callable]]] = None
     decode_rope_deltas: Optional[mx.array] = None
+    # Called as ``on_extend(self, other)`` before ``other`` joins this batch.
+    # Speculative decoding uses it to bring joining rows to the same cache
+    # state as the rows that are already decoding.
+    on_extend: Optional[Callable[["MLLMBatch", "MLLMBatch"], None]] = None
 
     def __len__(self) -> int:
         return len(self.uids)
@@ -402,6 +412,8 @@ class MLLMBatch:
         Args:
             other: Batch to merge into this one
         """
+        if self.on_extend is not None:
+            self.on_extend(self, other)
         self.uids.extend(other.uids)
         self.request_ids.extend(other.request_ids)
         self.y = mx.concatenate([self.y, other.y])
@@ -1405,6 +1417,47 @@ class MLLMBatchGenerator:
         return True
 
     @classmethod
+    def _cache_offsets(cls, cache_list) -> set:
+        """Positions held by the cache, one entry per distinct leaf value.
+
+        Leaves that carry no position (recurrent ``ArraysCache`` state) do not
+        contribute. A leaf whose position is not a plain integer (a batched
+        per-row array) or a missing leaf contributes ``-1`` so that no
+        comparison against a real token count can succeed.
+        """
+        offsets = set()
+        for cache in cls._cache_leaves(cache_list):
+            if cache is None:
+                offsets.add(-1)
+                continue
+            offset = getattr(cache, "offset", None)
+            if offset is None:
+                continue
+            if isinstance(offset, mx.array):
+                offset = offset.item() if offset.size == 1 else -1
+            offsets.add(int(offset))
+        return offsets
+
+    @classmethod
+    def _hit_is_aligned(
+        cls,
+        cached_kv,
+        matched: int,
+        *,
+        exact_required: bool = False,
+        remaining_ids=None,
+    ) -> bool:
+        """Whether a fetched entry is the KV of exactly ``matched`` tokens.
+
+        Every layer that carries a position must hold ``matched`` of them. An
+        entry used together with its stored last-token logits must also have
+        matched the whole prompt (nothing left to prefill).
+        """
+        if exact_required and remaining_ids:
+            return False
+        return cls._cache_offsets(cached_kv) <= {matched}
+
+    @classmethod
     def _can_rewind_prefix_cache(cls, cache_list, trim_by: int) -> bool:
         """Return whether every cache leaf retains the positions to rewind."""
         if trim_by <= 0:
@@ -2187,6 +2240,27 @@ class MLLMBatchGenerator:
                         if cached_kv is not None and S > 0:
                             remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 
+                # A hit is only usable if every layer holds exactly the
+                # positions of the tokens the cache says it matched (and an
+                # entry served with stored last-token logits must be the
+                # exact prompt). Anything else is KV of other tokens.
+                if cached_kv is not None and not self._hit_is_aligned(
+                    cached_kv,
+                    cache_credited,
+                    exact_required=cached_last_logits is not None,
+                    remaining_ids=remaining_ids,
+                ):
+                    logger.warning(
+                        "Prefix cache hit for %s holds KV positions %s for %d "
+                        "matched token(s) — falling through to full prefill",
+                        req.request_id,
+                        sorted(self._cache_offsets(cached_kv)),
+                        cache_credited,
+                    )
+                    cached_kv = None
+                    remaining_ids = None
+                    cached_last_logits = None
+
                 # Detect empty RotatingKVCache in cached entry — if any sliding-window
                 # layer has keys=None (all entries trimmed), the cache is unusable.
                 # Fall through to full prefill instead of producing garbage.
@@ -2625,8 +2699,18 @@ class MLLMBatchGenerator:
         else:
             logits = output
 
-        logits = logits[:, -1, :]
+        return self._sample_logits(
+            logits[:, -1, :], logits_processors, output_tokens, samplers
+        )
 
+    def _sample_logits(
+        self,
+        logits: mx.array,
+        logits_processors: Optional[List[Optional[List[Callable]]]] = None,
+        output_tokens: Optional[List[List[int]]] = None,
+        samplers: Optional[List[Optional[Callable]]] = None,
+    ) -> Tuple[mx.array, List[mx.array]]:
+        """Apply processors and sample one token per row from ``[B, vocab]`` logits."""
         # Apply per-request logits processors (repetition penalty etc.)
         if logits_processors and output_tokens and any(logits_processors):
             processed_logits = []
@@ -2920,7 +3004,14 @@ class MLLMBatchGenerator:
         *,
         evict_prefixes: bool = True,
     ) -> bool:
-        """Store an isolated, key-aligned cache snapshot when rewind is safe."""
+        """Store an isolated, key-aligned cache snapshot when rewind is safe.
+
+        The stored entry holds exactly ``len(cache_key)`` positions in every
+        layer. A hit hands the entry out as the KV of the first
+        ``len(cache_key)`` tokens, so an entry that is any longer (positions
+        of tokens that are not in the key) or shorter would silently serve
+        wrong KV; such a snapshot is refused, never stored.
+        """
         if self.prefix_cache is None:
             return False
         snapshot = self._rewind_prefix_cache(cache, trim_by)
@@ -2931,6 +3022,17 @@ class MLLMBatchGenerator:
                 source,
                 request_id,
                 trim_by,
+            )
+            return False
+        offsets = self._cache_offsets(snapshot)
+        if offsets != {len(cache_key)}:
+            logger.warning(
+                "Skipping %s prefix cache store for %s: key has %d token(s) "
+                "but the snapshot holds positions %s",
+                source,
+                request_id,
+                len(cache_key),
+                sorted(offsets),
             )
             return False
         return bool(
@@ -2957,18 +3059,27 @@ class MLLMBatchGenerator:
                 try:
                     extracted = batch.extract_cache(i)
                     input_ids_list = req.input_ids.reshape(-1).tolist()
-                    # Store prompt-only KV: trim generated tokens (+ think
-                    # suffix) so the stored offset equals key length exactly.
+                    # Store prompt-only KV: cut everything the request added
+                    # after its prompt (generated tokens, the think suffix) so
+                    # the stored offset equals key length exactly. The cut is
+                    # the number of positions the cache really holds beyond
+                    # the key, not the number of tokens emitted: a speculative
+                    # (MTP) verify step feeds the cache one to three positions
+                    # past the emitted tokens (primary + draft, or an accepted
+                    # draft whose successor is already verified).
                     # The exact-match path trims by 1 at fetch time to
                     # re-derive logits for the last prompt token.
-                    output_count = batch.num_tokens[i]
                     S = self._think_suffix_len
-                    total_trim = output_count + S
                     cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
+                    held = self._cache_offsets(extracted)
+                    if not held:
+                        continue  # no layer carries a position to align
+                    # Layers that disagree cannot all end on the key length
+                    # after one cut; the store refuses them.
                     self._store_prefix_snapshot(
                         cache_key,
                         extracted,
-                        total_trim,
+                        max(held) - len(cache_key),
                         req.request_id,
                         "completion",
                     )
@@ -3147,6 +3258,41 @@ def install_mtp_mllm(
 
     batch_gen.get_mtp_stats = _get_mtp_stats
 
+    def _admit_joiners(batch: "MLLMBatch", other: "MLLMBatch") -> None:
+        """Bring rows that join a verified batch to the same cache state.
+
+        A verified step leaves every decoding row with its input token (and
+        the verified draft) already in the cache and the logits of the next
+        position kept as skip state, so the next step feeds nothing for it.
+        A joining row has not fed its first token yet; stepping the merged
+        batch would feed that token for it but, with no way to skip a single
+        row, feed the old rows' input token a second time. Feed the joining
+        rows' first token now, while they are still a batch of their own, and
+        keep the resulting logits as their skip state: the merged batch is
+        then verified in every row.
+        """
+        if not batch.uids or not all(uid in _skip_state_by_uid for uid in batch.uids):
+            return
+        rope_deltas = batch_gen._batch_rope_deltas(other.requests)
+        model_kwargs = {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
+        output = language_model(
+            other.y[:, None], cache=other.cache, return_hidden=True, **model_kwargs
+        )
+        logits, hidden = _model_parts(output)
+        if hidden is None:
+            raise RuntimeError(
+                "MTP cannot admit a joining request: the model returned no "
+                "hidden state for its first token"
+            )
+        logits = logits[:, -1, :]
+        hidden = hidden[:, -1:, :]
+        mx.async_eval(logits, hidden)
+        for row, uid in enumerate(other.uids):
+            _skip_state_by_uid[uid] = {
+                "logits": logits[row : row + 1],
+                "hidden": hidden[row : row + 1],
+            }
+
     def _mtp_step(
         input_tokens: mx.array,
         cache: List[Any],
@@ -3201,7 +3347,28 @@ def install_mtp_mllm(
                     _bypass_counts["logits_processors"] += 1
                 if assistant_not_requested_bypass:
                     _bypass_counts["assistant_not_requested"] += 1
+            # A verified step leaves the batch cache already holding the
+            # input token (and the verified draft after it). Such rows must
+            # not be fed again: take their next-token logits from the verified
+            # state and only then fall back to the plain step.
+            verified = None
+            if batch_gen.active_batch is not None and not prefill_bypass:
+                entries = [
+                    _skip_state_by_uid.pop(uid, None)
+                    for uid in batch_gen.active_batch.uids
+                ]
+                if any(entries):
+                    if not all(entries):
+                        raise RuntimeError(_PARTIAL_VERIFIED_STATE_MESSAGE)
+                    verified = entries
             _skip_state_by_uid.clear()
+            if verified is not None:
+                return batch_gen._sample_logits(
+                    mx.concatenate([entry["logits"] for entry in verified], axis=0),
+                    logits_processors,
+                    output_tokens,
+                    samplers,
+                )
             original_step_kwargs = (
                 {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
             )
@@ -3217,18 +3384,12 @@ def install_mtp_mllm(
         current_uids = list(batch_gen.active_batch.uids)
         skip_entries = [_skip_state_by_uid.pop(uid, None) for uid in current_uids]
         if any(skip_entries) and not all(skip_entries):
-            # Batch membership changed since skip state was last populated
-            # (e.g. a chunked-prefill request finalizing mid-batch). Skip
-            # state cannot be partially reused, so discard it and fall back
-            # to a full forward for the whole batch this step -- the same
-            # tradeoff the concurrent-rejection path below makes (lose this
-            # step's acceleration, keep cache/state correct) rather than
-            # crash the batch.
-            logger.debug(
-                "[MTP-MLLM] batch membership changed since last verified "
-                "step; discarding stale skip state and forcing a full forward"
-            )
-            skip_entries = []
+            # Joining requests are brought to the verified state before they
+            # enter the batch (``_admit_joiners``), so the batch is never
+            # partially verified. Feeding the input token again would
+            # duplicate it in the rows that already hold it; refuse to
+            # produce tokens from such a cache.
+            raise RuntimeError(_PARTIAL_VERIFIED_STATE_MESSAGE)
 
         if skip_entries and all(skip_entries):
             logits = mx.concatenate([entry["logits"] for entry in skip_entries], axis=0)
@@ -3280,6 +3441,7 @@ def install_mtp_mllm(
             primary_tokens = batch_gen.sampler(logprobs)
 
         # MTP draft + always-advance verify
+        verify_started = False
         try:
             with _mtp_stats_lock:
                 _mtp_stats["attempted"] += 1
@@ -3359,6 +3521,7 @@ def install_mtp_mllm(
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
             )
+            verify_started = True
             verify_output = language_model(
                 verify_input, cache=cache, return_hidden=True, **model_kwargs
             )
@@ -3561,6 +3724,13 @@ def install_mtp_mllm(
                     draft_model.draft_lens.append(1)
 
         except Exception as e:
+            if verify_started:
+                # The verify forward writes two positions into the cache and
+                # the accept/reject bookkeeping rolls them back. A failure
+                # anywhere after it leaves the cache in a state no later step
+                # knows about (the input token would be fed again); stop the
+                # batch instead of decoding from it.
+                raise
             logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")
             _skip_state_by_uid.clear()
             with _mtp_stats_lock:
@@ -3591,11 +3761,11 @@ def install_mtp_mllm(
             _deferred_drafts.clear()
             _attempted_drafts_by_uid.clear()
 
-        # `_inner_next` may extend a text-only request into an active batch
-        # before the next `_mtp_step` call. That's fine: `_mtp_step` itself
-        # tolerates a batch whose UIDs only partially match verified skip
-        # state (it discards the stale entries and forces a full forward for
-        # that step), so no request needs to be held back here.
+        # `_inner_next` may extend a request into an active batch before the
+        # next `_mtp_step` call. The batch's `on_extend` hook (`_admit_joiners`,
+        # set at the end of this wrapper) brings the joining rows to the
+        # verified state first, so `_mtp_step` never sees a partially verified
+        # batch; if it does, that is a bug and the step raises.
 
         # Save deferred drafts from previous step. The base generator emits
         # its pending input token on this turn, so the verified suffix follows
@@ -3711,6 +3881,8 @@ def install_mtp_mllm(
             if uid not in active_uids:
                 _skip_state_by_uid.pop(uid, None)
 
+        if batch_gen.active_batch is not None:
+            batch_gen.active_batch.on_extend = _admit_joiners
         return augmented
 
     batch_gen._step = _mtp_step
@@ -4302,6 +4474,19 @@ def install_chunked_prefill_mllm(
                     if cached_kv is not None and S > 0:
                         remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 
+                    if cached_kv is not None and not batch_gen._hit_is_aligned(
+                        cached_kv, cache_credited
+                    ):
+                        logger.warning(
+                            "Prefix cache hit for %s holds KV positions %s for "
+                            "%d matched token(s) — falling through to full "
+                            "prefill",
+                            text_only_req.request_id,
+                            sorted(batch_gen._cache_offsets(cached_kv)),
+                            cache_credited,
+                        )
+                        cached_kv = None
+                        remaining_ids = None
                     # Check for empty rotating cache
                     if cached_kv is not None and batch_gen._has_empty_rotating_cache(
                         cached_kv

@@ -1164,7 +1164,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         )
 
         class FakeCache:
-            offset = 1
+            offset = 3  # the 3 cached tokens of the 4-token prompt
 
             def is_trimmable(self):
                 return True
@@ -1521,10 +1521,11 @@ class TestMLLMBatchGeneratorMTPGuards:
                 self._step = original_step
                 self._next = MagicMock(return_value=[])
                 self.active_batch = SimpleNamespace(
+                    uids=[1, 2],
                     requests=[
                         SimpleNamespace(mllm_draft=True),
                         SimpleNamespace(mllm_draft=False),
-                    ]
+                    ],
                 )
                 self.sampler = MagicMock()
 
@@ -2743,7 +2744,7 @@ class TestChunkedPrefillCacheHandling:
         gen._rewind_prefix_cache = tracking_rewind
 
         # Fake prefix cache: exact hit → remaining_ids = [] (empty)
-        fake_kv = [self._make_fake_kv_cache(offset=50)]
+        fake_kv = [self._make_fake_kv_cache(offset=5)]  # the whole 5-token prompt
 
         class FakePrefixCache:
             def fetch(self, ids):
