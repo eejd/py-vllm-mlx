@@ -142,13 +142,19 @@ one atomically, then removes entry files it did not write (a larger earlier save
 The SSD tier keeps its files in `<--ssd-cache-dir>/<identity digest>/` (`identity.json` there says what the
 digest stands for), so servers, models and settings sharing one directory never index or promote each
 other's entries; the whole identity (all three parts) names the directory, because a spilled entry is not
-tracked per KV setting. `--ssd-cache-max-gb` applies to each such subdirectory. Of the layout an older build left directly in the directory (`index.db`, `data/<sha256>/`,
-`quarantine/<sha256>/`; it recorded no model) only what is positively that is removed: a SQLite `index.db` and
-64-hex directories holding a `manifest.json`; any other file in `data/` or `quarantine/` is left alone. A sibling
-identity directory (another model, revision, mlx/mlx-lm version or setting) whose `identity.json` has not been
-refreshed by a tier start for 30 days (`SSDCacheConfig.stale_namespace_days`) is deleted when a tier starts, so
-upgrades do not strand a cache each; until then it is left, because another server may be using it (a tier
-refreshes its own `identity.json` at every start). Delete directories you no longer need sooner by hand. no longer need. Each spilled entry is checked on promotion (manifest token count, `tokens.bin`, and each
+tracked per KV setting. `--ssd-cache-max-gb` applies to each such subdirectory. Of the layout an older build left
+directly in the directory (`index.db`, `data/<sha256>/`, `quarantine/<sha256>/`; it recorded no model) only what is
+positively that is removed: a SQLite `index.db` that holds that build's `entries` table (token_hash, tokens_blob,
+file_path; any other SQLite file of that name is left alone) and 64-hex directories holding a `manifest.json`; any
+other file in `data/` or `quarantine/` is left alone. A sibling identity directory (another model, revision,
+mlx/mlx-lm version or setting) that has not been used for 30 days (`SSDCacheConfig.stale_namespace_days`) is deleted
+when a tier starts, so upgrades do not strand a cache each; until then it is left, because another server may be
+using it. "Not used" means that nothing in the directory (`identity.json`, written at every tier start, `index.db`
+and its WAL, which every spill, hit and eviction write) is newer than the retention and that no running tier holds
+the directory: a tier keeps a shared advisory lock (`flock` on `.lock`) on its own directory until it closes, and a
+reclaim needs the exclusive lock, so a server that has run or idled for longer than the retention never loses its
+cache to another server's start. Delete directories you no longer need sooner by hand. Each spilled entry is checked
+on promotion (manifest token count, `tokens.bin`, and each
 layer's offset against the key) and a mismatching one is quarantined and counted as a miss.
 
 A hit in the SSD tier is promoted into RAM even when the memory cache is full: the least recently used entries are

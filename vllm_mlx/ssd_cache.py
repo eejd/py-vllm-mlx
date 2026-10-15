@@ -36,6 +36,11 @@ import numpy as np
 from .cache_identity import CacheIdentity
 from .mlx_cache_compat import recurrent_arrays
 
+try:  # advisory locks mark a namespace as in use; absent on Windows
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
 logger = logging.getLogger(__name__)
 
 _BYTES_PER_MB = 1024 * 1024
@@ -972,6 +977,7 @@ class SSDCacheTier:
         self._config = config
         self._closed = True
         self._writer_thread: threading.Thread | None = None
+        self._namespace_lock_fd: int | None = None
 
         if config.cache_dir is None:
             raise ValueError("SSDCacheConfig.cache_dir must be set")
@@ -989,12 +995,12 @@ class SSDCacheTier:
         # Create directory structure
         os.makedirs(self._base_dir, mode=config.dir_permissions, exist_ok=True)
         self._discard_untagged_layout()
-        os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
-        os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
-        self._write_identity_file()
-        self._reclaim_stale_namespaces()
+        self._claim_namespace()
 
         try:
+            self._write_identity_file()
+            self._reclaim_stale_namespaces()
+
             # Open SQLite index
             self._index = SSDIndex(self._cache_dir)
             if getattr(self._index, "migrated_from", None) is not None:
@@ -1030,7 +1036,77 @@ class SSDCacheTier:
                     logger.exception(
                         "ssd_cache: failed to close index during init cleanup"
                     )
+            self._release_namespace()
             raise
+
+    _NAMESPACE_LOCK = ".lock"
+
+    def _claim_namespace(self) -> None:
+        """Create this tier's directory and mark it as in use by this process.
+
+        The mark is a shared advisory lock (``flock``) on ``<namespace>/.lock``,
+        held until close() (or the process's death, which the kernel handles).
+        Reclaiming a stale namespace needs the exclusive lock, so a directory
+        a running server holds is never reclaimed however old its files look
+        (a server can sit idle, or serve only from RAM, for longer than the
+        retention). A reclaim in progress holds the lock exclusively: the claim
+        waits for it, and starts over when the directory was deleted meanwhile.
+        """
+        config = self._config
+        for _ in range(5):
+            os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
+            os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
+            if fcntl is None:
+                return
+            lock_path = os.path.join(self._cache_dir, self._NAMESPACE_LOCK)
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, config.file_permissions)
+            except FileNotFoundError:
+                continue  # a reclaim removed the directory under us
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                if os.fstat(fd).st_ino == os.stat(lock_path).st_ino:
+                    self._namespace_lock_fd = fd
+                    return
+            except FileNotFoundError:
+                pass  # deleted by the reclaim that held the lock
+            except BaseException:
+                os.close(fd)
+                raise
+            os.close(fd)
+        raise RuntimeError(f"could not claim the SSD cache directory {self._cache_dir}")
+
+    def _release_namespace(self) -> None:
+        fd, self._namespace_lock_fd = self._namespace_lock_fd, None
+        if fd is not None:
+            os.close(fd)  # closing drops the flock
+
+    @staticmethod
+    def _is_legacy_index(path: str) -> bool:
+        """Whether ``path`` is the index of the builds that kept it in the base dir.
+
+        ``--ssd-cache-dir`` is user-supplied, and any SQLite file named
+        ``index.db`` starts with the same header: only a database holding the
+        ``entries`` table of those builds (token_hash, tokens_blob, file_path)
+        is ours to delete. Opened read-only.
+        """
+        import pathlib
+        import sqlite3
+
+        try:
+            with open(path, "rb") as f:
+                if f.read(16) != b"SQLite format 3\x00":
+                    return False
+            conn = sqlite3.connect(pathlib.Path(path).as_uri() + "?mode=ro", uri=True)
+        except (OSError, sqlite3.Error):
+            return False
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
+        except sqlite3.Error:
+            return False
+        finally:
+            conn.close()
+        return {"token_hash", "tokens_blob", "file_path"} <= columns
 
     def _discard_untagged_layout(self) -> None:
         """Remove entries a build that keyed on tokens alone left in the base dir.
@@ -1040,7 +1116,7 @@ class SSDCacheTier:
         of it can be attributed to the current identity. ``--ssd-cache-dir`` is
         user-supplied and ``data`` / ``quarantine`` are generic names, so only
         what is positively one of those entries goes: a SQLite ``index.db``
-        (with its WAL files), and ``<64 hex>`` (or ``.tmp``) directories that
+        holding their ``entries`` table (with its WAL files), and ``<64 hex>`` (or ``.tmp``) directories that
         hold a ``manifest.json``. Anything else, including the ``data`` and
         ``quarantine`` directories themselves while they hold other files, is
         left alone.
@@ -1049,12 +1125,7 @@ class SSDCacheTier:
 
         removed: list[str] = []
         index_db = os.path.join(self._base_dir, "index.db")
-        try:
-            with open(index_db, "rb") as f:
-                is_index = f.read(16) == b"SQLite format 3\x00"
-        except OSError:
-            is_index = False
-        if is_index:
+        if self._is_legacy_index(index_db):
             for suffix in ("", "-wal", "-shm"):
                 path = index_db + suffix
                 try:
@@ -1097,15 +1168,38 @@ class SSDCacheTier:
                 self._base_dir,
             )
 
+    @staticmethod
+    def _namespace_last_used(path: str) -> float | None:
+        """When a namespace directory was last used (None: cannot be told).
+
+        The newest of ``identity.json`` (written at each tier start),
+        ``index.db`` and its WAL (written by every spill, hit and eviction); a
+        directory with none of them (an interrupted start) is as old as the
+        directory itself.
+        """
+        newest: float | None = None
+        for name in ("identity.json", "index.db", "index.db-wal"):
+            try:
+                mtime = os.stat(os.path.join(path, name)).st_mtime
+            except OSError:
+                continue
+            newest = mtime if newest is None else max(newest, mtime)
+        if newest is None:
+            try:
+                newest = os.stat(path).st_mtime
+            except OSError:
+                return None
+        return newest
+
     def _reclaim_stale_namespaces(self) -> None:
         """Delete sibling identity directories nobody has used for a while.
 
         Every mlx / mlx-lm upgrade, model revision or config change names a new
         directory, and the size budget is per directory, so without this each
         of them strands a whole cache. A directory goes only when it is named
-        like an identity digest, has an ``identity.json`` (written, and so
-        touched, each time a tier starts on it) older than
-        ``stale_namespace_days``, and is not this tier's own.
+        like an identity digest, nothing in it (identity marker, index, WAL) has
+        been written for ``stale_namespace_days``, no running tier holds it
+        (``_claim_namespace``) and it is not this tier's own.
         """
         import shutil
         import time as _time
@@ -1123,10 +1217,25 @@ class SSDCacheTier:
                 or not os.path.isdir(path)
             ):
                 continue
-            marker = os.path.join(path, "identity.json")
+            last_used = self._namespace_last_used(path)
+            if last_used is None or last_used >= cutoff:
+                continue
+            lock_fd = None
             try:
-                if os.stat(marker).st_mtime >= cutoff:
-                    continue
+                if fcntl is not None:
+                    lock_fd = os.open(
+                        os.path.join(path, self._NAMESPACE_LOCK),
+                        os.O_CREAT | os.O_RDWR,
+                        self._config.file_permissions,
+                    )
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        logger.debug(
+                            "[ssd_cache] %s is held by a running tier; not reclaimed",
+                            name,
+                        )
+                        continue
                 shutil.rmtree(path)
             except OSError:
                 logger.warning(
@@ -1135,6 +1244,9 @@ class SSDCacheTier:
                     exc_info=True,
                 )
                 continue
+            finally:
+                if lock_fd is not None:
+                    os.close(lock_fd)
             logger.info("[ssd_cache] reclaimed %s: not used for %s days", name, days)
 
     def _write_identity_file(self) -> None:
@@ -1256,10 +1368,10 @@ class SSDCacheTier:
         with self._lifecycle_lock:
             if not self._accepting_spills:
                 return False
-
-        if self._index.lookup_exact(tokens) is not None:
-            self._index.touch(tokens)
-            return True
+            # Under the lock: close() closes the index under it.
+            if self._index.lookup_exact(tokens) is not None:
+                self._index.touch(tokens)
+                return True
 
         # Dequantize on the CALLER's thread, which owns the MLX GPU stream.
         # mx.dequantize is a GPU compute op; running it on the writer thread
@@ -1876,6 +1988,7 @@ class SSDCacheTier:
 
             self._index.close()
             self._closed = True
+            self._release_namespace()
         logger.info("[ssd_cache] SSDCacheTier closed")
 
     async def aclose(self) -> None:

@@ -1766,7 +1766,10 @@ class TestIdentityNamespacing:
         (base / "quarantine" / ("cd" * 32)).mkdir(parents=True)
         (base / "quarantine" / ("cd" * 32) / "manifest.json").write_text("{}")
         conn = sqlite3.connect(base / "index.db")
-        conn.execute("CREATE TABLE entries (token_hash TEXT)")
+        conn.execute(
+            "CREATE TABLE entries (token_hash TEXT PRIMARY KEY, tokens_blob BLOB, "
+            "num_tokens INTEGER, file_path TEXT, memory_bytes INTEGER)"
+        )
         conn.commit()
         conn.close()
 
@@ -1804,6 +1807,45 @@ class TestIdentityNamespacing:
             assert (lookalike / "payload.bin").exists()
             assert (tmp_path / "quarantine" / "mine.txt").exists()
             assert (tmp_path / "index.db").read_text() == "not a sqlite file"
+        finally:
+            tier.close()
+
+    def test_an_unrelated_sqlite_index_db_in_the_base_dir_is_left_alone(self, tmp_path):
+        """Any SQLite file has the same header: it must hold the legacy table."""
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_path / "index.db")
+        conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.execute("INSERT INTO documents (body) VALUES ('mine')")
+        conn.commit()
+        conn.close()
+        sibling = sqlite3.connect(tmp_path / "other.db")  # not named index.db at all
+        sibling.execute(
+            "CREATE TABLE entries (token_hash TEXT, tokens_blob BLOB, file_path TEXT)"
+        )
+        sibling.commit()
+        sibling.close()
+        tier = _tier(tmp_path)
+        try:
+            check = sqlite3.connect(tmp_path / "index.db")
+            assert check.execute("SELECT body FROM documents").fetchall() == [("mine",)]
+            check.close()
+            assert (tmp_path / "other.db").exists()
+        finally:
+            tier.close()
+
+    def test_an_index_db_with_an_entries_table_of_another_shape_is_left_alone(
+        self, tmp_path
+    ):
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_path / "index.db")
+        conn.execute("CREATE TABLE entries (token_hash TEXT, note TEXT)")
+        conn.commit()
+        conn.close()
+        tier = _tier(tmp_path)
+        try:
+            assert (tmp_path / "index.db").exists()
         finally:
             tier.close()
 
@@ -1860,6 +1902,128 @@ class TestIdentityNamespacing:
             assert os.stat(marker).st_mtime > time.time() - 60
         finally:
             again.close()
+
+    def test_a_namespace_a_running_tier_holds_is_never_reclaimed(self, tmp_path):
+        """The marker is written once, at start: a server that has run (or idled)
+        longer than the retention must keep its directory when another starts."""
+        other = CacheIdentity(model="model-b", window="window-a", kv="kv-a")
+        a = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            _spill(a, tuple(range(1, 17)))
+            long_ago = time.time() - 31 * 86400
+            for name in ("identity.json", "index.db", "index.db-wal", "index.db-shm"):
+                path = os.path.join(a.namespace_dir, name)
+                if os.path.exists(path):
+                    os.utime(path, (long_ago, long_ago))
+
+            b = _tier(tmp_path, identity=other, stale_namespace_days=30)
+            try:
+                assert os.path.isdir(a.namespace_dir), "the live namespace was deleted"
+                assert a.lookup_ssd(tuple(range(1, 17))) is not None
+                _spill(a, tuple(range(100, 116)))  # and its writer still works
+            finally:
+                b.close()
+        finally:
+            a.close()
+
+    def test_a_namespace_is_reclaimed_once_its_tier_has_closed(self, tmp_path):
+        other = CacheIdentity(model="model-b", window="window-a", kv="kv-a")
+        a = _tier(tmp_path)
+        a.close()
+        long_ago = time.time() - 31 * 86400
+        for name in ("identity.json", "index.db", "index.db-wal", "index.db-shm"):
+            path = os.path.join(a.namespace_dir, name)
+            if os.path.exists(path):
+                os.utime(path, (long_ago, long_ago))
+
+        b = _tier(tmp_path, identity=other, stale_namespace_days=30)
+        try:
+            assert not os.path.exists(a.namespace_dir)
+        finally:
+            b.close()
+
+    def test_use_of_the_index_keeps_a_namespace_young(self, tmp_path):
+        """Only identity.json is old: the index was written recently (spills, hits)."""
+        ns = self._stale_namespace(tmp_path, 45, "1" * 32)
+        (ns / "index.db").write_text("x")
+        tier = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert ns.exists()
+            long_ago = time.time() - 45 * 86400
+            os.utime(ns / "index.db", (long_ago, long_ago))
+        finally:
+            tier.close()
+        again = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert not ns.exists()
+        finally:
+            again.close()
+
+    def test_a_digest_directory_without_a_marker_is_handled_quietly(
+        self, tmp_path, caplog
+    ):
+        ns = tmp_path / ("4" * 32)
+        ns.mkdir()
+        long_ago = time.time() - 90 * 86400
+        os.utime(ns, (long_ago, long_ago))
+        with caplog.at_level("DEBUG", logger="vllm_mlx.ssd_cache"):
+            tier = _tier(tmp_path, stale_namespace_days=30)
+        try:
+            assert not ns.exists(), "an old directory with no marker is as old as it is"
+            assert "Traceback" not in caplog.text
+            assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        finally:
+            tier.close()
+
+    def test_two_tiers_of_one_identity_share_a_namespace_and_both_keep_it(
+        self, tmp_path
+    ):
+        other = CacheIdentity(model="model-b", window="window-a", kv="kv-a")
+        first, second = _tier(tmp_path), _tier(tmp_path)
+        try:
+            assert first.namespace_dir == second.namespace_dir
+            first.close()
+            long_ago = time.time() - 31 * 86400
+            os.utime(
+                os.path.join(second.namespace_dir, "identity.json"), (long_ago,) * 2
+            )
+            third = _tier(tmp_path, identity=other, stale_namespace_days=30)
+            try:
+                assert os.path.isdir(second.namespace_dir), "second still holds it"
+            finally:
+                third.close()
+        finally:
+            second.close()
+
+    def test_a_claim_waits_for_a_reclaim_and_starts_over(self, tmp_path):
+        """A tier starting on a directory another tier is reclaiming ends with a
+        usable directory, not a lock file in a deleted one."""
+        import fcntl
+        import shutil
+        import threading
+
+        ns = self._stale_namespace(tmp_path, 45, IDENT.digest)
+        lock = os.open(str(ns / ".lock"), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock, fcntl.LOCK_EX)  # the reclaiming tier
+        result = {}
+
+        def start():
+            result["tier"] = _tier(tmp_path)
+
+        thread = threading.Thread(target=start)
+        thread.start()
+        time.sleep(0.3)
+        assert thread.is_alive(), "the claim must wait for the reclaim"
+        shutil.rmtree(ns)
+        os.close(lock)
+        thread.join(timeout=10)
+        tier = result["tier"]
+        try:
+            assert os.path.isdir(tier._data_dir)
+            _spill(tier, tuple(range(1, 17)))
+            assert tier.lookup_ssd(tuple(range(1, 17))) is not None
+        finally:
+            tier.close()
 
     def test_reclaiming_can_be_turned_off(self, tmp_path):
         old = self._stale_namespace(tmp_path, 400)

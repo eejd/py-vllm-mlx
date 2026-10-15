@@ -79,12 +79,15 @@ def _drain(tier):
 class World:
     """A 1 MB memory cache backed by an SSD tier, behind a scheduler."""
 
-    def __init__(self, tmp_path, entry_tokens):
+    def __init__(self, tmp_path, entry_tokens, **cache_config):
         self.n = entry_tokens
         self.cache = MemoryAwarePrefixCache(
             tiny_llama(1),
             MemoryCacheConfig(
-                max_memory_mb=1, max_entries=50, min_prefix_tokens=MIN_PREFIX
+                max_memory_mb=1,
+                max_entries=50,
+                min_prefix_tokens=MIN_PREFIX,
+                **cache_config,
             ),
         )
         self.tier = SSDCacheTier(
@@ -135,8 +138,8 @@ class World:
 def world(tmp_path):
     made = []
 
-    def build(entry_tokens=400):
-        w = World(tmp_path / f"w{len(made)}", entry_tokens)
+    def build(entry_tokens=400, **cache_config):
+        w = World(tmp_path / f"w{len(made)}", entry_tokens, **cache_config)
         made.append(w)
         return w
 
@@ -599,6 +602,118 @@ def test_a_rejected_ssd_hit_evicts_the_entry_it_came_from(world):
 
     assert (prompt + reply) not in w.cache
     assert w.tier.lookup_ssd(tuple(prompt + reply)) is None
+
+
+def test_an_entry_already_on_the_tier_is_marked_recently_used(world):
+    w = world()
+    key = tuple(_conversation(0, 400)[0])
+    assert w.tier.enqueue_spill(key, _kv(list(key)), 1024)
+    _wait_spilled(w.tier, 1)
+
+    def accessed_at():
+        with w.tier._index._db_lock:
+            return w.tier._index._conn.execute(
+                "SELECT accessed_at FROM entries"
+            ).fetchone()[0]
+
+    with w.tier._index._db_lock:
+        w.tier._index._conn.execute("UPDATE entries SET accessed_at = 1.0")
+        w.tier._index._conn.commit()
+    assert w.tier.enqueue_spill(key, _kv(list(key)), 1024)
+
+    assert accessed_at() > time.time() - 60
+
+
+def test_a_spill_racing_a_close_does_not_touch_a_closed_index(world):
+    """The index is looked at under the lifecycle lock: close() cannot close it between
+    the 'still accepting' check and the lookup."""
+    import threading
+
+    w = world()
+    real = w.tier._index.lookup_exact
+    closer = threading.Thread(target=w.tier.close)
+
+    def racing(tokens):
+        closer.start()
+        closer.join(0.5)  # a close that is not locked out finishes in this time
+        return real(tokens)
+
+    w.tier._index.lookup_exact = racing
+    key = tuple(_conversation(0, 400)[0])
+    w.tier.enqueue_spill(key, _kv(list(key)), 1024)  # must not raise
+    closer.join(timeout=15)
+    assert not closer.is_alive()
+
+
+def test_fetch_resident_marks_the_entry_recently_used(world):
+    w = world()
+    w.fill([0, 1], spilled=0)
+    first, second = list(w.cache._entries)
+
+    assert w.cache.fetch_resident(first) is not None
+
+    assert list(w.cache._entries) == [second, first]
+    assert w.cache.fetch_resident((1, 2, 3)) is None
+    _within_budget(w.cache)
+
+
+def test_an_entry_served_from_ram_in_a_pass_is_protected_from_the_next_promotion(world):
+    """Serving a request from a resident entry refreshes its recency, so only the
+    protected set stops a later, larger promotion from evicting it: that promotion
+    needs every other entry gone and the cache cannot make room without this one."""
+    w = world()
+    w.fill([0, 1, 2], spilled=1)  # RAM holds 1 and 2; conversation 0 is on the tier
+    (p0, r0), (p2, r2) = w.conversations[0], w.conversations[2]
+    p3, r3 = _conversation(3, 800)  # ~830 KB: on the tier only, needs all but 170 KB
+    assert w.tier.enqueue_spill(tuple(p3 + r3), _kv(p3 + r3), len(p3 + r3) * 1024)
+    _wait_spilled(w.tier, 2)
+    first = w.request(p0, "first")  # an lcp candidate on conversation 0's entry
+    second = w.request(p3 + r3 + [7001 + i for i in range(40)], "second")
+    assert first._ssd_candidate["match_type"] == "lcp"
+    assert second._ssd_candidate["match_type"] == "prefix"
+    assert w.cache.store(p0 + r0, _kv(p0 + r0), evict_prefixes=False)  # now resident
+    _wait_spilled(w.tier, 3)
+
+    w.promote()
+
+    assert first.cache_hit_type == "ssd_hit"
+    assert (
+        p0 + r0
+    ) in w.cache, "the entry the first request was served from was evicted"
+    assert second.cache_hit_type == "miss", "it can only fit by evicting that entry"
+    assert (p2 + r2) in w.cache, "a refused promotion must evict nothing"
+    _within_budget(w.cache)
+
+
+def test_a_resident_entry_is_served_dequantized_under_kv_quantization(world):
+    """fetch_resident hands out what fetch() does: dense layers, not the quantized
+    storage form (which cannot be cut back or replayed)."""
+    w = world(kv_quantize=True, kv_bits=8, kv_group_size=HEAD_DIM)
+    prompt, reply = _conversation(0, 400)
+    key = prompt + reply
+    assert w.tier.enqueue_spill(tuple(key), _kv(key), 1024)
+    _wait_spilled(w.tier, 1)
+    turn_two = key + [7001 + i for i in range(40)]
+    first, second = w.request(turn_two, "first"), w.request(turn_two, "second")
+    repeat = w.request(prompt, "repeat")
+
+    w.promote()
+
+    assert w.cache._entries[tuple(key)].cache[0].__class__.__name__ == (
+        "_QuantizedCacheWrapper"
+    ), "the entry must be held quantized for this to prove anything"
+    for request, covered in (
+        (first, len(key)),
+        (second, len(key)),
+        (repeat, len(prompt)),
+    ):
+        assert request.cache_hit_type == "ssd_hit"
+        assert request.cached_tokens == covered
+        for layer in request.prompt_cache:
+            assert type(layer).__name__ == "KVCache"
+            assert layer.offset == covered
+            assert not isinstance(layer.keys, (tuple, list))
+    assert w.tier.get_stats()["ssd_hits"] == 1
 
 
 # --- real model: cold and warm answer alike ---------------------------------------------------
