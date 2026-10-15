@@ -160,7 +160,8 @@ names it) a tier runs without the mark, and no directory in that base directory 
 to be idle: delete stale ones by hand (as you can any directory you no longer need sooner). Tiers of builds before the
 lock hold no mark, so a reclaim by this build judges a directory such a server uses by its last use only (the index and its
 WAL); and the reclaim's own leftovers (`*.reclaim-*`) are deleted at every start, whatever the retention. A relative
-`--ssd-cache-dir` is resolved against the working directory once, when the tier starts. Each spilled entry is checked
+`--ssd-cache-dir` is resolved against the working directory once, when the tier starts (symlinks are not resolved); an empty
+value is refused at start rather than meaning the working directory. Each spilled entry is checked
 on promotion (manifest token count, `tokens.bin`, and each
 layer's offset against the key) and a mismatching one is quarantined and counted as a miss.
 

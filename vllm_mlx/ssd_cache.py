@@ -987,8 +987,8 @@ class SSDCacheTier:
         self._writer_thread: threading.Thread | None = None
         self._namespace_lock_fd: int | None = None
 
-        if config.cache_dir is None:
-            raise ValueError("SSDCacheConfig.cache_dir must be set")
+        if not config.cache_dir:  # None, or "": abspath("") would mean the cwd
+            raise ValueError("SSDCacheConfig.cache_dir must be a directory path")
         if config.identity is None:
             raise ValueError(
                 "SSDCacheConfig.identity must be set: entries are only valid for the "

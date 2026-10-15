@@ -2346,6 +2346,103 @@ class TestIdentityNamespacing:
         finally:
             conn.close()
 
+    @staticmethod
+    def _wal_database(directory):
+        """A legacy-schema database with a live WAL (the connection stays open)."""
+        import sqlite3
+
+        conn = sqlite3.connect(directory / "index.db")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute(
+            "CREATE TABLE entries (token_hash TEXT PRIMARY KEY, tokens_blob BLOB, "
+            "num_tokens INTEGER, file_path TEXT, memory_bytes INTEGER)"
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(FULL)")  # the table is in the main file ...
+        conn.execute("INSERT INTO entries (token_hash) VALUES ('x')")
+        conn.commit()  # ... and the WAL holds a later write
+        return conn
+
+    def test_the_wal_copy_limit_is_inclusive_at_the_combined_size(
+        self, tmp_path, monkeypatch
+    ):
+        conn = self._wal_database(tmp_path)
+        try:
+            path = str(tmp_path / "index.db")
+            size = os.path.getsize(path) + os.path.getsize(path + "-wal")
+            monkeypatch.setattr(ssd_cache_module, "_LEGACY_PROBE_COPY_LIMIT", size)
+            assert SSDCacheTier._is_legacy_index(path) is True  # exactly at it: copied
+            monkeypatch.setattr(ssd_cache_module, "_LEGACY_PROBE_COPY_LIMIT", size - 1)
+            assert SSDCacheTier._is_legacy_index(path) is False  # one byte over
+        finally:
+            conn.close()
+
+    def test_the_wal_copy_limit_counts_the_database_as_well_as_the_wal(
+        self, tmp_path, monkeypatch
+    ):
+        conn = self._wal_database(tmp_path)
+        try:
+            path = str(tmp_path / "index.db")
+            wal = os.path.getsize(path + "-wal")
+            assert os.path.getsize(path) > 0
+            monkeypatch.setattr(ssd_cache_module, "_LEGACY_PROBE_COPY_LIMIT", wal)
+            assert SSDCacheTier._is_legacy_index(path) is False
+        finally:
+            conn.close()
+
+    def test_a_wal_whose_size_cannot_be_read_is_not_probed(self, tmp_path, monkeypatch):
+        conn = self._wal_database(tmp_path)
+        try:
+            path = str(tmp_path / "index.db")
+            real = os.path.getsize
+
+            def unreadable(p):
+                if str(p).endswith("-wal"):
+                    raise PermissionError(13, "Permission denied", str(p))
+                return real(p)
+
+            monkeypatch.setattr(os.path, "getsize", unreadable)
+            assert SSDCacheTier._is_legacy_index(path) is False
+        finally:
+            conn.close()
+
+    def test_a_wal_that_cannot_be_copied_is_not_probed(self, tmp_path, monkeypatch):
+        import shutil
+
+        conn = self._wal_database(tmp_path)
+        try:
+
+            def full_disk(src, dst, **kwargs):
+                raise OSError(28, "No space left on device", str(dst))
+
+            monkeypatch.setattr(shutil, "copyfile", full_disk)
+            assert SSDCacheTier._is_legacy_index(str(tmp_path / "index.db")) is False
+        finally:
+            conn.close()
+
+    def test_a_probe_that_sqlite_rejects_with_a_value_error_is_not_ours(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        conn = self._wal_database(tmp_path)
+        conn.close()  # checkpointed: no WAL is left beside the database
+
+        def rejected(*args, **kwargs):
+            raise ValueError("embedded null character")
+
+        monkeypatch.setattr(sqlite3, "connect", rejected)
+        assert SSDCacheTier._is_legacy_index(str(tmp_path / "index.db")) is False
+
+    def test_an_empty_cache_dir_is_refused_not_taken_for_the_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ValueError, match="cache_dir"):
+            SSDCacheTier(SSDCacheConfig(cache_dir="", identity=IDENT))
+        assert os.listdir(tmp_path) == [], "nothing may be created in the cwd"
+
     def test_a_lock_file_that_cannot_be_created_degrades_like_a_refused_lock(
         self, tmp_path, monkeypatch, caplog
     ):
