@@ -2024,7 +2024,9 @@ class Scheduler:
                     # cached prefix a hit shows a repetition penalty only the
                     # prompt's tail (a single token for an exact hit), and the
                     # request answers differently from the same one served cold.
-                    insert_kwargs["all_tokens"] = [list(cached_prefix)]
+                    # ``cached_prefix`` is already a copy (a slice): mlx-lm
+                    # appends to it in place, so it must not be the request's list.
+                    insert_kwargs["all_tokens"] = [cached_prefix]
             if request.sampling_params.ignore_eos:
                 # Do not stop on EOS: the generator-wide stop set is replaced
                 # for this sequence only (see _stop_override_insert_kwargs).

@@ -418,3 +418,14 @@ def test_the_same_picture_behind_two_urls_shares_one_entry(engine):
 
     assert vlm.calls[1]["fed"] == vlm.calls[0]["fed"][-1:]
     assert hit == cold
+
+
+def test_a_prompt_snapshot_for_a_remote_url_is_reported_as_not_stored():
+    manager = mllm_cache.MLLMPrefixCacheManager()
+    layer = vlm_cache.KVCache()
+    feed(layer, [1, 2, 3, 4], tag=0)
+
+    assert manager.store_prompt_cache([REMOTE], "p", [layer], [1, 2, 3, 4]) is False
+    assert len(manager) == 0
+    assert manager.store_prompt_cache(["local.png"], "p", [layer], [1, 2, 3, 4]) is True
+    assert len(manager) == 1

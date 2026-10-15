@@ -485,7 +485,7 @@ class MLLMPrefixCacheManager:
         token_ids: list[int],
         num_image_tokens: int = 0,
         model_name: str = "",
-    ) -> None:
+    ) -> bool:
         """
         Store prefix state in cache.
 
@@ -500,9 +500,13 @@ class MLLMPrefixCacheManager:
             token_ids: Token sequence the ``kv_cache`` positions correspond to
             num_image_tokens: Number of image tokens (e.g., 256 for Gemma 3)
             model_name: Model name for validation
+
+        Returns:
+            True if an entry was stored; False for a remote ``http(s)://``
+            source, whose content is not pinned (see :func:`is_remote_source`).
         """
         if any(is_remote_source(image) for image in images):
-            return
+            return False
         cache_key = self._make_cache_key(images, prompt)
         replaced = self._cache.pop(cache_key, None)
         if replaced is not None:
@@ -534,6 +538,7 @@ class MLLMPrefixCacheManager:
             f"tokens={len(token_ids)}, vision_emb={vision_embeddings is not None}, "
             f"memory={entry.memory_size / 1024 / 1024:.1f}MB"
         )
+        return True
 
     def store_cache(
         self,
@@ -585,7 +590,7 @@ class MLLMPrefixCacheManager:
         snapshot = snapshot_prompt_prefix(live_cache, keep)
         if snapshot is None:
             return False
-        self.store(
+        return self.store(
             images=images,
             prompt=prompt,
             vision_embeddings=None,
@@ -593,7 +598,6 @@ class MLLMPrefixCacheManager:
             token_ids=list(token_ids[:keep]),
             model_name=model_name,
         )
-        return True
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
