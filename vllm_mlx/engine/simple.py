@@ -537,23 +537,41 @@ class SimpleEngine(BaseEngine):
 
     @staticmethod
     def _clone_cache_state(value: Any) -> Any:
-        """Copy cache state containers without duplicating immutable MLX arrays."""
+        """Copy a cache state without copying any tensor data.
+
+        ``update_and_fetch`` writes new keys/values into the cache's padded
+        buffer with ``self.keys[..., prev:offset, :] = keys``. ``mx.array``
+        assignment rebinds the Python array object itself, so two caches that
+        hold the *same Python object* see each other's writes, even though MLX
+        arrays are values. ``KVCache.state`` returns the live ``keys`` /
+        ``values`` objects, and the old container-only copy handed them to
+        every holder: a restored cache decoded into the buffer of the saved
+        snapshot and of any prefix-trie entry built from the request that took
+        the snapshot, overwriting that entry's tail with another
+        conversation's KV. ``value[...]`` is a new array object over the same
+        data; MLX copies the buffer only when one of the two is written
+        (nothing may be donated while another object references the data), so
+        a restore costs one buffer copy at the first decode step instead of a
+        corrupted cache.
+        """
         if isinstance(value, tuple):
             return tuple(SimpleEngine._clone_cache_state(v) for v in value)
         if isinstance(value, list):
             return [SimpleEngine._clone_cache_state(v) for v in value]
+        if isinstance(value, mx.array):
+            return value[...]
         return value
 
     @classmethod
     def _snapshot_prompt_cache(cls, prompt_cache: list[Any]) -> list[Any]:
-        """Capture cache states without aliasing mutable state containers."""
+        """Capture cache states that share no object with the live cache."""
         return [cls._clone_cache_state(c.state) for c in prompt_cache]
 
     @classmethod
     def _restore_prompt_cache(
         cls, prompt_cache: list[Any], snapshot: list[Any]
     ) -> None:
-        """Restore cache states without letting decode mutate the saved snapshot."""
+        """Restore cache states that share no object with the saved snapshot."""
         for i, saved_state in enumerate(snapshot):
             prompt_cache[i].state = cls._clone_cache_state(saved_state)
 
