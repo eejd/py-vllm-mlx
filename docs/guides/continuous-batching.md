@@ -81,6 +81,13 @@ ownership, not a throughput feature.
 - KV cache stored in fixed-size blocks
 - Shared system prompts use same blocks
 - Memory savings: 80%+ for 10+ concurrent users
+- A block is identified by its chain hash (the hash of the previous block, the block's
+  tokens and any per-request extra keys), as in vLLM. The same tokens behind a different
+  prefix, or at a different position, are a different block, so a hit is always KV that was
+  computed behind exactly this prefix (py-vllm-mlx#104). Only full blocks are cached and
+  hit; requests with images or video bypass the paged cache.
+- Blocks of a finished request are released but stay cached until the pool needs them
+  (least recently used, deepest block first).
 
 ## Performance Results
 

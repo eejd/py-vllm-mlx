@@ -11,6 +11,7 @@ This module provides two implementations:
 """
 
 import copy
+import functools
 import logging
 import time
 from collections import OrderedDict
@@ -25,7 +26,7 @@ except ImportError:
     HAS_MLX = False
 
 from .mlx_cache_compat import restore_from_state
-from .paged_cache import BlockTable, PagedCacheManager
+from .paged_cache import BlockTable, PagedCacheManager, compute_chain_hashes
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +362,25 @@ class PrefixCacheManager:
 # =============================================================================
 
 
+def _under_pool_lock(method):
+    """Run a BlockAwarePrefixCache method holding the paged pool's lock.
+
+    ``fetch_cache`` and ``store_cache`` look blocks up and then pin them. A block
+    that is found free but not yet referenced can be recycled by another thread
+    (the scheduler adds requests and stores finished ones from different
+    threads), and the caller would then hold a block that carries somebody
+    else's tokens. The pool's lock is re-entrant, so the whole operation can
+    hold it.
+    """
+
+    @functools.wraps(method)
+    def locked(self, *args, **kwargs):
+        with self.paged_cache.lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
 @dataclass
 class BlockCacheEntry:
     """Entry mapping a token sequence to cache blocks."""
@@ -376,8 +396,10 @@ class BlockAwarePrefixCache:
 
     Features:
     - Block-level prefix sharing (64 tokens per block)
+    - Block identity is a chain hash (parent block hash + tokens + extra keys),
+      as in vLLM: a block is reused only behind the exact prefix it was
+      computed after
     - Copy-on-Write for efficient forking
-    - Hash-based deduplication across requests
     - Reference counting for memory efficiency
 
     This is the recommended cache for production use when memory
@@ -414,10 +436,6 @@ class BlockAwarePrefixCache:
         self.paged_cache = paged_cache_manager
         self.block_size = paged_cache_manager.block_size
 
-        # Hash table for quick prefix lookup
-        # Maps hash(tokens[:block_size*n]) -> (tokens, block_ids)
-        self._prefix_index: Dict[str, Tuple[List[int], List[int]]] = {}
-
         # Request to block table mapping
         self._request_tables: Dict[str, BlockCacheEntry] = {}
 
@@ -426,17 +444,28 @@ class BlockAwarePrefixCache:
         self._misses = 0
         self._tokens_saved = 0
 
+    @_under_pool_lock
     def fetch_cache(
         self,
         request_id: str,
         tokens: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Tuple[Optional[BlockTable], List[int]]:
         """
         Find cached prefix blocks for the given tokens.
 
+        A block is a hit only behind the exact blocks it was computed after:
+        blocks are looked up by chain hash (parent block hash + tokens + extra
+        keys), so identical tokens cached behind a different prefix, or at a
+        different position, are never served. The KV of a token depends on
+        every token before it; reusing it behind another prefix answers from
+        a context that never existed.
+
         Args:
             request_id: Unique request identifier
             tokens: Input token sequence
+            extra_keys: Per-request inputs that change the KV of identical
+                tokens (multimodal content, cache salt, adapter id)
 
         Returns:
             Tuple of (block_table, remaining_tokens)
@@ -446,53 +475,36 @@ class BlockAwarePrefixCache:
         if not tokens:
             return None, tokens
 
-        # Try to find shared prefix blocks
-        shared_block_ids, remaining = self.paged_cache.find_shared_prefix(tokens)
+        # A request id that comes back (retry) must not leak the refs of its
+        # previous table.
+        self.paged_cache.delete_block_table(request_id)
+        self._request_tables.pop(request_id, None)
 
-        if shared_block_ids:
-            # Create block table for this request with shared blocks
+        matched, _ = self.paged_cache.get_computed_blocks(tokens, extra_keys)
+
+        # The prefix has to end on a block that can be restored as of its end
+        # (a recurrent layer's snapshot exists only where it was taken);
+        # blocks stored without tensors (reference-only data) have nothing to
+        # restore and are plain lookups.
+        usable = list(matched)
+        while usable and not self._is_restorable_end(usable[-1]):
+            usable.pop()
+
+        if usable:
+            self.paged_cache.touch(usable)
             block_table = self.paged_cache.create_block_table(request_id)
+            for block in usable:
+                block_table.block_ids.append(block.block_id)
+                block_table.num_tokens += block.token_count
 
-            for block_id in shared_block_ids:
-                # Increment ref count for sharing
-                self.paged_cache.increment_ref(block_id)
-                block = self.paged_cache.allocated_blocks.get(block_id)
-                if block:
-                    block_table.block_ids.append(block_id)
-                    block_table.num_tokens += block.token_count
-
-            num_prefix_tokens = len(tokens) - len(remaining)
+            num_prefix_tokens = block_table.num_tokens
+            remaining = tokens[num_prefix_tokens:]
             self._hits += 1
             self._tokens_saved += num_prefix_tokens
 
             logger.debug(
                 f"Cache hit for {request_id}: "
-                f"{len(shared_block_ids)} blocks, {num_prefix_tokens} tokens"
-            )
-
-            return block_table, remaining
-
-        # Try prefix index for longer matches
-        best_match = self._find_best_prefix_match(tokens)
-        if best_match:
-            matched_tokens, matched_block_ids = best_match
-
-            # Fork the matched blocks
-            block_table = self.paged_cache.create_block_table(request_id)
-            for block_id in matched_block_ids:
-                self.paged_cache.increment_ref(block_id)
-                block = self.paged_cache.allocated_blocks.get(block_id)
-                if block:
-                    block_table.block_ids.append(block_id)
-                    block_table.num_tokens += block.token_count
-
-            remaining = tokens[len(matched_tokens) :]
-            self._hits += 1
-            self._tokens_saved += len(matched_tokens)
-
-            logger.debug(
-                f"Prefix index hit for {request_id}: "
-                f"{len(matched_tokens)} tokens matched"
+                f"{len(usable)} blocks, {num_prefix_tokens} tokens"
             )
 
             return block_table, remaining
@@ -502,11 +514,46 @@ class BlockAwarePrefixCache:
         logger.debug(f"Cache miss for {request_id}")
         return None, tokens
 
+    @staticmethod
+    def _is_restorable_end(block: Any) -> bool:
+        """Can a prefix that ends with ``block`` be rebuilt as of its end?
+
+        Every layer needs an entry in the last block: the slice of a
+        sequence-backed layer, or the snapshot of a recurrent layer taken at
+        exactly this block's last token.
+        """
+        data = block.cache_data
+        return data is None or all(entry is not None for entry in data)
+
+    def _cache_extent(self, cache_data: List[Any]) -> int:
+        """Number of token positions the extracted cache actually holds.
+
+        Taken from the tensors, never from the token list: the KV of a
+        finished request normally covers all of ``prompt + output`` (the
+        scheduler's contract), but a path that leaves it one position short
+        (a sampled token that was never fed back, a draft/MTP rollback) would
+        otherwise get a block hashed for N tokens whose slice holds N-1. That
+        block would be reconstructed one position short and every later token
+        would sit at the wrong position.
+
+        Returns 0 when the extent cannot be established (no sequence-backed
+        layer, or layers that disagree): nothing is then claimed.
+        """
+        extents = set()
+        for layer_state in cache_data:
+            state = layer_state.get("state")
+            axis = self._cache_state_seq_axis(state)
+            if axis is not None:
+                extents.add(state[0].shape[axis])
+        return extents.pop() if len(extents) == 1 else 0
+
+    @_under_pool_lock
     def store_cache(
         self,
         request_id: str,
         tokens: List[int],
         cache_data: List[Any],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
     ) -> Optional[BlockTable]:
         """
         Store computed cache for future reuse.
@@ -514,12 +561,18 @@ class BlockAwarePrefixCache:
         This method stores actual tensor data (not references) when cache_data
         contains extracted states from mlx-lm's KVCache.state property.
 
+        Only full blocks whose KV exists are cached, each under its chain hash
+        (see :meth:`fetch_cache`); a block already cached behind the same
+        prefix is shared, never one that merely holds the same tokens.
+
         Args:
             request_id: Unique request identifier
             tokens: Token sequence that was processed
             cache_data: The computed KV cache to store. Can be:
                 - List of KVCache objects (legacy, stores references)
                 - List of dicts with 'state': (keys, values) tensors (new, stores slices)
+            extra_keys: Per-request inputs that change the KV of identical
+                tokens (multimodal content, cache salt, adapter id)
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -528,12 +581,20 @@ class BlockAwarePrefixCache:
             return None
 
         # Check if cache_data contains extracted tensor states
-        is_tensor_data = (
+        is_tensor_data = bool(
             cache_data
             and isinstance(cache_data, list)
-            and len(cache_data) > 0
             and isinstance(cache_data[0], dict)
             and "state" in cache_data[0]
+        )
+
+        # Positions whose KV really exists. Reference-only data (legacy) has
+        # no tensors to bound it, nothing is sliced from it either.
+        extent = self._cache_extent(cache_data) if is_tensor_data else len(tokens)
+        covered = min(len(tokens), extent)
+        num_full_blocks = covered // self.block_size
+        hashes = compute_chain_hashes(
+            tokens, self.block_size, extra_keys, num_full_blocks
         )
 
         # Get or create block table
@@ -541,70 +602,64 @@ class BlockAwarePrefixCache:
         if not block_table:
             block_table = self.paged_cache.create_block_table(request_id)
 
-        # Determine tokens we need to cache (not already in block_table)
-        existing_tokens = block_table.num_tokens
-        new_tokens = tokens[existing_tokens:]
+        # Keep the blocks of the table that are exactly this sequence's chain
+        # (a table from fetch_cache, or from an earlier store of the same
+        # request); anything else is dropped rather than extended.
+        keep = 0
+        for block_id in block_table.block_ids[:num_full_blocks]:
+            block = self.paged_cache.allocated_blocks.get(block_id)
+            if block is None or block.block_hash != hashes[keep]:
+                break
+            keep += 1
+        self._truncate_table(block_table, keep)
 
-        if not new_tokens:
-            # All tokens already cached
-            return block_table
+        for i in range(keep, num_full_blocks):
+            start = i * self.block_size
+            end = start + self.block_size
+            block_tokens = tokens[start:end]
+            parent_hash = hashes[i - 1] if i > 0 else None
 
-        # Allocate blocks for new tokens
-        num_new_blocks = (len(new_tokens) + self.block_size - 1) // self.block_size
-
-        for i in range(num_new_blocks):
-            start_idx = i * self.block_size
-            end_idx = min(start_idx + self.block_size, len(new_tokens))
-            block_tokens = new_tokens[start_idx:end_idx]
-
-            # Token range in the original sequence (accounting for existing tokens)
-            global_start = existing_tokens + start_idx
-            global_end = existing_tokens + end_idx
-
-            # Check if this block already exists (deduplication)
-            if len(block_tokens) == self.block_size:
-                existing_block = self.paged_cache.find_cached_block(block_tokens)
-                if existing_block:
-                    # Reuse existing block
-                    self.paged_cache.increment_ref(existing_block.block_id)
-                    block_table.block_ids.append(existing_block.block_id)
-                    block_table.num_tokens += len(block_tokens)
-                    continue
+            # Deduplicate against a block cached behind the same prefix
+            existing_block = self.paged_cache.find_cached_block(
+                block_tokens, parent_hash, extra_keys
+            )
+            if existing_block is not None:
+                self.paged_cache.touch([existing_block])
+                block_table.block_ids.append(existing_block.block_id)
+                block_table.num_tokens += self.block_size
+                if is_tensor_data and HAS_MLX:
+                    self._complete_shared_block(
+                        existing_block, cache_data, start, end, covered
+                    )
+                continue
 
             # Allocate new block
             block = self.paged_cache.allocate_block()
             if not block:
-                # Handle memory pressure
-                if not self.paged_cache.handle_memory_pressure(1):
-                    logger.warning(f"Cannot allocate block for {request_id}")
-                    break
-                block = self.paged_cache.allocate_block()
-                if not block:
-                    break
-
-            # Store block data
-            block.token_count = len(block_tokens)
-            block_table.block_ids.append(block.block_id)
-            block_table.num_tokens += len(block_tokens)
+                logger.warning(f"Cannot allocate block for {request_id}")
+                break
 
             # Extract and store actual tensor slices for this block
-            if is_tensor_data and HAS_MLX:
-                block_kv_data = self._extract_block_tensor_slice(
-                    cache_data, global_start, global_end, len(tokens)
+            if is_tensor_data:
+                block_kv_data = (
+                    self._extract_block_tensor_slice(cache_data, start, end, covered)
+                    if HAS_MLX
+                    else None
                 )
-                if block_kv_data:
-                    block.cache_data = block_kv_data
-                    logger.debug(
-                        f"Stored tensor slice for block {block.block_id}: "
-                        f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
-                    )
+                if not block_kv_data:
+                    # No KV for this block: it must not be findable
+                    self.paged_cache.free_block(block.block_id)
+                    break
+                block.cache_data = block_kv_data
+                logger.debug(
+                    f"Stored tensor slice for block {block.block_id}: "
+                    f"tokens [{start}:{end}], {len(block_kv_data)} layers"
+                )
 
-            # Register hash for full blocks (for deduplication)
-            if len(block_tokens) == self.block_size:
-                self.paged_cache.register_block_hash(block, block_tokens)
-
-        # Update prefix index
-        self._update_prefix_index(tokens, block_table.block_ids)
+            self.paged_cache.add_block_to_table(block_table, block, self.block_size)
+            self.paged_cache.register_block_hash(
+                block, block_tokens, parent_hash, extra_keys
+            )
 
         # Store entry for request (for legacy compatibility)
         self._request_tables[request_id] = BlockCacheEntry(
@@ -627,6 +682,52 @@ class BlockAwarePrefixCache:
         )
 
         return block_table
+
+    def _truncate_table(self, block_table: BlockTable, keep: int) -> None:
+        """Drop every block of the table after the first ``keep``."""
+        dropped = block_table.block_ids[keep:]
+        if not dropped:
+            return
+        del block_table.block_ids[keep:]
+        block_table.num_tokens = keep * self.block_size
+        for block_id in reversed(dropped):
+            self.paged_cache.free_block(block_id)
+
+    def _complete_shared_block(
+        self,
+        block: Any,
+        cache_data: List[Dict[str, Any]],
+        start_idx: int,
+        end_idx: int,
+        covered: int,
+    ) -> None:
+        """Fill in what a shared block was stored without.
+
+        The block holds the same tokens behind the same prefix as this request,
+        so this request's KV for those positions is the block's KV. Two gaps
+        can be closed from it: a block cached as a bare lookup (no tensors),
+        and the recurrent snapshots of a block cached mid-sequence, which
+        exist only where a request ended (``end_idx == covered``) and let the
+        block end a hit.
+        """
+        data = block.cache_data
+        if data is not None and (
+            end_idx != covered or all(entry is not None for entry in data)
+        ):
+            return
+        fresh = self._extract_block_tensor_slice(
+            cache_data, start_idx, end_idx, covered
+        )
+        if not fresh:
+            return
+        if data is None:
+            block.cache_data = fresh
+            return
+        if len(fresh) != len(data):
+            return
+        for idx, entry in enumerate(data):
+            if entry is None and fresh[idx] is not None:
+                data[idx] = fresh[idx]
 
     def _extract_block_tensor_slice(
         self,
@@ -803,11 +904,15 @@ class BlockAwarePrefixCache:
         """
         Release cache blocks for a completed request.
 
+        Drops the request's references (also those of a table that only came
+        from :meth:`fetch_cache`). Blocks nobody references any more stay
+        cached, evictable least recently used first, until the pool needs them.
+
         Args:
             request_id: Request identifier
         """
-        entry = self._request_tables.pop(request_id, None)
-        if entry:
+        self._request_tables.pop(request_id, None)
+        if self.paged_cache.get_block_table(request_id) is not None:
             self.paged_cache.delete_block_table(request_id)
             logger.debug(f"Released cache for {request_id}")
 
@@ -890,31 +995,34 @@ class BlockAwarePrefixCache:
             if not all_block_data:
                 return None
 
-            # Get number of layers from the richest block
-            num_layers = max(len(block_data) for block_data in all_block_data)
-            if num_layers == 0:
+            # Every block must describe the same layers
+            num_layers = len(all_block_data[0])
+            if num_layers == 0 or any(len(d) != num_layers for d in all_block_data):
                 return None
 
             reconstructed_caches = []
             for layer_idx in range(num_layers):
-                layer_entries = [
-                    block_data[layer_idx]
-                    for block_data in all_block_data
-                    if layer_idx < len(block_data)
-                ]
-                layer_entries = [entry for entry in layer_entries if entry is not None]
-                if not layer_entries:
+                layer_entries = [block_data[layer_idx] for block_data in all_block_data]
+
+                # The restored layer must describe the state after the LAST
+                # block. A sequence-backed layer needs every block's slice (a
+                # missing one would shift every later position); a recurrent
+                # layer's snapshot is only valid at the token where it was
+                # taken, so it must come from the last block, never from an
+                # earlier one (that would pair the KV of N tokens with the
+                # recurrent state of fewer).
+                layer_meta = layer_entries[-1]
+                if layer_meta is None:
                     return None
 
-                layer_meta = layer_entries[-1]
                 state = layer_meta["state"]
                 if layer_meta["storage"] == "concat":
+                    if any(entry is None for entry in layer_entries):
+                        return None
                     state = self._concat_cache_states(
                         [entry["state"] for entry in layer_entries],
                         layer_meta["seq_axis"],
                     )
-                elif layer_meta["storage"] == "latest":
-                    state = layer_entries[-1]["state"]
 
                 if state is None:
                     return None
@@ -936,6 +1044,17 @@ class BlockAwarePrefixCache:
                         return None
                     cache.offset = cache.keys.shape[seq_axis]
 
+                # A layer that carries its own position (a rotating window
+                # rebuilt from the meta_state of the whole stored sequence)
+                # must land exactly where the table says the prefix ends.
+                offset = getattr(cache, "offset", None)
+                if isinstance(offset, int) and offset != block_table.num_tokens:
+                    logger.debug(
+                        f"Reconstructed layer {layer_idx} is at offset {offset}, "
+                        f"not {block_table.num_tokens}: not restorable"
+                    )
+                    return None
+
                 reconstructed_caches.append(cache)
 
             if not reconstructed_caches:
@@ -954,44 +1073,6 @@ class BlockAwarePrefixCache:
 
             logger.debug(traceback.format_exc())
             return None
-
-    def _find_best_prefix_match(
-        self,
-        tokens: List[int],
-    ) -> Optional[Tuple[List[int], List[int]]]:
-        """Find best matching prefix in the index."""
-        best_match = None
-        best_len = 0
-
-        # Try progressively longer prefixes
-        for num_blocks in range(1, len(tokens) // self.block_size + 1):
-            prefix_len = num_blocks * self.block_size
-            if prefix_len > len(tokens):
-                break
-
-            prefix_tokens = tokens[:prefix_len]
-            prefix_hash = self.paged_cache.compute_block_hash(prefix_tokens)
-
-            if prefix_hash in self._prefix_index:
-                cached_tokens, block_ids = self._prefix_index[prefix_hash]
-                if cached_tokens == prefix_tokens and len(cached_tokens) > best_len:
-                    best_match = (cached_tokens, block_ids)
-                    best_len = len(cached_tokens)
-
-        return best_match
-
-    def _update_prefix_index(
-        self,
-        tokens: List[int],
-        block_ids: List[int],
-    ) -> None:
-        """Update prefix index with new token sequence."""
-        # Index block-aligned prefixes
-        for i in range(1, len(block_ids) + 1):
-            prefix_len = min(i * self.block_size, len(tokens))
-            prefix_tokens = tokens[:prefix_len]
-            prefix_hash = self.paged_cache.compute_block_hash(prefix_tokens)
-            self._prefix_index[prefix_hash] = (prefix_tokens, block_ids[:i])
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
@@ -1019,7 +1100,6 @@ class BlockAwarePrefixCache:
     def clear(self) -> None:
         """Clear all cached data."""
         self._request_tables.clear()
-        self._prefix_index.clear()
         self.paged_cache.clear()
         self.reset_stats()
 
