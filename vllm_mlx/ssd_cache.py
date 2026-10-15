@@ -51,6 +51,9 @@ _LEGACY_ENTRY_RE = re.compile(r"^[0-9a-f]{64}(\.tmp)?$")
 _DIGEST_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
 # A namespace being deleted is renamed to this first (see _reclaim_stale_namespaces).
 _TOMBSTONE_RE = re.compile(r"^[0-9a-f]{32}\.reclaim-[0-9]+-[0-9]+$")
+# A legacy index.db with a WAL is probed as a copy; a foreign database bigger than
+# this is not worth copying and is left alone (treated as not ours).
+_LEGACY_PROBE_COPY_LIMIT = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -992,7 +995,9 @@ class SSDCacheTier:
                 "model and configuration that computed them"
             )
 
-        self._base_dir = config.cache_dir
+        # Absolute, once: the directory is used for file URIs and lock files, and the
+        # process's working directory may change after start.
+        self._base_dir = os.path.abspath(config.cache_dir)
         self._identity = config.identity
         self._cache_dir = os.path.join(self._base_dir, config.identity.digest)
         self._data_dir = os.path.join(self._cache_dir, "data")
@@ -1126,21 +1131,25 @@ class SSDCacheTier:
         import sqlite3
         import tempfile
 
+        path = os.path.abspath(path)  # a file URI cannot name a relative path
         wal = path + "-wal"
         try:
             with open(path, "rb") as f:
                 if f.read(16) != b"SQLite format 3\x00":
                     return False
-            has_wal = os.path.getsize(wal) > 0
+        except OSError:  # absent (the usual case), unreadable or a directory
+            return False
+        try:
+            wal_size = os.path.getsize(wal)
         except FileNotFoundError:
-            has_wal = False
+            wal_size = 0
         except OSError:
             return False
 
         def has_legacy_table(db_path: str, query: str) -> bool:
             try:
                 conn = sqlite3.connect(pathlib.Path(db_path).as_uri() + query, uri=True)
-            except sqlite3.Error:
+            except (sqlite3.Error, ValueError):
                 return False
             try:
                 columns = {r[1] for r in conn.execute("PRAGMA table_info(entries)")}
@@ -1150,9 +1159,11 @@ class SSDCacheTier:
                 conn.close()
             return {"token_hash", "tokens_blob", "file_path"} <= columns
 
-        if not has_wal:
+        if wal_size == 0:
             return has_legacy_table(path, "?mode=ro&immutable=1")
         try:
+            if os.path.getsize(path) + wal_size > _LEGACY_PROBE_COPY_LIMIT:
+                return False
             with tempfile.TemporaryDirectory(prefix="ssd-probe-") as tmp:
                 shutil.copyfile(path, os.path.join(tmp, "index.db"))
                 shutil.copyfile(wal, os.path.join(tmp, "index.db-wal"))
@@ -1263,14 +1274,14 @@ class SSDCacheTier:
         import shutil
         import time as _time
 
+        names = os.listdir(self._base_dir)
+        for name in names:  # whatever the retention: nothing uses a tombstone
+            if _TOMBSTONE_RE.match(name):
+                shutil.rmtree(os.path.join(self._base_dir, name), ignore_errors=True)
         days = self._config.stale_namespace_days
         if days is None:
             return
         cutoff = _time.time() - days * 86400
-        names = os.listdir(self._base_dir)
-        for name in names:
-            if _TOMBSTONE_RE.match(name):
-                shutil.rmtree(os.path.join(self._base_dir, name), ignore_errors=True)
         for name in names:
             path = os.path.join(self._base_dir, name)
             if (
@@ -1286,13 +1297,14 @@ class SSDCacheTier:
             tombstone = self._tombstone_if_idle(path, name, cutoff, last_used)
             if tombstone is None:
                 continue
-            try:
-                shutil.rmtree(tombstone)
-            except OSError:
+            # Another server's start sweeps tombstones too: entries vanishing under
+            # this delete are not a failure; only a tree that is still there is.
+            shutil.rmtree(tombstone, ignore_errors=True)
+            if os.path.exists(tombstone):
                 logger.warning(
-                    "[ssd_cache] could not delete reclaimed namespace %s",
+                    "[ssd_cache] could not delete reclaimed namespace %s "
+                    "(it is swept at the next start)",
                     tombstone,
-                    exc_info=True,
                 )
                 continue
             logger.info("[ssd_cache] reclaimed %s: not used for %s days", name, days)

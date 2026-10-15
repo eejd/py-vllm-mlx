@@ -157,7 +157,10 @@ cache to another server's start. The reclaim renames the directory to `<digest>.
 the lock and deletes that (a leftover one is deleted at the next start), so a server starting on that identity at the
 same moment gets a fresh directory. On a filesystem that refuses advisory locks (some network and FUSE mounts: a warning
 names it) a tier runs without the mark, and no directory in that base directory is reclaimed, since none can be shown
-to be idle: delete stale ones by hand (as you can any directory you no longer need sooner). Each spilled entry is checked
+to be idle: delete stale ones by hand (as you can any directory you no longer need sooner). Tiers of builds before the
+lock hold no mark, so a reclaim by this build judges a directory such a server uses by its last use only (the index and its
+WAL); and the reclaim's own leftovers (`*.reclaim-*`) are deleted at every start, whatever the retention. A relative
+`--ssd-cache-dir` is resolved against the working directory once, when the tier starts. Each spilled entry is checked
 on promotion (manifest token count, `tokens.bin`, and each
 layer's offset against the key) and a mismatching one is quarantined and counted as a miss.
 

@@ -2273,6 +2273,139 @@ class TestIdentityNamespacing:
         finally:
             tier.close()
 
+    def test_a_relative_cache_dir_works(self, tmp_path, monkeypatch):
+        """--ssd-cache-dir is passed as given: ``cache`` is relative to the cwd."""
+        monkeypatch.chdir(tmp_path)
+        tier = _tier("cache")
+        try:
+            assert os.path.isabs(tier.namespace_dir)
+            _spill(tier, tuple(range(1, 17)))
+            assert tier.lookup_ssd(tuple(range(1, 17))) is not None
+            assert os.path.isfile(tmp_path / "cache" / IDENT.digest / ".lock")
+            # the working directory moving later does not move the tier's files
+            monkeypatch.chdir("/")
+            _spill(tier, tuple(range(100, 116)))
+            assert tier.lookup_ssd(tuple(range(100, 116))) is not None
+        finally:
+            tier.close()
+        assert not os.path.exists("/" + IDENT.digest)
+
+    @pytest.mark.parametrize("spelling", ["cache", "./cache", "sub/../cache"])
+    def test_a_relative_cache_dir_discards_the_legacy_layout_and_reclaims(
+        self, tmp_path, monkeypatch, spelling
+    ):
+        monkeypatch.chdir(tmp_path)
+        base = tmp_path / "cache"
+        base.mkdir()
+        self._legacy_layout(base)
+        stale = self._stale_namespace(base, 45, "9" * 32)
+        tier = _tier(spelling, stale_namespace_days=30)
+        try:
+            assert not (base / "index.db").exists()
+            assert not stale.exists()
+        finally:
+            tier.close()
+
+    def test_the_legacy_probe_takes_a_relative_path_and_a_missing_file(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        monkeypatch.chdir(tmp_path)
+        assert SSDCacheTier._is_legacy_index("index.db") is False  # absent
+        assert SSDCacheTier._is_legacy_index(".") is False  # not a file
+        conn = sqlite3.connect("index.db")
+        conn.execute(
+            "CREATE TABLE entries (token_hash TEXT PRIMARY KEY, tokens_blob BLOB, "
+            "num_tokens INTEGER, file_path TEXT, memory_bytes INTEGER)"
+        )
+        conn.commit()
+        conn.close()
+        assert SSDCacheTier._is_legacy_index("index.db") is True
+
+    def test_a_foreign_database_too_big_to_copy_is_left_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """A WAL database is probed as a copy: a big one is not worth copying and is
+        treated as not ours."""
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_path / "index.db")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute(
+            "CREATE TABLE entries (token_hash TEXT PRIMARY KEY, tokens_blob BLOB, "
+            "num_tokens INTEGER, file_path TEXT, memory_bytes INTEGER)"
+        )
+        conn.commit()
+        try:
+            path = str(tmp_path / "index.db")
+            assert SSDCacheTier._is_legacy_index(path) is True
+            monkeypatch.setattr(ssd_cache_module, "_LEGACY_PROBE_COPY_LIMIT", 1024)
+            assert SSDCacheTier._is_legacy_index(path) is False
+        finally:
+            conn.close()
+
+    def test_a_lock_file_that_cannot_be_created_degrades_like_a_refused_lock(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        real_open = os.open
+
+        def refuse_the_lock_file(path, *args, **kwargs):
+            if str(path).endswith(".lock"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", refuse_the_lock_file)
+        with caplog.at_level("WARNING", logger="vllm_mlx.ssd_cache"):
+            tier = _tier(tmp_path)
+        try:
+            assert tier._namespace_lock_fd is None
+            assert "running without the in-use mark" in caplog.text
+            _spill(tier, tuple(range(1, 17)))
+        finally:
+            tier.close()
+
+    def test_a_tombstone_a_concurrent_sweep_deletes_is_not_a_failure(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Two servers starting together both sweep and delete tombstones."""
+        import shutil
+
+        other = CacheIdentity(model="model-b", window="window-a", kv="kv-a")
+        old = _tier(tmp_path)
+        old.close()
+        self._backdate(old.namespace_dir)
+        real_rmtree = shutil.rmtree
+
+        def the_other_sweeper_got_there_first(path, *args, **kwargs):
+            real_rmtree(path)
+            if not kwargs.get("ignore_errors"):
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+
+        monkeypatch.setattr(shutil, "rmtree", the_other_sweeper_got_there_first)
+        with caplog.at_level("INFO", logger="vllm_mlx.ssd_cache"):
+            tier = _tier(tmp_path, identity=other, stale_namespace_days=30)
+        monkeypatch.undo()
+        try:
+            assert not [r for r in caplog.records if r.levelname == "WARNING"]
+            assert "reclaimed" in caplog.text
+            assert not os.path.exists(old.namespace_dir)
+            assert not [n for n in os.listdir(tmp_path) if ".reclaim-" in n]
+        finally:
+            tier.close()
+
+    def test_tombstones_are_swept_even_when_reclaiming_is_turned_off(self, tmp_path):
+        leftover = tmp_path / ("a" * 32 + ".reclaim-1-2")
+        (leftover / "data").mkdir(parents=True)
+        stale = self._stale_namespace(tmp_path, 400, "b" * 32)
+        tier = _tier(tmp_path, stale_namespace_days=None)
+        try:
+            assert not leftover.exists()
+            assert stale.exists(), "turning reclaiming off keeps stale namespaces"
+        finally:
+            tier.close()
+
     def test_reclaiming_can_be_turned_off(self, tmp_path):
         old = self._stale_namespace(tmp_path, 400)
         tier = _tier(tmp_path, stale_namespace_days=None)
