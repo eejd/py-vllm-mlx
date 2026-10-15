@@ -115,6 +115,28 @@ class TestSnapshotPromptPrefix:
 
         assert snapshot_prompt_prefix(live, live[1].offset) is None
 
+    def test_a_buffer_whose_start_has_advanced_cannot_be_cut_back(self):
+        # A plain KV layer that has dropped its oldest rows (``start_position``
+        # moved on): the first rows it holds are no longer positions 0..n, so
+        # keeping the "first keep_tokens" would hand back later positions as
+        # if they were the prompt's start. Only this guard refuses it (the
+        # layer is plain KV and not a wrapped window).
+        layer = vlm_cache.KVCache()
+        feed(layer, list(range(1, 21)))
+        layer.start_position = 12
+        assert snapshot_prompt_prefix([layer], 10) is None
+
+        layer.start_position = 0
+        assert snapshot_prompt_prefix([layer], 10) is not None
+
+    def test_a_chunked_buffer_that_dropped_its_front_is_refused(self):
+        chunked = lm_cache.ChunkedKVCache(chunk_size=8)
+        feed(chunked, list(range(1, 21)))
+        chunked.maybe_trim_front()
+        assert chunked.start_position > 0 and chunked.offset == 20
+
+        assert snapshot_prompt_prefix([chunked], 10) is None
+
     def test_recurrent_state_cannot_be_cut_back(self):
         live = live_cache(PROMPT_IDS, OUTPUT_IDS)
         live[1] = lm_cache.ArraysCache(2)
