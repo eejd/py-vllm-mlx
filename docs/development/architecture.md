@@ -104,7 +104,7 @@ Request Completion                    Cache Storage
 | **80% Memory Savings** | Share system prompt blocks across concurrent users |
 | **vLLM Architecture** | FreeKVCacheBlockQueue, BlockHashToBlockMap, chain hashing |
 | **Real Tensor Storage** | Extracts actual KV data using `.state` |
-| **Block Deduplication** | Hash-based detection prevents duplicate storage |
+| **Block Deduplication** | Chain-hash detection (parent hash + tokens + extra keys) shares a block only behind the exact prefix it was computed after |
 | **Copy-on-Write (COW)** | Shared blocks only copied when modified |
 | **O(1) LRU Eviction** | Doubly linked list for efficient cleanup |
 

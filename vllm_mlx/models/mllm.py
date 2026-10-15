@@ -27,6 +27,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import numpy as np
@@ -34,9 +35,8 @@ import requests
 
 from vllm_mlx.engine.chat_template_safety import normalize_messages_for_chat_template
 from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
-from vllm_mlx.mlx_cache_compat import clone_layer
 from vllm_mlx.utils.chat_template_override import apply_chat_template_override
-from vllm_mlx.utils.tokenizer import encode_prompt, resolve_add_special_tokens
+from vllm_mlx.utils.tokenizer import resolve_add_special_tokens
 from vllm_mlx.utils.vlm_inputs import prepare_inputs
 from vllm_mlx.utils.mistral_tokenizer import (
     adopt_fast_tokenizer,
@@ -559,6 +559,26 @@ def _mllm_finish_reason(result) -> str:
     return "length" if getattr(result, "finish_reason", None) == "length" else "stop"
 
 
+def _flat_token_ids(input_ids) -> list[int]:
+    """The ids of a batch-of-one ``input_ids`` (mx array or nested lists) as a list."""
+    if input_ids is None:
+        return []
+    if hasattr(input_ids, "flatten"):
+        return [int(t) for t in input_ids.flatten().tolist()]
+    return [int(t) for row in input_ids for t in row]
+
+
+@dataclass
+class _PromptCacheRun:
+    """One request's use of the prompt-KV cache (an mlx-vlm ``PromptCacheState``)."""
+
+    sources: list
+    prompt: str
+    token_ids: list[int]
+    state: Any
+    hit: bool
+
+
 def _stream_mllm_generated_outputs(
     *,
     stream_generate_fn,
@@ -575,6 +595,8 @@ def _stream_mllm_generated_outputs(
     stop: list[str] | None,
     draft_metrics,
     input_kwargs: dict | None = None,
+    prompt_cache_state=None,
+    on_complete=None,
 ):
     token_count = 0
     last_chunk = None
@@ -587,6 +609,7 @@ def _stream_mllm_generated_outputs(
         max_tokens=max_tokens,
         temperature=temperature,
         prompt_cache=prompt_cache,
+        prompt_cache_state=prompt_cache_state,
         **(input_kwargs or {}),
         **draft_kwargs,
         **generation_kwargs,
@@ -608,6 +631,9 @@ def _stream_mllm_generated_outputs(
         if stop and any(seq in generated_text for seq in stop)
         else _mllm_finish_reason(last_chunk)
     )
+    if on_complete is not None:
+        # Before the final chunk: a consumer may stop reading at finish_reason.
+        on_complete()
     yield MLLMOutput(
         text="",
         finish_reason=finish_reason,
@@ -1929,6 +1955,72 @@ class MLXMultimodalLM:
         prepared["mask"] = inputs.get("attention_mask")
         return prepared
 
+    def _open_prompt_cache(
+        self,
+        enabled: bool,
+        sources: list,
+        formatted_prompt: str,
+        prepared: dict,
+    ) -> "_PromptCacheRun | None":
+        """Start a request's use of the prompt-KV cache, or None if it must not use it.
+
+        ``prepared`` is what :meth:`_prepared_inputs` returned: its ``input_ids``
+        are the prompt as the model sees it (image placeholders expanded), which
+        is what a snapshot is keyed against and checked with. On a hit the
+        returned state carries an independent copy of the snapshot, holding all
+        prompt positions but the last; mlx-vlm then prefills only the rest and
+        never sees the stored entry. On a miss the state is empty and mlx-vlm
+        fills it with the cache the request ran on once the request completes.
+        """
+        if not enabled or self._cache_manager is None or not sources:
+            return None
+        token_ids = _flat_token_ids(prepared.get("input_ids"))
+        if len(token_ids) < 2:
+            return None
+        from mlx_vlm.generate import PromptCacheState
+
+        state = PromptCacheState()
+        hit = self._cache_manager.fetch_prompt_cache(
+            sources, formatted_prompt, token_ids
+        )
+        if hit is not None:
+            state.cache, state.token_ids = hit
+            logger.info(
+                f"[PREFIX CACHE] hit for {len(sources)} source(s): "
+                f"{len(state.token_ids)} of {len(token_ids)} prompt tokens cached"
+            )
+        return _PromptCacheRun(
+            sources, formatted_prompt, token_ids, state, hit is not None
+        )
+
+    def _close_prompt_cache(self, run: "_PromptCacheRun | None") -> None:
+        """Store the prompt KV of a completed request that missed the cache.
+
+        mlx-vlm leaves the cache the request ran on in ``run.state`` only when
+        the request ran to its end; a request cut short stores nothing. That
+        cache holds the prompt *and* the generated tokens, so it goes through
+        :meth:`MLLMPrefixCacheManager.store_prompt_cache`, which stores an
+        independent copy cut back to the prompt.
+        """
+        if run is None or run.hit or run.state.cache is None:
+            return
+        try:
+            stored = self._cache_manager.store_prompt_cache(
+                run.sources,
+                run.prompt,
+                run.state.cache,
+                run.token_ids,
+                model_name=self.model_name,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to cache prompt KV: {e}")
+            return
+        if stored:
+            logger.info(
+                f"[PREFIX CACHE] stored {len(run.token_ids) - 1} of "
+                f"{len(run.token_ids)} prompt tokens for {len(run.sources)} source(s)"
+            )
+
     def _prepare_images(self, images: list) -> list[str]:
         """Process remote/base64 image inputs into local temp file paths."""
         return [process_image_input(image) for image in images]
@@ -2446,23 +2538,24 @@ class MLXMultimodalLM:
         else:
             formatted_prompt = prompt
 
-        # Check cache for existing KV state
-        prompt_cache = None
-        cache_hit = False
-
+        # Prompt KV reuse: a snapshot of the prompt's positions, keyed by the
+        # sources + rendered prompt (see MLLMPrefixCacheManager.fetch_prompt_cache)
         if use_cache and all_audio:
             logger.info("MLLM cache disabled for audio inputs")
             use_cache = False
 
-        if use_cache and self._cache_manager is not None and all_sources:
-            prompt_cache, cache_hit = self._cache_manager.fetch_cache(
-                all_sources, formatted_prompt
-            )
-            if cache_hit:
-                logger.info(f"MLLM cache hit for {len(all_sources)} source(s)")
+        draft_accept_start = self._reset_draft_metrics()
+        prepared = self._prepared_inputs(
+            formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
+        )
+        draft_kwargs = self._draft_generation_kwargs(kwargs)
+        cache_run = self._open_prompt_cache(
+            use_cache and not draft_kwargs, all_sources, formatted_prompt, prepared
+        )
 
-        # Create new cache if needed
-        if prompt_cache is None and self.model is not None:
+        # The cache mlx-vlm prefills into when it does not reuse a snapshot
+        prompt_cache = None
+        if self.model is not None:
             try:
                 prompt_cache = vlm_cache.make_prompt_cache(
                     self.model.language_model,
@@ -2471,8 +2564,6 @@ class MLXMultimodalLM:
             except Exception:
                 prompt_cache = None
 
-        # Generate with cache
-        draft_accept_start = self._reset_draft_metrics()
         result = generate(
             self.model,
             self.processor,
@@ -2484,25 +2575,13 @@ class MLXMultimodalLM:
             top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
-            **self._prepared_inputs(
-                formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
-            ),
-            **self._draft_generation_kwargs(kwargs),
+            prompt_cache_state=cache_run.state if cache_run else None,
+            **prepared,
+            **draft_kwargs,
             **kwargs,
         )
         draft_metrics = self._draft_metrics_since(draft_accept_start)
-
-        # Store cache for future reuse (only on miss)
-        if use_cache and self._cache_manager and all_sources and not cache_hit:
-            if prompt_cache is not None:
-                try:
-                    num_tokens = getattr(result, "prompt_tokens", 0)
-                    self._cache_manager.store_cache(
-                        all_sources, formatted_prompt, prompt_cache, num_tokens
-                    )
-                    logger.info(f"MLLM cache stored for {len(all_sources)} source(s)")
-                except Exception as e:
-                    logger.debug(f"Failed to store MLLM cache: {e}")
+        self._close_prompt_cache(cache_run)
 
         # Handle GenerationResult object or plain string
         if hasattr(result, "text"):
@@ -2855,86 +2934,26 @@ class MLXMultimodalLM:
             chat_messages, tools, chat_template_kwargs, enable_thinking
         )
 
-        # Prefix caching with vision embedding support
-        # Following LMCache approach: cache vision embeddings to skip encoder on hit
-        import time
-
+        # Prompt KV reuse: a snapshot of the prompt's positions, keyed by
+        # images + rendered prompt (see MLLMPrefixCacheManager.fetch_prompt_cache)
         from mlx_vlm.models import cache as vlm_cache
 
-        cache_entry = None
-        prefix_match_len = 0
-        vision_embeddings = None
-        cache_hit = False
-
-        # Tokenize prompt for cache lookup
-        tokenizer = (
-            self.processor.tokenizer
-            if hasattr(self.processor, "tokenizer")
-            else self.processor
-        )
-        token_ids = encode_prompt(tokenizer, formatted_prompt, prompt_kind)
-
-        # Check prefix cache
         if use_cache and all_audio:
             logger.info("Prefix cache disabled for audio inputs")
             use_cache = False
 
-        if use_cache and self._cache_manager is not None and all_images:
-            try:
-                cache_entry, prefix_match_len = self._cache_manager.fetch(
-                    all_images, formatted_prompt, token_ids
-                )
-                if cache_entry:
-                    cache_hit = True
-                    vision_embeddings = cache_entry.vision_embeddings
-                    if vision_embeddings is not None:
-                        logger.info(
-                            "[PREFIX CACHE] Vision embeddings cached - would skip encoder!"
-                        )
-                    if prefix_match_len > 0:
-                        logger.info(
-                            f"[PREFIX CACHE] {prefix_match_len} prefix tokens match"
-                        )
-            except Exception as e:
-                logger.warning(f"Cache fetch failed: {e}")
+        draft_accept_start = self._reset_draft_metrics()
+        prepared = self._prepared_inputs(
+            formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
+        )
+        draft_kwargs = self._draft_generation_kwargs(kwargs)
+        cache_run = self._open_prompt_cache(
+            use_cache and not draft_kwargs, all_images, formatted_prompt, prepared
+        )
 
-        # Generate - use KV cache if available from previous identical request
-        start_time = time.time()
-
-        # Create or reuse prompt cache for prefix caching speedup
+        # The cache mlx-vlm prefills into when it does not reuse a snapshot
         prompt_cache = None
-        skip_prompt_processing = False
-
-        if cache_hit and cache_entry and cache_entry.kv_cache:
-            # NOTE: mlx-vlm's generate_step() has its own multimodal KV cache with prefix matching
-            # (MULTIMODAL_KV_CACHE_ENABLED in mlx_vlm/utils.py). Let it handle caching.
-            # We only use vllm-mlx's cache for text-only requests (no images).
-            if all_images:
-                # Let mlx-vlm's multimodal cache handle this - don't interfere
-                logger.info(
-                    "[PREFIX CACHE] Images present - delegating to mlx-vlm multimodal cache"
-                )
-                prompt_cache = None  # Fresh cache, mlx-vlm will handle prefix matching
-                skip_prompt_processing = False
-            else:
-                # Text-only: can use skip_prompt_processing for maximum speedup
-                logger.info(
-                    "[PREFIX CACHE] Text-only cache hit - using skip_prompt_processing speedup"
-                )
-                cached_prompt_cache = cache_entry.kv_cache
-                try:
-                    prompt_cache = [clone_layer(c) for c in cached_prompt_cache]
-                    skip_prompt_processing = True
-                    logger.info(
-                        f"[PREFIX CACHE] Skipping {prefix_match_len} token forward pass"
-                    )
-                except Exception as e:
-                    logger.warning(f"[PREFIX CACHE] Failed to copy cache: {e}")
-                    prompt_cache = None
-                    skip_prompt_processing = False
-
-        if prompt_cache is None and self.model is not None:
-            # Create fresh cache
+        if self.model is not None:
             try:
                 prompt_cache = vlm_cache.make_prompt_cache(
                     self.model.language_model,
@@ -2943,7 +2962,6 @@ class MLXMultimodalLM:
             except Exception:
                 prompt_cache = None
 
-        draft_accept_start = self._reset_draft_metrics()
         result = generate(
             self.model,
             self.processor,
@@ -2954,49 +2972,13 @@ class MLXMultimodalLM:
             temperature=temperature,
             verbose=False,
             prompt_cache=prompt_cache,
-            skip_prompt_processing=skip_prompt_processing,
-            **self._prepared_inputs(
-                formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
-            ),
-            **self._draft_generation_kwargs(kwargs),
+            prompt_cache_state=cache_run.state if cache_run else None,
+            **prepared,
+            **draft_kwargs,
             **kwargs,
         )
         draft_metrics = self._draft_metrics_since(draft_accept_start)
-
-        # Store KV cache for future reuse (on cache miss)
-        # IMPORTANT: We need to store only the prompt portion, not generated tokens
-        if (
-            use_cache
-            and self._cache_manager is not None
-            and all_images
-            and not cache_hit
-            and prompt_cache
-        ):
-            try:
-                # Get prompt token count (before generation)
-                prompt_tokens_count = getattr(result, "prompt_tokens", 0)
-
-                # Deep copy the cache and trim to prompt tokens only
-                cache_to_store = []
-                for layer_cache in prompt_cache:
-                    cache_to_store.append(
-                        clone_layer(layer_cache, max_tokens=prompt_tokens_count)
-                    )
-
-                self._cache_manager.store(
-                    images=all_images,
-                    prompt=formatted_prompt,
-                    vision_embeddings=None,
-                    kv_cache=cache_to_store,
-                    token_ids=token_ids,
-                    num_image_tokens=256,
-                    model_name=self.model_name,
-                )
-                logger.info(
-                    f"[PREFIX CACHE] Stored KV cache for {len(all_images)} image(s) ({prompt_tokens_count} prompt tokens)"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to cache: {e}")
+        self._close_prompt_cache(cache_run)
 
         # Handle GenerationResult object or plain string
         if hasattr(result, "text"):
@@ -3167,25 +3149,26 @@ class MLXMultimodalLM:
             chat_messages, tools, chat_template_kwargs, enable_thinking
         )
 
-        # Check cache for existing KV state (uses images as cache key)
+        # Prompt KV reuse (same key space and snapshots as chat()/generate())
         from mlx_vlm.models import cache as vlm_cache
-
-        prompt_cache = None
-        cache_hit = False
 
         if use_cache and all_audio:
             logger.info("Stream chat cache disabled for audio inputs")
             use_cache = False
 
-        if use_cache and self._cache_manager is not None and all_images:
-            prompt_cache, cache_hit = self._cache_manager.fetch_cache(
-                all_images, formatted_prompt
-            )
-            if cache_hit:
-                logger.debug(f"Stream chat cache hit for {len(all_images)} image(s)")
+        draft_accept_start = self._reset_draft_metrics()
+        generation_kwargs = _generation_kwargs_with_stop(kwargs, stop)
+        draft_kwargs = self._draft_generation_kwargs(generation_kwargs)
+        prepared = self._prepared_inputs(
+            formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
+        )
+        cache_run = self._open_prompt_cache(
+            use_cache and not draft_kwargs, all_images, formatted_prompt, prepared
+        )
 
-        # Create new cache if needed
-        if prompt_cache is None and self.model is not None:
+        # The cache mlx-vlm prefills into when it does not reuse a snapshot
+        prompt_cache = None
+        if self.model is not None:
             try:
                 prompt_cache = vlm_cache.make_prompt_cache(
                     self.model.language_model,
@@ -3194,9 +3177,6 @@ class MLXMultimodalLM:
             except Exception:
                 prompt_cache = None
 
-        # Stream generate tokens with cache
-        draft_accept_start = self._reset_draft_metrics()
-        generation_kwargs = _generation_kwargs_with_stop(kwargs, stop)
         yield from _stream_mllm_generated_outputs(
             stream_generate_fn=stream_generate,
             model=self.model,
@@ -3207,13 +3187,13 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temperature=temperature,
             prompt_cache=prompt_cache,
-            draft_kwargs=self._draft_generation_kwargs(generation_kwargs),
+            draft_kwargs=draft_kwargs,
             generation_kwargs=generation_kwargs,
             stop=stop,
             draft_metrics=lambda: self._draft_metrics_since(draft_accept_start),
-            input_kwargs=self._prepared_inputs(
-                formatted_prompt, all_images, all_audio, add_special_tokens=prompt_kind
-            ),
+            input_kwargs=prepared,
+            prompt_cache_state=cache_run.state if cache_run else None,
+            on_complete=lambda: self._close_prompt_cache(cache_run),
         )
 
     def describe_image(

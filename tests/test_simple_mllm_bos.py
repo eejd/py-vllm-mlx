@@ -67,7 +67,11 @@ def boundary(monkeypatch):
     models.cache = cache
     utils = ModuleType("mlx_vlm.utils")
     utils.prepare_inputs = prepare_inputs
-    for module in (vlm, prompt_utils, models, cache, utils):
+    generate_module = ModuleType("mlx_vlm.generate")
+    generate_module.PromptCacheState = type(
+        "PromptCacheState", (), {"cache": None, "token_ids": None}
+    )
+    for module in (vlm, generate_module, prompt_utils, models, cache, utils):
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
     wrapper = MLXMultimodalLM("test-model", enable_cache=True)
@@ -79,14 +83,13 @@ def boundary(monkeypatch):
     wrapper.config = {}
     monkeypatch.setattr(wrapper, "_prepare_images", lambda images: ["prepared-image"])
 
-    def fetch(images, prompt, token_ids):
+    def fetch_prompt_cache(images, prompt, token_ids):
         seen["cache_fetch"].append(token_ids)
-        return None, 0
+        return None
 
     wrapper._cache_manager = SimpleNamespace(
-        fetch=fetch,
-        fetch_cache=lambda images, prompt: (None, False),
-        store=lambda **kw: None,
+        fetch_prompt_cache=fetch_prompt_cache,
+        store_prompt_cache=lambda *args, **kw: False,
     )
     return wrapper, seen
 
@@ -139,10 +142,13 @@ def test_text_only_chat_prompt_is_prepared_without_images(boundary):
 
 
 def test_chat_prefix_cache_key_uses_the_ids_the_model_sees(boundary):
+    # The prompt ids of a multimodal request are the processor's (image
+    # placeholders expanded), not a re-tokenization of the rendered text.
     wrapper, seen = boundary
     wrapper.chat(messages=CHAT, max_tokens=4)
     (token_ids,) = seen["cache_fetch"]
-    assert token_ids == FakeTokenizer().encode(RENDERED, add_special_tokens=False)
+    (call,) = seen["generate"]
+    assert token_ids == call["input_ids"][0]
 
 
 @pytest.mark.parametrize("route", ["generate", "stream_generate"])
