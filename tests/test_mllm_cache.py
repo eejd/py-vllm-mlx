@@ -85,7 +85,6 @@ class TestImageHashing:
 
             # Same file should give same hash
             assert hash1 == hash2
-            assert len(hash1) == 16  # First 16 chars of SHA256
         finally:
             os.unlink(temp_path)
 
@@ -107,14 +106,11 @@ class TestImageHashing:
             os.unlink(path1)
             os.unlink(path2)
 
-    def test_compute_image_hash_url(self):
-        """Test hashing a URL (non-existent file path)."""
-        url = "https://example.com/image.jpg"
-        hash1 = compute_image_hash(url)
-        hash2 = compute_image_hash(url)
-
-        assert hash1 == hash2
-        assert len(hash1) == 16
+    def test_compute_image_hash_data_uri(self):
+        """A data: URI carries its content, so it is hashed as a string."""
+        uri = "data:image/png;base64,AAAA"
+        assert compute_image_hash(uri) == compute_image_hash(uri)
+        assert compute_image_hash(uri) != compute_image_hash(uri + "B")
 
     def test_compute_images_hash_empty(self):
         """Test hashing empty image list."""
@@ -129,7 +125,8 @@ class TestImageHashing:
 
         try:
             hash_single = compute_images_hash([path])
-            assert len(hash_single) == 16
+            assert hash_single == compute_images_hash([path])
+            assert hash_single != compute_images_hash([path, path])
         finally:
             os.unlink(path)
 

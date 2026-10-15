@@ -2494,12 +2494,10 @@ class MLXMultimodalLM:
         # Process all images (including frames from videos) and audio inputs
         all_images = []
         all_audio = []
-        all_sources = []  # Track original sources for cache key
 
         # Process image inputs
         if images:
             all_images.extend(self._prepare_images(images))
-            all_sources.extend(images)
 
         # Extract frames from videos
         for video_path in videos:
@@ -2509,11 +2507,6 @@ class MLXMultimodalLM:
                 max_frames=video_max_frames,
             )
             all_images.extend(frames)
-            # Include video params in cache key
-            video_str = video_path if isinstance(video_path, str) else str(video_path)
-            all_sources.append(
-                f"video:{video_str}:fps{video_fps}:max{video_max_frames}"
-            )
             logger.info(f"Added {len(frames)} frames from video: {video_path}")
 
         if audio:
@@ -2539,7 +2532,7 @@ class MLXMultimodalLM:
             formatted_prompt = prompt
 
         # Prompt KV reuse: a snapshot of the prompt's positions, keyed by the
-        # sources + rendered prompt (see MLLMPrefixCacheManager.fetch_prompt_cache)
+        # fetched images' bytes + rendered prompt (see MLLMPrefixCacheManager.fetch_prompt_cache)
         if use_cache and all_audio:
             logger.info("MLLM cache disabled for audio inputs")
             use_cache = False
@@ -2550,7 +2543,7 @@ class MLXMultimodalLM:
         )
         draft_kwargs = self._draft_generation_kwargs(kwargs)
         cache_run = self._open_prompt_cache(
-            use_cache and not draft_kwargs, all_sources, formatted_prompt, prepared
+            use_cache and not draft_kwargs, all_images, formatted_prompt, prepared
         )
 
         # The cache mlx-vlm prefills into when it does not reuse a snapshot

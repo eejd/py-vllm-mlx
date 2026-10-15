@@ -265,6 +265,8 @@ When you send an image to the model, the vision encoder processes it into embedd
 
 The cache uses content-based hashing (similar to LMCache) to identify identical images regardless of how they're provided (URL, base64, or file path).
 
+An entry is identified by the full SHA-256 of every image's bytes (in order), of the prompt text, and, for the batched engine's pixel cache, by how the prompt was tokenised (a rendered chat prompt and a raw completion of the same words have different token ids). A remote URL is never a key: the server fetches it first and the bytes it got are hashed, so a URL that starts serving another picture is a miss, not the old picture's cached pixels or KV. The caches themselves refuse a bare `http(s)://` source.
+
 ### Enabling the Cache
 
 ```bash
