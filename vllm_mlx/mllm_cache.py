@@ -143,6 +143,18 @@ class MLLMPrefixCacheEntry:
         return match_length
 
 
+def is_remote_source(source: str) -> bool:
+    """True for an ``http(s)://`` URL.
+
+    A URL names a resource, not its bytes: the same URL can serve another
+    picture later, so a cache key built from it would hand the old picture's
+    pixels or KV to the new one. Such a source has to be fetched to a local
+    file (whose bytes :func:`compute_image_hash` hashes) before it can key
+    anything; a cache refuses it.
+    """
+    return isinstance(source, str) and source.startswith(("http://", "https://"))
+
+
 def compute_image_hash(image_path: str) -> str:
     """
     Compute hash of image content for cache key.
@@ -152,23 +164,24 @@ def compute_image_hash(image_path: str) -> str:
     different paths or as base64.
 
     Args:
-        image_path: Path to image file
+        image_path: Path to image file, or a ``data:`` URI (which carries its
+            own content)
 
     Returns:
-        SHA256 hash of image content (first 16 chars)
+        SHA-256 hex digest of the image content (the whole digest: a prefix
+        of it is a key someone can collide on purpose)
     """
     try:
-        path = Path(image_path)
-        if path.exists():
-            # Hash file content - this is the LMCache approach
-            content = path.read_bytes()
-            return hashlib.sha256(content).hexdigest()[:16]
-        else:
-            # Hash the string itself (for URLs or base64)
-            return hashlib.sha256(image_path.encode()).hexdigest()[:16]
+        if not image_path.startswith("data:"):
+            path = Path(image_path)
+            if path.is_file():
+                # Hash file content - this is the LMCache approach
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+        # A data: URI, or a stand-in name that is no file
+        return hashlib.sha256(image_path.encode()).hexdigest()
     except Exception as e:
         logger.warning(f"Failed to hash image: {e}")
-        return hashlib.sha256(str(image_path).encode()).hexdigest()[:16]
+        return hashlib.sha256(str(image_path).encode()).hexdigest()
 
 
 def compute_images_hash(images: list[str]) -> str:
@@ -188,7 +201,7 @@ def compute_images_hash(images: list[str]) -> str:
     # [B, A] are different requests and must not share a cache entry.
     hashes = [compute_image_hash(img) for img in images]
     combined = "_".join(hashes)
-    return hashlib.sha256(combined.encode()).hexdigest()[:16]
+    return hashlib.sha256(combined.encode()).hexdigest()
 
 
 def _snapshot_layer(layer: Any, keep_tokens: int) -> Any | None:
@@ -299,7 +312,7 @@ class MLLMPrefixCacheManager:
     def _make_cache_key(self, images: list[str], prompt: str) -> str:
         """Create cache key from images and prompt."""
         image_hash = compute_images_hash(images)
-        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
         return f"{image_hash}_{prompt_hash}"
 
     def _make_image_only_key(self, images: list[str]) -> str:
@@ -488,6 +501,8 @@ class MLLMPrefixCacheManager:
             num_image_tokens: Number of image tokens (e.g., 256 for Gemma 3)
             model_name: Model name for validation
         """
+        if any(is_remote_source(image) for image in images):
+            return
         cache_key = self._make_cache_key(images, prompt)
         replaced = self._cache.pop(cache_key, None)
         if replaced is not None:
@@ -495,7 +510,7 @@ class MLLMPrefixCacheManager:
 
         entry = MLLMPrefixCacheEntry(
             image_hash=compute_images_hash(images),
-            prompt_hash=hashlib.sha256(prompt.encode()).hexdigest()[:16],
+            prompt_hash=hashlib.sha256(prompt.encode()).hexdigest(),
             vision_embeddings=vision_embeddings,
             kv_cache=kv_cache,
             token_ids=token_ids,

@@ -46,9 +46,13 @@ container layers, an entry rejected by the KV bound, a failed cache insert) is t
 `tokens_saved`, counted as a miss and in `discarded_hits`. Engines older than this change still show the
 discrepancy; there the per-request value is the truthful one.
 
-Known limits: on an exact repeat only the last prompt token is fed to the batch generator, so a request with
-`repetition_penalty` or custom logits processors sees just that token as context (as partial-prefix hits
-already do); a request aborted before it is scheduled keeps its credit in `hits`; the SSD-tier and MLLM paths
+Logits processors see the same context on a hit as cold: only the last prompt token (or the prompt's
+remainder) is fed to the batch generator, and the scheduler passes the cached prefix as the sequence's
+`all_tokens`, so `repetition_penalty` or a custom logits processor works over the whole prompt plus output
+whether or not the prompt came from the cache. Before, a hit showed it just that remainder and the answer
+differed from the cold one.
+
+Known limits: a request aborted before it is scheduled keeps its credit in `hits`; the SSD-tier and MLLM paths
 are not settled. An exact SSD promotion, a paged hit that ends on a block boundary and a legacy prefix-cache
 hit are rewound by one position like a memory-cache exact hit (or prefilled when the layers cannot be
 rewound), so the last token is never in the KV cache twice (#47).

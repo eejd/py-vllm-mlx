@@ -2013,6 +2013,18 @@ class Scheduler:
                 # mlx_lm BatchGenerator never stores None per-sequence.
                 "logits_processors": [lp] if lp else [[]],
             }
+            if lp:
+                cached_prefix = request.prompt_token_ids[
+                    : len(request.prompt_token_ids) - len(tokens_to_process)
+                ]
+                if cached_prefix:
+                    # A logits processor is handed the tokens the BatchGenerator
+                    # has seen for the sequence: the ones it prefills plus
+                    # ``all_tokens``, the ones already in the cache. Without the
+                    # cached prefix a hit shows a repetition penalty only the
+                    # prompt's tail (a single token for an exact hit), and the
+                    # request answers differently from the same one served cold.
+                    insert_kwargs["all_tokens"] = [list(cached_prefix)]
             if request.sampling_params.ignore_eos:
                 # Do not stop on EOS: the generator-wide stop set is replaced
                 # for this sequence only (see _stop_override_insert_kwargs).
@@ -2040,6 +2052,7 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
                     insert_kwargs["caches"] = None
+                    insert_kwargs.pop("all_tokens", None)
                     uids = self.batch_generator.insert(
                         [tokens_to_process],
                         **insert_kwargs,

@@ -1176,11 +1176,19 @@ class MLLMBatchGenerator:
             for audio in request.audio:
                 all_audio.append(process_audio_input(audio))
 
+        # The cached entry holds the prompt's token ids, so it is keyed by how
+        # this request's prompt is tokenised, not just by its text.
+        add_special_tokens = resolve_add_special_tokens(
+            getattr(self.processor, "tokenizer", self.processor),
+            request.prompt,
+            request.add_special_tokens,
+        )
+
         # Check pixel cache first
         cached_pixels = None
         if not all_audio:
             cached_pixels = self.vision_cache.get_pixel_cache(
-                all_images, request.prompt
+                all_images, request.prompt, add_special_tokens
             )
         if cached_pixels is not None:
             # Cache hit - use cached pixel values
@@ -1210,11 +1218,7 @@ class MLLMBatchGenerator:
             audio=all_audio if all_audio else None,
             prompts=request.prompt,
             image_token_index=image_token_index,
-            add_special_tokens=resolve_add_special_tokens(
-                getattr(self.processor, "tokenizer", self.processor),
-                request.prompt,
-                request.add_special_tokens,
-            ),
+            add_special_tokens=add_special_tokens,
         )
 
         request.input_ids = inputs.get("input_ids")
@@ -1242,6 +1246,7 @@ class MLLMBatchGenerator:
                 image_grid_thw=request.image_grid_thw,
                 extra_kwargs=request.extra_kwargs,
                 processing_time=processing_time,
+                add_special_tokens=add_special_tokens,
             )
 
         self._stats.num_images_processed += len(all_images)
