@@ -19,13 +19,16 @@ Based on research from:
 - mlx-lm cache_prompt: https://github.com/ml-explore/mlx-lm
 """
 
+import copy
 import hashlib
 import logging
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+from vllm_mlx.mlx_cache_compat import clone_layer, is_plain_kv, recurrent_arrays
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +191,64 @@ def compute_images_hash(images: list[str]) -> str:
     return hashlib.sha256(combined.encode()).hexdigest()[:16]
 
 
+def _snapshot_layer(layer: Any, keep_tokens: int) -> Any | None:
+    """Independent copy of one cache layer cut to ``keep_tokens`` positions, or None."""
+    # A container's children and a recurrent layer's state hold the whole
+    # sequence folded into fixed-size state: there is no earlier position left
+    # to cut back to.
+    if (
+        getattr(layer, "caches", None) is not None
+        or recurrent_arrays(layer) is not None
+    ):
+        return None
+    offset = getattr(layer, "offset", None)
+    if not isinstance(offset, int) or offset < keep_tokens:
+        return None
+    # A window that has wrapped (or a buffer that has advanced its start) has
+    # evicted the early positions: keeping the first ``keep_tokens`` would
+    # silently return a rotation of the buffer.
+    max_size = getattr(layer, "max_size", None)
+    if max_size is not None and offset > max_size:
+        return None
+    if getattr(layer, "start_position", None) not in (None, 0):
+        return None
+    if is_plain_kv(layer):
+        return clone_layer(layer, max_tokens=keep_tokens)
+    drop = offset - keep_tokens
+    if drop:
+        is_trimmable = getattr(layer, "is_trimmable", None)
+        if not callable(is_trimmable) or not is_trimmable():
+            return None
+    snapshot = copy.deepcopy(layer)
+    if drop and snapshot.trim(drop) != drop:
+        return None
+    return snapshot if snapshot.offset == keep_tokens else None
+
+
+def snapshot_prompt_prefix(
+    prompt_cache: list[Any] | None, keep_tokens: int
+) -> list[Any] | None:
+    """Independent copy of ``prompt_cache`` holding exactly its first ``keep_tokens`` positions.
+
+    The cache a request ran on holds the prompt and everything generated after
+    it. A prefix-cache entry must hold the prompt alone, and must share no
+    arrays or cursors with the live cache (which generation keeps extending
+    in place). Returns None when any layer cannot be cut back to exactly
+    ``keep_tokens`` -- recurrent state, a container layer, a sliding window
+    that has already evicted positions -- so the caller stores nothing instead
+    of a cache of some other length.
+    """
+    if not prompt_cache or keep_tokens <= 0:
+        return None
+    snapshot = []
+    for layer in prompt_cache:
+        part = _snapshot_layer(layer, keep_tokens)
+        if part is None:
+            return None
+        snapshot.append(part)
+    return snapshot
+
+
 class MLLMPrefixCacheManager:
     """
     LRU Cache manager for MLLM prefix states with vision embedding caching.
@@ -312,7 +373,7 @@ class MLLMPrefixCacheManager:
                 f"MLLM cache HIT: {cache_key[:32]}..., prefix_match={match_length}"
             )
 
-            return entry, match_length
+            return self._detached(entry), match_length
 
         # Check for image-only match (can reuse vision embeddings)
         if images:
@@ -331,11 +392,26 @@ class MLLMPrefixCacheManager:
 
                     # Return entry for vision embeddings, but 0 prefix match
                     # (prompt is different, so KV cache can't be reused)
-                    return entry, 0
+                    return self._detached(entry), 0
 
         self.stats.misses += 1
         logger.debug(f"MLLM cache MISS: {cache_key[:32]}...")
         return None, 0
+
+    @staticmethod
+    def _detached(entry: MLLMPrefixCacheEntry) -> MLLMPrefixCacheEntry:
+        """A copy of ``entry`` that shares no mutable state with the stored one.
+
+        The stored ``kv_cache`` is a prompt snapshot another request may fetch
+        later. A caller that hands its list to mlx-vlm gets it extended in
+        place (every layer ``update_and_fetch`` appends), so the stored list
+        must never leave the manager.
+        """
+        return replace(
+            entry,
+            kv_cache=copy.deepcopy(entry.kv_cache),
+            token_ids=list(entry.token_ids),
+        )
 
     def fetch_cache(
         self,
@@ -343,15 +419,49 @@ class MLLMPrefixCacheManager:
         prompt: str,
     ) -> tuple[list[Any] | None, bool]:
         """
-        Legacy API: Fetch cached KV state for image+prompt combination.
+        Fetch cached KV state for image+prompt combination.
 
-        For backwards compatibility with existing code.
+        Returns an independent copy of the stored layers: the caller may feed
+        it to a model (which extends it in place) without touching the entry.
+        A hit says nothing about how many positions the layers hold; the
+        Simple engine uses :meth:`fetch_prompt_cache`, which checks that.
         """
         entry, match_len = self.fetch(images, prompt)
         # For legacy API, return hit if entry exists (don't require token match)
         if entry is not None and entry.kv_cache is not None:
             return entry.kv_cache, True
         return None, False
+
+    def fetch_prompt_cache(
+        self,
+        images: list[str],
+        prompt: str,
+        token_ids: list[int],
+    ) -> tuple[list[Any], list[int]] | None:
+        """Reusable prompt KV for this exact request, as ``(layers, cached_ids)``.
+
+        ``layers`` is an independent copy holding exactly the positions of
+        ``cached_ids``, and ``cached_ids`` is a strict prefix of ``token_ids``
+        (the request's real prompt ids, image placeholders included): the
+        generation call only has to prefill ``token_ids[len(cached_ids):]``.
+        Returns None (counted as a miss) when nothing is stored under the
+        key or the stored ids are not such a prefix -- e.g. the same
+        images+prompt text tokenized differently.
+        """
+        entry = self._cache.get(self._make_cache_key(images, prompt))
+        cached_ids = entry.token_ids if entry is not None else None
+        if (
+            entry is None
+            or not entry.kv_cache
+            or not cached_ids
+            or len(cached_ids) >= len(token_ids)
+            or list(token_ids[: len(cached_ids)]) != list(cached_ids)
+        ):
+            self.stats.total_queries += 1
+            self.stats.misses += 1
+            return None
+        hit, _ = self.fetch(images, prompt, token_ids)
+        return hit.kv_cache, hit.token_ids
 
     def store(
         self,
@@ -366,16 +476,22 @@ class MLLMPrefixCacheManager:
         """
         Store prefix state in cache.
 
+        The manager takes ownership of ``kv_cache``: it must be a snapshot no
+        one else extends (see :meth:`store_prompt_cache`), not a live cache.
+
         Args:
             images: List of image paths
             prompt: Text prompt
             vision_embeddings: Output of vision encoder (can be None for text-only)
             kv_cache: Language model KV cache states
-            token_ids: Full token sequence
+            token_ids: Token sequence the ``kv_cache`` positions correspond to
             num_image_tokens: Number of image tokens (e.g., 256 for Gemma 3)
             model_name: Model name for validation
         """
         cache_key = self._make_cache_key(images, prompt)
+        replaced = self._cache.pop(cache_key, None)
+        if replaced is not None:
+            self._current_memory -= replaced.memory_size
 
         entry = MLLMPrefixCacheEntry(
             image_hash=compute_images_hash(images),
@@ -414,7 +530,10 @@ class MLLMPrefixCacheManager:
         """
         Legacy API: Store KV cache for future reuse.
 
-        For backwards compatibility with existing code.
+        Stores an independent copy, so a cache the caller keeps using (a live
+        one that generation extends in place) cannot change the entry. It
+        does not cut the copy back to a prompt length -- that is
+        :meth:`store_prompt_cache`.
         """
         # Don't store empty or None caches
         if cache is None or (isinstance(cache, list) and len(cache) == 0):
@@ -424,10 +543,42 @@ class MLLMPrefixCacheManager:
             images=images,
             prompt=prompt,
             vision_embeddings=None,
-            kv_cache=cache,
+            kv_cache=copy.deepcopy(cache),
             token_ids=[0] * num_tokens,  # Dummy token IDs
             num_image_tokens=0,
         )
+
+    def store_prompt_cache(
+        self,
+        images: list[str],
+        prompt: str,
+        live_cache: list[Any] | None,
+        token_ids: list[int],
+        model_name: str = "",
+    ) -> bool:
+        """Store the prompt KV of a finished request; True if an entry was stored.
+
+        ``live_cache`` is the cache the request ran on: it holds the prompt
+        *and* what was generated, and is not touched here. The entry is an
+        independent snapshot of its first ``len(token_ids) - 1`` positions
+        (see :func:`snapshot_prompt_prefix`): all but the last prompt token,
+        which a hit prefills itself because the logits of the last prompt
+        position are what the first generated token is sampled from.
+        Nothing is stored when the layers cannot be cut back to that length.
+        """
+        keep = len(token_ids) - 1
+        snapshot = snapshot_prompt_prefix(live_cache, keep)
+        if snapshot is None:
+            return False
+        self.store(
+            images=images,
+            prompt=prompt,
+            vision_embeddings=None,
+            kv_cache=snapshot,
+            token_ids=list(token_ids[:keep]),
+            model_name=model_name,
+        )
+        return True
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""

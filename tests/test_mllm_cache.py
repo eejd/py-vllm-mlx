@@ -376,24 +376,6 @@ class TestMLLMCacheManager:
         # Stats should also be reset
         assert cache_manager.stats.hits == 0
 
-    def test_cache_returns_reference(self, cache_manager, temp_image):
-        """Test that fetched cache returns the stored reference.
-
-        Note: For performance, the cache returns direct references to stored
-        KV caches. In practice, MLX arrays are immutable so this is safe.
-        """
-        original = [[1, 2, 3]]
-        cache_manager.store_cache([temp_image], "prompt", original)
-
-        cache, hit = cache_manager.fetch_cache([temp_image], "prompt")
-        assert hit is True
-        assert cache is not None
-        assert cache[0] == [1, 2, 3]
-
-        # Cache returns the same reference (for performance)
-        cache2, _ = cache_manager.fetch_cache([temp_image], "prompt")
-        assert cache2 is cache  # Same reference
-
     def test_repr(self, cache_manager):
         """Test string representation."""
         repr_str = repr(cache_manager)
