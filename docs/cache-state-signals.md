@@ -142,14 +142,45 @@ one atomically, then removes entry files it did not write (a larger earlier save
 The SSD tier keeps its files in `<--ssd-cache-dir>/<identity digest>/` (`identity.json` there says what the
 digest stands for), so servers, models and settings sharing one directory never index or promote each
 other's entries; the whole identity (all three parts) names the directory, because a spilled entry is not
-tracked per KV setting. `--ssd-cache-max-gb` applies to each such subdirectory. Of the layout an older build left directly in the directory (`index.db`, `data/<sha256>/`,
-`quarantine/<sha256>/`; it recorded no model) only what is positively that is removed: a SQLite `index.db` and
-64-hex directories holding a `manifest.json`; any other file in `data/` or `quarantine/` is left alone. A sibling
-identity directory (another model, revision, mlx/mlx-lm version or setting) whose `identity.json` has not been
-refreshed by a tier start for 30 days (`SSDCacheConfig.stale_namespace_days`) is deleted when a tier starts, so
-upgrades do not strand a cache each; until then it is left, because another server may be using it (a tier
-refreshes its own `identity.json` at every start). Delete directories you no longer need sooner by hand. no longer need. Each spilled entry is checked on promotion (manifest token count, `tokens.bin`, and each
+tracked per KV setting. `--ssd-cache-max-gb` applies to each such subdirectory. Of the layout an older build left
+directly in the directory (`index.db`, `data/<sha256>/`, `quarantine/<sha256>/`; it recorded no model) only what is
+positively that is removed: a SQLite `index.db` that holds that build's `entries` table (token_hash, tokens_blob,
+file_path; any other SQLite file of that name is left alone) and 64-hex directories holding a `manifest.json`; any
+other file in `data/` or `quarantine/` is left alone. A sibling identity directory (another model, revision,
+mlx/mlx-lm version or setting) that has not been used for 30 days (`SSDCacheConfig.stale_namespace_days`) is deleted
+when a tier starts, so upgrades do not strand a cache each; until then it is left, because another server may be
+using it. "Not used" means that nothing in the directory (`identity.json`, written at every tier start, `index.db`
+and its WAL, which every spill, hit and eviction write) is newer than the retention and that no running tier holds
+the directory: a tier keeps a shared advisory lock (`flock` on `.lock`) on its own directory until it closes, and a
+reclaim needs the exclusive lock, so a server that has run or idled for longer than the retention does not lose its
+cache to another server's start. The reclaim renames the directory to `<digest>.reclaim-<pid>-<time>` while it holds
+the lock and deletes that (a leftover one is deleted at the next start), so a server starting on that identity at the
+same moment gets a fresh directory. On a filesystem that refuses advisory locks (some network and FUSE mounts: a warning
+names it) a tier runs without the mark, and no directory in that base directory is reclaimed, since none can be shown
+to be idle: delete stale ones by hand (as you can any directory you no longer need sooner). Tiers of builds before the
+lock hold no mark, so a reclaim by this build judges a directory such a server uses by its last use only (the index and its
+WAL); and the reclaim's own leftovers (`*.reclaim-*`) are deleted at every start, whatever the retention. A relative
+`--ssd-cache-dir` is resolved against the working directory once, when the tier starts (symlinks are not resolved); an empty
+value is refused at start rather than meaning the working directory. Each spilled entry is checked
+on promotion (manifest token count, `tokens.bin`, and each
 layer's offset against the key) and a mismatching one is quarantined and counted as a miss.
+
+A hit in the SSD tier is promoted into RAM even when the memory cache is full: the least recently used entries are
+evicted (and spilled, as a store would) until the promoted entry fits the `--cache-memory-mb` budget, except entries
+promoted for other requests in the same scheduling pass; if the rest of the cache cannot make room the request is a
+miss (`[ssd_promote] ... budget denied`, counted in `promotion_failures`). An entry larger than the whole budget is
+never read: it is logged (`exceeds the whole cache budget`), counted in `promotions_rejected_oversized` and the
+request is a miss. The tier matches a request exactly, by a stored key that is a prefix of it, or (`lcp`) by an entry
+whose key is longer than the prompt or diverges from it after a shared head: a finished request spills its prompt
+*and* its reply, so the exact repeat of that prompt is only a prefix of the stored key. The request then gets the
+entry cut back to the shared tokens (at least the cache's `min_prefix_tokens`, 128 by default); the whole entry is promoted.
+Only entries made of plain KV layers qualify (the index records it at spill time); sliding-window, recurrent and
+container layers cannot be cut back and are matched only by an exact or prefix key, and entries spilled by an
+older build, which did not record it, are not used for `lcp`. When the `lcp` entry cannot be used (it exceeds the budget, or its
+layers turn out not to be cuttable) the `prefix` entry the lookup also found is tried; a request whose entry an earlier request of
+the same pass promoted is served from the resident entry (nothing is reserved or read twice). Spilled entries are write-once: an
+entry whose key is already on the tier is not written again when it is evicted from RAM (it is only marked recently used), so a
+workload cycling through more conversations than the cache holds reads entries back instead of rewriting them.
 
 `DELETE /v1/cache`, `DELETE /v1/cache/prefix` and cache-error recovery empty the SSD tier together with the
 RAM cache: spills still queued, a write in flight and a promotion in flight when the flush lands are dropped,

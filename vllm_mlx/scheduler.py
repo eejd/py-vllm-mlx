@@ -3074,12 +3074,35 @@ class Scheduler:
             self._ssd_tier = None
         logger.info("SSD cache tier closed")
 
+    @staticmethod
+    def _ssd_candidate_key(request, candidate: dict) -> tuple[int, ...]:
+        """The SSD entry's own key, NOT the prompt: the entry is the prompt's
+        prefix, or longer than the prompt (an ``lcp`` hit)."""
+        return tuple(
+            candidate.get(
+                "matched_key",
+                request.prompt_token_ids[
+                    : candidate.get("matched_tokens", len(request.prompt_token_ids))
+                ],
+            )
+        )
+
     def _try_promote_ssd_pending(self) -> None:
         """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.
 
         Called from _schedule_waiting() before requests are moved to running.
         Reads SSD entries synchronously (disk I/O stays out of fetch() per spec).
+
+        A cold-tier hit makes room for itself: the least recently used resident
+        entries are evicted (and spilled) until it fits, as ``store()`` does,
+        except those promoted for other requests in this pass. An entry larger
+        than the whole cache budget is rejected without being read. A request
+        whose entry an earlier request of the pass already promoted (or that is
+        resident for any other reason) is served from RAM. When an ``lcp``
+        candidate cannot be used, the ``prefix`` candidate the lookup also found
+        is tried.
         """
+        promoted: set[tuple[int, ...]] = set()
         for request in self.waiting:
             if getattr(request, "cache_hit_type", None) != "ssd_pending":
                 continue
@@ -3088,79 +3111,144 @@ class Scheduler:
             if candidate is None:
                 continue
 
-            memory_bytes = candidate["memory_bytes"]
-
-            # Check RAM budget availability
             if self.memory_aware_cache is None:
                 request.cache_hit_type = "miss"
                 continue
 
-            if not self.memory_aware_cache.try_reserve_memory(memory_bytes):
-                self._ssd_tier._stats.promotion_failures += 1
+            attempt = candidate
+            while attempt is not None:
+                if self._promote_ssd_candidate(request, attempt, promoted):
+                    break
+                attempt = attempt.get("fallback")
+            else:
+                request.cache_hit_type = "miss"
+
+    def _promote_ssd_candidate(
+        self, request, candidate: dict, protect: set[tuple[int, ...]]
+    ) -> bool:
+        """Promote one SSD candidate for ``request``; False leaves it a miss.
+
+        On success the entry's key is added to ``protect``.
+        """
+        cache = self.memory_aware_cache
+        matched_key = self._ssd_candidate_key(request, candidate)
+        memory_bytes = candidate["memory_bytes"]
+
+        resident = cache.fetch_resident(matched_key)
+        if resident is not None:
+            if not self._install_promoted_ssd_entry(
+                request, candidate, resident, store=False
+            ):
+                return False
+            protect.add(matched_key)
+            self._log_ssd_promotion(request, candidate, "the resident entry")
+            return True
+
+        if memory_bytes > cache.memory_limit_bytes:
+            with self._ssd_tier._lock:
+                self._ssd_tier._stats.promotions_rejected_oversized += 1
+            request.cache_hit_type = "miss"
+            logger.warning(
+                f"[ssd_promote] request={request.request_id[:12]} "
+                f"entry of {memory_bytes} bytes exceeds the whole cache "
+                f"budget ({cache.memory_limit_bytes} bytes); not promoted "
+                f"(raise --cache-memory-mb)"
+            )
+            return False
+
+        if not cache.try_reserve_memory(memory_bytes, protect=protect):
+            self._ssd_tier._stats.promotion_failures += 1
+            request.cache_hit_type = "miss"
+            logger.info(
+                f"[ssd_promote] request={request.request_id[:12]} "
+                f"budget denied ({memory_bytes} bytes): the rest of the "
+                f"cache is held for requests promoted in this pass"
+            )
+            return False
+
+        try:
+            cache_layers = self._ssd_tier._read_entry(
+                matched_key, candidate["file_path"]
+            )
+        except Exception:
+            cache.release_reserved_memory(memory_bytes)
+            self._ssd_tier._stats.promotion_failures += 1
+            request.cache_hit_type = "miss"
+            logger.exception(
+                f"[ssd_promote] request={request.request_id[:12]} disk read failed"
+            )
+            return False
+
+        # Release tentative budget (store() will account properly)
+        cache.release_reserved_memory(memory_bytes)
+
+        if cache_layers is None:
+            self._ssd_tier._stats.promotion_failures += 1
+            request.cache_hit_type = "miss"
+            return False
+
+        reconstructed = self._reconstruct_ssd_layers(cache_layers)
+        if reconstructed is None:
+            request.cache_hit_type = "miss"
+            return False
+        if not self._install_promoted_ssd_entry(
+            request, candidate, reconstructed, store=True
+        ):
+            return False
+        protect.add(matched_key)
+
+        self._ssd_tier._stats.ssd_hits += 1
+        self._ssd_tier._index.touch(matched_key)
+        self._log_ssd_promotion(request, candidate, "SSD")
+        return True
+
+    def _log_ssd_promotion(self, request, candidate: dict, source: str) -> None:
+        logger.info(
+            f"[ssd_promote] request={request.request_id[:12]} "
+            f"{candidate.get('match_type', 'exact')} promote: "
+            f"{request.cached_tokens}/{len(request.prompt_token_ids)} tokens "
+            f"from {source}, {len(request.remaining_tokens)} remaining"
+        )
+
+    def _install_promoted_ssd_entry(
+        self, request, candidate: dict, layers: list, *, store: bool
+    ) -> bool:
+        """Hand a request the KV of a promoted (or already resident) entry.
+
+        ``layers`` are live cache objects. With ``store`` the entry is filed in
+        RAM under its own key. When it is longer than what the request shares
+        with it (an ``lcp`` hit), the request gets a copy cut back to the
+        shared tokens (what the in-memory cache does for a longer or diverging
+        entry), and only a layout that can be cut back exactly qualifies.
+        Returns False, leaving the request a miss, otherwise.
+        """
+        matched_key = self._ssd_candidate_key(request, candidate)
+        served = candidate["matched_tokens"]
+
+        request_cache = layers
+        excess = len(matched_key) - served
+        if excess > 0:
+            if not all(_is_exactly_rewindable(layer) for layer in layers):
                 request.cache_hit_type = "miss"
                 logger.info(
                     f"[ssd_promote] request={request.request_id[:12]} "
-                    f"budget denied ({memory_bytes} bytes)"
+                    f"entry cannot be cut back to the shared prefix "
+                    f"(non-trimmable cache layers); not promoted"
                 )
-                continue
+                return False
+            request_cache = _trim_cache_offset(layers, excess)
 
-            # Use the SSD entry's actual token count for read and store,
-            # NOT the full prompt tokens. For prefix hits these differ.
-            matched_tokens = tuple(
-                candidate.get(
-                    "matched_key",
-                    request.prompt_token_ids[: candidate["matched_tokens"]],
-                )
-            )
-            matched_count = len(matched_tokens)
-
-            try:
-                cache_layers = self._ssd_tier._read_entry(
-                    matched_tokens, candidate["file_path"]
-                )
-            except Exception:
-                self.memory_aware_cache.release_reserved_memory(memory_bytes)
-                self._ssd_tier._stats.promotion_failures += 1
-                request.cache_hit_type = "miss"
-                logger.exception(
-                    f"[ssd_promote] request={request.request_id[:12]} "
-                    f"disk read failed"
-                )
-                continue
-
-            if cache_layers is None:
-                self.memory_aware_cache.release_reserved_memory(memory_bytes)
-                self._ssd_tier._stats.promotion_failures += 1
-                request.cache_hit_type = "miss"
-                continue
-
-            # Release tentative budget (store() will account properly)
-            self.memory_aware_cache.release_reserved_memory(memory_bytes)
-
-            # Reconstruct and store under the matched prefix tokens
-            reconstructed = self._reconstruct_ssd_layers(cache_layers)
-            if reconstructed is None:
-                request.cache_hit_type = "miss"
-                continue
-
+        if store:
             self.memory_aware_cache.store(
-                list(matched_tokens), reconstructed, evict_prefixes=False
+                list(matched_key), layers, evict_prefixes=False
             )
 
-            request.prompt_cache = reconstructed
-            request.prompt_cache_key = list(matched_tokens)
-            request.cached_tokens = matched_count
-            request.remaining_tokens = request.prompt_token_ids[matched_count:]
-            request.cache_hit_type = "ssd_hit"
-
-            self._ssd_tier._stats.ssd_hits += 1
-            self._ssd_tier._index.touch(matched_tokens)
-
-            logger.info(
-                f"[ssd_promote] request={request.request_id[:12]} "
-                f"{candidate['match_type']} promote: {matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
-                f"{len(request.remaining_tokens)} remaining"
-            )
+        request.prompt_cache = request_cache
+        request.prompt_cache_key = list(matched_key)
+        request.cached_tokens = served
+        request.remaining_tokens = request.prompt_token_ids[served:]
+        request.cache_hit_type = "ssd_hit"
+        return True
 
     async def promote_from_ssd(self, request) -> bool:
         """Promote a cold-tier cache entry for a request (async version).
@@ -3176,9 +3264,41 @@ class Scheduler:
         candidate = getattr(request, "_ssd_candidate", None)
         if candidate is None:
             return False
+        while candidate is not None:
+            if await self._promote_ssd_candidate_async(request, candidate):
+                return True
+            candidate = candidate.get("fallback")
+        request.cache_hit_type = "miss"
+        return False
+
+    async def _promote_ssd_candidate_async(self, request, candidate: dict) -> bool:
+        """One candidate of ``promote_from_ssd``; False leaves the request a miss."""
+        cache = self.memory_aware_cache
+        matched_key = self._ssd_candidate_key(request, candidate)
+
+        if cache is not None:
+            resident = cache.fetch_resident(matched_key)
+            if resident is not None:
+                if not self._install_promoted_ssd_entry(
+                    request, candidate, resident, store=False
+                ):
+                    return False
+                self._log_ssd_promotion(request, candidate, "the resident entry")
+                return True
+
+            if candidate["memory_bytes"] > cache.memory_limit_bytes:
+                with self._ssd_tier._lock:
+                    self._ssd_tier._stats.promotions_rejected_oversized += 1
+                request.cache_hit_type = "miss"
+                logger.warning(
+                    f"[ssd_promote] request={request.request_id[:12]} "
+                    f"entry of {candidate['memory_bytes']} bytes exceeds the whole "
+                    f"cache budget ({cache.memory_limit_bytes} bytes); not promoted"
+                )
+                return False
 
         def reserve_budget(nbytes: int) -> bool:
-            """Tentatively reserve RAM budget for promotion."""
+            """Reserve RAM budget for promotion, evicting LRU entries for it."""
             if self.memory_aware_cache is None:
                 return False
             return self.memory_aware_cache.try_reserve_memory(nbytes)
@@ -3188,19 +3308,8 @@ class Scheduler:
             if self.memory_aware_cache is not None:
                 self.memory_aware_cache.release_reserved_memory(nbytes)
 
-        # Use matched token count, not full prompt, for prefix hits
-        matched_tokens = tuple(
-            candidate.get(
-                "matched_key",
-                request.prompt_token_ids[
-                    : candidate.get("matched_tokens", len(request.prompt_token_ids))
-                ],
-            )
-        )
-        matched_count = len(matched_tokens)
-
         cache_layers = await self._ssd_tier.async_promote(
-            matched_tokens, reserve_budget, release_budget
+            matched_key, reserve_budget, release_budget
         )
 
         if cache_layers is None:
@@ -3210,29 +3319,16 @@ class Scheduler:
         # Release tentative budget — store() will account properly
         release_budget(candidate["memory_bytes"])
 
-        # Reconstruct cache objects from deserialized layer dicts
         reconstructed = self._reconstruct_ssd_layers(cache_layers)
         if reconstructed is None:
             request.cache_hit_type = "miss"
             return False
+        if not self._install_promoted_ssd_entry(
+            request, candidate, reconstructed, store=True
+        ):
+            return False
 
-        # Store in RAM cache under the matched prefix tokens
-        self.memory_aware_cache.store(
-            list(matched_tokens), reconstructed, evict_prefixes=False
-        )
-
-        request.prompt_cache = reconstructed
-        request.prompt_cache_key = list(matched_tokens)
-        request.cached_tokens = matched_count
-        request.remaining_tokens = request.prompt_token_ids[matched_count:]
-        request.cache_hit_type = "ssd_hit"
-
-        logger.info(
-            f"[ssd_promote] request={request.request_id[:12]} "
-            f"{candidate.get('match_type', 'exact')} promote: "
-            f"{matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
-            f"{len(request.remaining_tokens)} remaining"
-        )
+        self._log_ssd_promotion(request, candidate, "SSD")
         return True
 
     def _reconstruct_ssd_layers(self, layer_dicts: list[dict]) -> list | None:

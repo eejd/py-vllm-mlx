@@ -36,13 +36,24 @@ import numpy as np
 from .cache_identity import CacheIdentity
 from .mlx_cache_compat import recurrent_arrays
 
+try:  # advisory locks mark a namespace as in use; absent on Windows
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
 logger = logging.getLogger(__name__)
 
 _BYTES_PER_MB = 1024 * 1024
 _BYTES_PER_GB = 1024 * 1024 * 1024
 _PREFIX_FILTER_TOKENS = 16
+_TOKEN_BYTES = _array.array("i").itemsize
 _LEGACY_ENTRY_RE = re.compile(r"^[0-9a-f]{64}(\.tmp)?$")
 _DIGEST_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
+# A namespace being deleted is renamed to this first (see _reclaim_stale_namespaces).
+_TOMBSTONE_RE = re.compile(r"^[0-9a-f]{32}\.reclaim-[0-9]+-[0-9]+$")
+# A legacy index.db with a WAL is probed as a copy; a foreign database bigger than
+# this is not worth copying and is left alone (treated as not ours).
+_LEGACY_PROBE_COPY_LIMIT = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -64,8 +75,11 @@ class SSDCacheConfig:
         spill_queue_size: Max pending spill operations before dropping.
         retention_seconds: Optional max age for cache entries (None = no expiry).
         stale_namespace_days: Sibling identity directories (other models,
-            revisions, library versions) whose ``identity.json`` is older than
-            this are deleted when a tier starts (None = never).
+            revisions, library versions) that nothing has used for this long
+            (``identity.json``, ``index.db`` and its WAL all older) and that no
+            running tier holds (an advisory lock) are deleted when a tier
+            starts (None = never). On a filesystem without advisory locks no
+            directory can be shown to be idle, so none is reclaimed.
     """
 
     cache_dir: str | None = None
@@ -105,7 +119,9 @@ class SSDCacheStats:
         ssd_misses: Number of SSD cache lookup misses.
         reload_latency_sum: Sum of reload latencies in seconds.
         reload_bytes: Total bytes read from SSD.
-        promotion_failures: Number of failed promotions (RAM budget exhausted).
+        promotion_failures: Number of failed promotions (no RAM budget, read error).
+        promotions_rejected_oversized: Promotions refused because the entry is
+            larger than the whole in-memory cache budget (it could never fit).
     """
 
     spill_count: int = 0
@@ -115,6 +131,7 @@ class SSDCacheStats:
     reload_latency_sum: float = 0.0
     reload_bytes: int = 0
     promotion_failures: int = 0
+    promotions_rejected_oversized: int = 0
 
     def to_dict(self) -> dict:
         total_lookups = self.ssd_hits + self.ssd_misses
@@ -134,6 +151,7 @@ class SSDCacheStats:
             "avg_reload_latency_ms": round(avg_latency_ms, 2),
             "reload_bytes": self.reload_bytes,
             "promotion_failures": self.promotion_failures,
+            "promotions_rejected_oversized": self.promotions_rejected_oversized,
         }
 
 
@@ -214,6 +232,10 @@ class SSDIndex:
             """
         self._conn.executescript(schema_sql)
         self._ensure_column("entries", "prefix_hash", "TEXT")
+        # 1 = every layer of the entry is a plain KV layer, so the entry can be
+        # cut back to a shorter shared prefix; NULL (entries written by an
+        # older build) and 0 = it cannot, or is not known to.
+        self._ensure_column("entries", "trimmable", "INTEGER")
         self._conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_entries_accessed
                 ON entries(accessed_at);
@@ -272,6 +294,7 @@ class SSDIndex:
         file_path: str,
         memory_bytes: int,
         num_tokens: int,
+        trimmable: bool = False,
     ) -> None:
         """Insert or replace a cache entry in the index."""
         now = time.time()
@@ -283,8 +306,8 @@ class SSDIndex:
                 """
                 INSERT OR REPLACE INTO entries
                     (token_hash, tokens_blob, prefix_hash, num_tokens, file_path,
-                     memory_bytes, created_at, accessed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     memory_bytes, created_at, accessed_at, trimmable)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token_hash,
@@ -295,6 +318,7 @@ class SSDIndex:
                     memory_bytes,
                     now,
                     now,
+                    1 if trimmable else 0,
                 ),
             )
             self._conn.commit()
@@ -359,6 +383,65 @@ class SSDIndex:
                     }
                 )
         return results
+
+    def lookup_lcp(self, query_tokens: tuple[int, ...], min_tokens: int) -> dict | None:
+        """Find the entry sharing the longest token prefix with the query.
+
+        Serves what ``lookup_prefix`` cannot: a stored key that is *longer* than
+        the query (an exact repeat of a prompt whose entry also holds the reply
+        it generated) or that diverges from it after a shared head. Only
+        entries written as trimmable (plain KV layers) qualify, since the
+        caller cuts the entry back to the shared prefix.
+
+        The shared prefix must be at least ``min_tokens`` long (and at least
+        ``_PREFIX_FILTER_TOKENS``, the head the index hashes). Returns the
+        entry's metadata plus ``lcp`` (the shared length) and ``tokens`` (its
+        full key); the longest shared prefix wins, the shortest entry on a tie.
+        """
+        floor = max(int(min_tokens), _PREFIX_FILTER_TOKENS)
+        if len(query_tokens) < floor:
+            return None
+        query_blob = _tokens_to_blob(query_tokens)
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+                "FROM entries WHERE trimmable = 1 AND num_tokens > ? "
+                "AND prefix_hash = ? AND substr(tokens_blob, 1, ?) = ?",
+                (
+                    floor,
+                    _prefix_hash(query_tokens),
+                    floor * _TOKEN_BYTES,
+                    query_blob[: floor * _TOKEN_BYTES],
+                ),
+            )
+            rows = cur.fetchall()
+
+        query = np.frombuffer(query_blob, dtype=np.intc)
+        best: dict | None = None
+        for row in rows:
+            stored = np.frombuffer(row["tokens_blob"], dtype=np.intc)
+            n = min(len(stored), len(query))
+            differs = np.flatnonzero(stored[:n] != query[:n])
+            lcp = int(differs[0]) if len(differs) else n
+            # A stored key that is a prefix of the query needs no trimming and
+            # belongs to lookup_prefix; one that stops short of the floor is
+            # too little to reuse.
+            if lcp < floor or lcp >= row["num_tokens"]:
+                continue
+            if (
+                best is None
+                or lcp > best["lcp"]
+                or (lcp == best["lcp"] and row["num_tokens"] < best["num_tokens"])
+            ):
+                best = {
+                    "token_hash": row["token_hash"],
+                    "file_path": row["file_path"],
+                    "memory_bytes": row["memory_bytes"],
+                    "num_tokens": row["num_tokens"],
+                    "lcp": lcp,
+                    "tokens": _blob_to_tokens(row["tokens_blob"]),
+                }
+        return best
 
     def delete_entry(self, tokens_key: tuple[int, ...]) -> None:
         """Delete an entry by token sequence."""
@@ -902,16 +985,19 @@ class SSDCacheTier:
         self._config = config
         self._closed = True
         self._writer_thread: threading.Thread | None = None
+        self._namespace_lock_fd: int | None = None
 
-        if config.cache_dir is None:
-            raise ValueError("SSDCacheConfig.cache_dir must be set")
+        if not config.cache_dir:  # None, or "": abspath("") would mean the cwd
+            raise ValueError("SSDCacheConfig.cache_dir must be a directory path")
         if config.identity is None:
             raise ValueError(
                 "SSDCacheConfig.identity must be set: entries are only valid for the "
                 "model and configuration that computed them"
             )
 
-        self._base_dir = config.cache_dir
+        # Absolute, once: the directory is used for file URIs and lock files, and the
+        # process's working directory may change after start.
+        self._base_dir = os.path.abspath(config.cache_dir)
         self._identity = config.identity
         self._cache_dir = os.path.join(self._base_dir, config.identity.digest)
         self._data_dir = os.path.join(self._cache_dir, "data")
@@ -919,12 +1005,12 @@ class SSDCacheTier:
         # Create directory structure
         os.makedirs(self._base_dir, mode=config.dir_permissions, exist_ok=True)
         self._discard_untagged_layout()
-        os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
-        os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
-        self._write_identity_file()
-        self._reclaim_stale_namespaces()
+        self._claim_namespace()
 
         try:
+            self._write_identity_file()
+            self._reclaim_stale_namespaces()
+
             # Open SQLite index
             self._index = SSDIndex(self._cache_dir)
             if getattr(self._index, "migrated_from", None) is not None:
@@ -960,7 +1046,130 @@ class SSDCacheTier:
                     logger.exception(
                         "ssd_cache: failed to close index during init cleanup"
                     )
+            self._release_namespace()
             raise
+
+    _NAMESPACE_LOCK = ".lock"
+
+    def _claim_namespace(self) -> None:
+        """Create this tier's directory and mark it as in use by this process.
+
+        The mark is a shared advisory lock (``flock``) on ``<namespace>/.lock``,
+        held until close() (or the process's death, which the kernel handles).
+        Reclaiming a stale namespace needs the exclusive lock, so a directory
+        a running server holds is never reclaimed however old its files look
+        (a server can sit idle, or serve only from RAM, for longer than the
+        retention). A reclaim moves the directory away (to a name no tier
+        uses) while it holds the lock: a claim that raced it finds the path
+        gone or a different ``.lock`` and starts over on a fresh directory.
+
+        On a filesystem that cannot lock (network or FUSE mounts: ``ENOLCK``,
+        ``ENOTSUP``) the tier runs without the mark, as builds before it did;
+        nothing can then be proved idle, so such a directory is not reclaimed.
+        """
+        config = self._config
+        for _ in range(5):
+            os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
+            os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
+            if fcntl is None:
+                return
+            lock_path = os.path.join(self._cache_dir, self._NAMESPACE_LOCK)
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, config.file_permissions)
+            except FileNotFoundError:
+                continue  # a reclaim moved the directory away under us
+            except OSError:
+                logger.warning(
+                    "[ssd_cache] cannot create %s; running without the in-use mark",
+                    lock_path,
+                    exc_info=True,
+                )
+                return
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                if os.fstat(fd).st_ino == os.stat(lock_path).st_ino:
+                    self._namespace_lock_fd = fd
+                    return
+            except FileNotFoundError:
+                pass  # moved away by the reclaim that held the lock
+            except OSError as exc:
+                os.close(fd)
+                logger.warning(
+                    "[ssd_cache] advisory locks are unavailable on %s (%s); running "
+                    "without the in-use mark, and stale namespaces cannot be "
+                    "reclaimed from this directory",
+                    self._base_dir,
+                    exc,
+                )
+                return
+            except BaseException:
+                os.close(fd)
+                raise
+            os.close(fd)
+        raise RuntimeError(f"could not claim the SSD cache directory {self._cache_dir}")
+
+    def _release_namespace(self) -> None:
+        fd, self._namespace_lock_fd = self._namespace_lock_fd, None
+        if fd is not None:
+            os.close(fd)  # closing drops the flock
+
+    @staticmethod
+    def _is_legacy_index(path: str) -> bool:
+        """Whether ``path`` is the index of the builds that kept it in the base dir.
+
+        ``--ssd-cache-dir`` is user-supplied, and any SQLite file named
+        ``index.db`` starts with the same header: only a database holding the
+        ``entries`` table of those builds (token_hash, tokens_blob, file_path)
+        is ours to delete. The probe must not change what it inspects: SQLite
+        creates ``-wal`` / ``-shm`` files next to a WAL-mode database it opens,
+        even read-only. A database with no WAL is opened ``immutable``; one that
+        has a WAL (a crash left it: the table may live only there) is probed as
+        a copy in a temporary directory.
+        """
+        import pathlib
+        import shutil
+        import sqlite3
+        import tempfile
+
+        path = os.path.abspath(path)  # a file URI cannot name a relative path
+        wal = path + "-wal"
+        try:
+            with open(path, "rb") as f:
+                if f.read(16) != b"SQLite format 3\x00":
+                    return False
+        except OSError:  # absent (the usual case), unreadable or a directory
+            return False
+        try:
+            wal_size = os.path.getsize(wal)
+        except FileNotFoundError:
+            wal_size = 0
+        except OSError:
+            return False
+
+        def has_legacy_table(db_path: str, query: str) -> bool:
+            try:
+                conn = sqlite3.connect(pathlib.Path(db_path).as_uri() + query, uri=True)
+            except (sqlite3.Error, ValueError):
+                return False
+            try:
+                columns = {r[1] for r in conn.execute("PRAGMA table_info(entries)")}
+            except sqlite3.Error:
+                return False
+            finally:
+                conn.close()
+            return {"token_hash", "tokens_blob", "file_path"} <= columns
+
+        if wal_size == 0:
+            return has_legacy_table(path, "?mode=ro&immutable=1")
+        try:
+            if os.path.getsize(path) + wal_size > _LEGACY_PROBE_COPY_LIMIT:
+                return False
+            with tempfile.TemporaryDirectory(prefix="ssd-probe-") as tmp:
+                shutil.copyfile(path, os.path.join(tmp, "index.db"))
+                shutil.copyfile(wal, os.path.join(tmp, "index.db-wal"))
+                return has_legacy_table(os.path.join(tmp, "index.db"), "?mode=ro")
+        except OSError:
+            return False
 
     def _discard_untagged_layout(self) -> None:
         """Remove entries a build that keyed on tokens alone left in the base dir.
@@ -970,7 +1179,7 @@ class SSDCacheTier:
         of it can be attributed to the current identity. ``--ssd-cache-dir`` is
         user-supplied and ``data`` / ``quarantine`` are generic names, so only
         what is positively one of those entries goes: a SQLite ``index.db``
-        (with its WAL files), and ``<64 hex>`` (or ``.tmp``) directories that
+        holding their ``entries`` table (with its WAL files), and ``<64 hex>`` (or ``.tmp``) directories that
         hold a ``manifest.json``. Anything else, including the ``data`` and
         ``quarantine`` directories themselves while they hold other files, is
         left alone.
@@ -979,12 +1188,7 @@ class SSDCacheTier:
 
         removed: list[str] = []
         index_db = os.path.join(self._base_dir, "index.db")
-        try:
-            with open(index_db, "rb") as f:
-                is_index = f.read(16) == b"SQLite format 3\x00"
-        except OSError:
-            is_index = False
-        if is_index:
+        if self._is_legacy_index(index_db):
             for suffix in ("", "-wal", "-shm"):
                 path = index_db + suffix
                 try:
@@ -1027,24 +1231,58 @@ class SSDCacheTier:
                 self._base_dir,
             )
 
+    @staticmethod
+    def _namespace_last_used(path: str, use_dir: bool = True) -> float | None:
+        """When a namespace directory was last used (None: cannot be told).
+
+        The newest of ``identity.json`` (written at each tier start),
+        ``index.db`` and its WAL (written by every spill, hit and eviction); a
+        directory with none of them (an interrupted start) is as old as the
+        directory itself.
+        """
+        newest: float | None = None
+        for name in ("identity.json", "index.db", "index.db-wal"):
+            try:
+                mtime = os.stat(os.path.join(path, name)).st_mtime
+            except OSError:
+                continue
+            newest = mtime if newest is None else max(newest, mtime)
+        if newest is None and use_dir:
+            try:
+                newest = os.stat(path).st_mtime
+            except OSError:
+                return None
+        return newest
+
     def _reclaim_stale_namespaces(self) -> None:
         """Delete sibling identity directories nobody has used for a while.
 
         Every mlx / mlx-lm upgrade, model revision or config change names a new
         directory, and the size budget is per directory, so without this each
         of them strands a whole cache. A directory goes only when it is named
-        like an identity digest, has an ``identity.json`` (written, and so
-        touched, each time a tier starts on it) older than
-        ``stale_namespace_days``, and is not this tier's own.
+        like an identity digest, nothing in it (identity marker, index, WAL) has
+        been written for ``stale_namespace_days``, no running tier holds it
+        (``_claim_namespace``) and it is not this tier's own.
+
+        Under the exclusive lock the directory is first renamed to a tombstone
+        (``<digest>.reclaim-<pid>-<ns>``, which no tier uses), then the lock is
+        dropped and the tombstone deleted: deleting in place would remove the
+        ``.lock`` file first, and a tier starting meanwhile would create a new
+        one, lock it and settle into a directory being deleted. Tombstones an
+        interrupted reclaim left are deleted on the next start.
         """
         import shutil
         import time as _time
 
+        names = os.listdir(self._base_dir)
+        for name in names:  # whatever the retention: nothing uses a tombstone
+            if _TOMBSTONE_RE.match(name):
+                shutil.rmtree(os.path.join(self._base_dir, name), ignore_errors=True)
         days = self._config.stale_namespace_days
         if days is None:
             return
         cutoff = _time.time() - days * 86400
-        for name in os.listdir(self._base_dir):
+        for name in names:
             path = os.path.join(self._base_dir, name)
             if (
                 name == self._identity.digest
@@ -1053,19 +1291,77 @@ class SSDCacheTier:
                 or not os.path.isdir(path)
             ):
                 continue
-            marker = os.path.join(path, "identity.json")
+            last_used = self._namespace_last_used(path)
+            if last_used is None or last_used >= cutoff:
+                continue
+            tombstone = self._tombstone_if_idle(path, name, cutoff, last_used)
+            if tombstone is None:
+                continue
+            # Another server's start sweeps tombstones too: entries vanishing under
+            # this delete are not a failure; only a tree that is still there is.
+            shutil.rmtree(tombstone, ignore_errors=True)
+            if os.path.exists(tombstone):
+                logger.warning(
+                    "[ssd_cache] could not delete reclaimed namespace %s "
+                    "(it is swept at the next start)",
+                    tombstone,
+                )
+                continue
+            logger.info("[ssd_cache] reclaimed %s: not used for %s days", name, days)
+
+    def _tombstone_if_idle(
+        self, path: str, name: str, cutoff: float, last_used: float
+    ) -> str | None:
+        """Rename ``path`` to a tombstone if no tier holds it and it is still stale.
+
+        Returns the tombstone's path, or None (nothing changed) when a tier holds
+        the directory, locks are unavailable, or it was used again meanwhile.
+        """
+        if fcntl is None:
+            return None
+        try:
+            lock_fd = os.open(
+                os.path.join(path, self._NAMESPACE_LOCK),
+                os.O_CREAT | os.O_RDWR,
+                self._config.file_permissions,
+            )
+        except OSError:
+            return None  # gone already, or not ours to open
+        try:
             try:
-                if os.stat(marker).st_mtime >= cutoff:
-                    continue
-                shutil.rmtree(path)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                logger.debug(
+                    "[ssd_cache] %s is held by a running tier; not reclaimed", name
+                )
+                return None
+            except OSError as exc:
+                logger.debug(
+                    "[ssd_cache] cannot lock %s (%s); not reclaimed", name, exc
+                )
+                return None
+            # A tier may have started, written and closed between the check and
+            # the lock: judge again now that nothing can change it. (Taking the
+            # lock created ``.lock``, which touches the directory itself: a
+            # directory with none of the marker files keeps its earlier age.)
+            fresh = self._namespace_last_used(path, use_dir=False)
+            if (fresh if fresh is not None else last_used) >= cutoff:
+                return None
+            tombstone = os.path.join(
+                self._base_dir, f"{name}.reclaim-{os.getpid()}-{time.time_ns()}"
+            )
+            try:
+                os.rename(path, tombstone)
             except OSError:
                 logger.warning(
                     "[ssd_cache] could not reclaim stale namespace %s",
                     path,
                     exc_info=True,
                 )
-                continue
-            logger.info("[ssd_cache] reclaimed %s: not used for %s days", name, days)
+                return None
+            return tombstone
+        finally:
+            os.close(lock_fd)  # a claimer waiting on the old inode starts over
 
     def _write_identity_file(self) -> None:
         """Record what this directory's entries are valid for (for operators)."""
@@ -1170,7 +1466,15 @@ class SSDCacheTier:
         owns the layer's Stream(gpu, N)) — the snapshot below materializes
         MLX → numpy here so the writer thread never has to.
 
-        Returns True if enqueued, False if queue is full (entry dropped).
+        Entries are write-once: the KV of a token key is fixed by the cache
+        identity (the tier's directory), so a key that is already indexed is
+        not written again (it is marked recently used). Without this an entry
+        promoted into RAM and evicted again, by a workload cycling through
+        more conversations than the memory cache holds, would be re-snapshotted
+        and rewritten in full on every round trip.
+
+        Returns True if the entry is on the tier or enqueued, False if it was
+        dropped (queue full, tier closing, snapshot failure).
         """
         # The epoch the entry was handed over in: a flush (clear()) that lands
         # while it is being snapshotted or queued must drop it.
@@ -1178,6 +1482,10 @@ class SSDCacheTier:
         with self._lifecycle_lock:
             if not self._accepting_spills:
                 return False
+            # Under the lock: close() closes the index under it.
+            if self._index.lookup_exact(tokens) is not None:
+                self._index.touch(tokens)
+                return True
 
         # Dequantize on the CALLER's thread, which owns the MLX GPU stream.
         # mx.dequantize is a GPU compute op; running it on the writer thread
@@ -1355,6 +1663,10 @@ class SSDCacheTier:
             file_path=relative_path,
             memory_bytes=memory_bytes,
             num_tokens=len(tokens_key),
+            trimmable=all(
+                isinstance(serializer, KVCacheSerializer) and "max_size" not in snapshot
+                for serializer, snapshot in layer_snapshots
+            ),
         )
 
         # Update stats
@@ -1393,6 +1705,15 @@ class SSDCacheTier:
         if results:
             return results[0]  # Already sorted by num_tokens DESC
         return None
+
+    def lookup_ssd_lcp(self, tokens: tuple[int, ...], min_tokens: int) -> dict | None:
+        """Find the entry sharing the longest prefix with ``tokens``.
+
+        For a stored key longer than the query or diverging from it (see
+        ``SSDIndex.lookup_lcp``). The entry's data covers its whole key; the
+        caller reads it and cuts it back to the shared ``lcp`` tokens.
+        """
+        return self._index.lookup_lcp(tokens, min_tokens)
 
     def remove(self, tokens: tuple[int, ...]) -> bool:
         """Remove an entry from both the SSD index and its data directory."""
@@ -1781,6 +2102,7 @@ class SSDCacheTier:
 
             self._index.close()
             self._closed = True
+            self._release_namespace()
         logger.info("[ssd_cache] SSDCacheTier closed")
 
     async def aclose(self) -> None:
