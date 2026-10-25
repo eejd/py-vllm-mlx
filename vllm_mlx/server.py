@@ -953,15 +953,29 @@ def _attach_parser_control_tokens(kwargs: dict, request, *, stream: bool) -> Non
     (``<|channel|>``, ``<|message|>``, ``<|start|>``, ``<|end|>``, ``<|call|>``) and
     flattens the channels, so the harmony reasoning and tool parsers, which read the
     channels out of the text, find nothing: the analysis text and the call arguments
-    end up in ``content`` and no call is returned (py-quantbench#244). vLLM does the
-    same for the same reason (a tool parser's ``adjust_request`` turns
-    ``skip_special_tokens`` off). The response is still cleaned for the client, with
-    the request's own flag, after the parsers have run.
+    end up in ``content`` and no call is returned (py-quantbench#244). The response
+    is still cleaned for the client, with the request's own flag, after the parsers
+    have run.
 
-    Streaming reads the raw ``new_text`` deltas, which the engines do not clean, so
-    only a non-streaming request needs it. A request that carries tools needs it for
-    a tool parser that reads the raw output; a reasoning parser that reads control
-    tokens needs it on every request.
+    vLLM's text-based tool parsers do the same in ``adjust_request`` (hermes, jamba,
+    kimi_k2, ...: ``skip_special_tokens = False`` when the request has tools and
+    ``tool_choice != "none"``, streaming included); vLLM's own Harmony parser reads
+    token ids instead and does not use the flag. Here:
+
+    * Streaming reads the raw ``new_text`` deltas, which the engines do not clean,
+      so only a non-streaming request needs it.
+    * A request that carries tools needs it for a tool parser that reads the raw
+      output; a reasoning parser that reads control tokens needs it on every
+      request. ``tool_choice="none"`` is not special-cased: the final cleaning
+      still removes the control tokens, and the reasoning parsers read them anyway.
+    * The flag also lifts the engine's hiding of BOS/PAD/UNK/EOS markers a
+      generation runs past (``ignore_eos``): those are rendered into the text the
+      parsers read, and the final cleaning does not remove all of them (gpt-oss's
+      ``<|startoftext|>``). The engines have no separate switch for the channel
+      cleaning (py-vllm-mlx#129).
+    * A client's explicit ``skip_special_tokens=true`` is the request default and
+      cannot be told apart from it; it is overridden for the engine and honoured in
+      the response.
     """
     if stream or kwargs.get("skip_special_tokens") is False:
         return

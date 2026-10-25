@@ -303,30 +303,92 @@ def test_a_tool_parser_alone_leaves_a_request_without_tools_cleaned_by_the_engin
     assert engine._engine.sampling_params.skip_special_tokens is True
 
 
-def test_streaming_is_left_alone(monkeypatch):
+@pytest.mark.parametrize("path", PATHS)
+def test_streaming_is_left_alone(monkeypatch, path):
     """A stream reads the raw deltas; it must not start asking for rendered boundary tokens."""
+    from vllm_mlx.engine.base import GenerationOutput
+
     _use_parsers(monkeypatch, tool="harmony", reasoning="gpt_oss")
     engine = _engine(CALL)
     seen = {}
 
     async def stream_chat(**kwargs):
         seen.update(kwargs)
-        return
-        yield  # pragma: no cover
+        yield GenerationOutput(
+            text=CALL, new_text=CALL, finished=True, finish_reason="stop"
+        )
 
     engine.stream_chat = stream_chat
     monkeypatch.setattr(srv, "_engine", engine)
-    TestClient(srv.app).post(
+    body = {
+        "/v1/chat/completions": {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [WEATHER_TOOL],
+        },
+        "/v1/responses": {
+            "model": "test-model",
+            "input": "go",
+            "tools": [
+                {"type": "function", "name": "get_weather"}
+                | {
+                    k: v
+                    for k, v in WEATHER_TOOL["function"].items()
+                    if k != "name"
+                }
+            ],
+        },
+        "/v1/messages": {
+            "model": "test-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "input_schema": WEATHER_TOOL["function"]["parameters"],
+                }
+            ],
+        },
+    }[path]
+    response = TestClient(srv.app).post(path, json=body | {"stream": True})
+
+    assert response.status_code == 200, response.text
+    assert seen and "skip_special_tokens" not in seen
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+@pytest.mark.parametrize("tool,reasoning", PARSERS)
+def test_tool_choice_none_returns_no_call_and_no_control_token(
+    monkeypatch, path, tool, reasoning
+):
+    """tools + ``tool_choice: none``: the model was not offered the tools, a call is not honoured, and
+    the raw channel text the parsers now read never reaches the client."""
+    _use_parsers(monkeypatch, tool=tool, reasoning=reasoning)
+
+    _, payload = _post(monkeypatch, path, CALL, WEATHER_TOOL, tool_choice="none")
+
+    r, content, calls = _seen(path, payload)
+    assert calls == []
+    assert re.findall(r"<\|[a-z]+\|>", r + content) == []
+
+
+def test_a_response_format_failure_does_not_echo_the_channel_text(monkeypatch):
+    """The ``response_format`` fallback can now be handed the raw channel text (a harmony output with no
+    final channel); the 422 it ends in must not carry it."""
+    _use_parsers(monkeypatch, tool=None, reasoning="gpt_oss")
+    monkeypatch.setattr(srv, "_engine", _engine(CALL))
+
+    response = TestClient(srv.app).post(
         "/v1/chat/completions",
         json={
             "model": "test-model",
             "messages": [{"role": "user", "content": "go"}],
-            "tools": [WEATHER_TOOL],
-            "stream": True,
+            "response_format": {"type": "json_object"},
         },
     )
 
-    assert "skip_special_tokens" not in seen
+    assert response.status_code == 422, response.text
+    assert "<|" not in response.text and "get_weather" not in response.text
 
 
 def test_a_client_that_asks_for_skip_special_tokens_false_still_gets_the_call(
