@@ -42,7 +42,7 @@ CALL_ARGS = {"city": "Bogota", "unit": "celsius"}
 # tool_arg list-01 (tool: echo_args)
 ARG_CALL = (
     "<|channel|>analysis<|message|>We need to call the function echo_args with text "
-    "'list' and items [\"age\", \"computer\", \"issue\"]. No other arguments.<|end|>"
+    '\'list\' and items ["age", "computer", "issue"]. No other arguments.<|end|>'
     "<|start|>assistant<|channel|>commentary to=functions.echo_args <|constrain|>json"
     '<|message|>{"text":"list","items":["age","computer","issue"]}'
 )
