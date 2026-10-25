@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""gpt-oss through the REAL engine text path and the non-streaming endpoints (py-quantbench#244).
+"""gpt-oss through the REAL engine text path and the non-streaming endpoints
+(py-quantbench#244).
 
-``GenerationOutput.text`` of the batched and simple engines is ``clean_output_text(raw)``:
-it deletes the Harmony channel tokens and flattens the channels. The harmony reasoning and
-tool parsers read those tokens, so a non-streaming request with the default
-``skip_special_tokens`` got the analysis text and the call arguments glued into
-``content`` and no call (a streamed request read the raw deltas and worked). The other
-harmony tests hand the parsers raw text through a fake engine, so none of them saw it.
+``GenerationOutput.text`` of the batched and simple engines is
+``clean_output_text(raw)``: it deletes the Harmony channel tokens and flattens the
+channels. The harmony reasoning and tool parsers read those tokens, so a
+non-streaming request with the default ``skip_special_tokens`` got the analysis text
+and the call arguments glued into ``content`` and no call (a streamed request read
+the raw deltas and worked). The other harmony tests hand the parsers raw text
+through a fake engine, so none of them saw it.
 
-Here the engine is a real ``BatchedEngine`` (its ``generate``/``chat`` cleaning is the code
-under test) over a stand-in for its scheduler that returns *captured* gpt-oss-20b output:
-the decoded text of ``mlx-community/gpt-oss-20b-MXFP4-Q8`` generations from py-quantbench's
-2026-10-18 qualification run (``docs/evidence/model-qualification-2026-10-18/
-gpt-oss-20b-mxfp4-q8/result.json``, ``raw`` of the greedy cases). A generation ends on a
-stop token (``<|return|>``/``<|call|>``) that is not decoded, so the captures end without one.
-"""
+Here the engine is a real ``BatchedEngine`` (its ``generate``/``chat`` cleaning is
+the code under test) over a stand-in for its scheduler that returns *captured*
+gpt-oss-20b output: the decoded text of ``mlx-community/gpt-oss-20b-MXFP4-Q8``
+generations from py-quantbench's 2026-10-18 qualification run
+(``docs/evidence/model-qualification-2026-10-18/gpt-oss-20b-mxfp4-q8/
+result.json``, ``raw`` of the greedy cases). A generation ends on a stop token
+(``<|return|>``/``<|call|>``) that is not decoded, so the captures end without one."""
 
 import json
 import re
@@ -162,10 +164,7 @@ def _post(monkeypatch, path, raw, tool_def=None, **extra):
     elif path == "/v1/responses":
         body = {"model": "test-model", "input": "go"}
         if tool_def:
-            body["tools"] = [
-                {"type": "function", "name": tool_def["function"]["name"]}
-                | {k: v for k, v in tool_def["function"].items() if k != "name"}
-            ]
+            body["tools"] = [{"type": "function", **tool_def["function"]}]
     else:
         body = {
             "model": "test-model",
@@ -292,7 +291,8 @@ def test_the_tool_parser_alone_returns_the_call(monkeypatch):
 def test_a_tool_parser_alone_leaves_a_request_without_tools_cleaned_by_the_engine(
     monkeypatch,
 ):
-    """With no tools nothing reads the channels: the engine keeps its final-channel fallback."""
+    """With no tools nothing reads the channels: the engine keeps its final-channel
+    fallback."""
     _use_parsers(monkeypatch, tool="harmony", reasoning=None)
 
     engine, payload = _post(monkeypatch, "/v1/chat/completions", ANSWER)
@@ -305,7 +305,8 @@ def test_a_tool_parser_alone_leaves_a_request_without_tools_cleaned_by_the_engin
 
 @pytest.mark.parametrize("path", PATHS)
 def test_streaming_is_left_alone(monkeypatch, path):
-    """A stream reads the raw deltas; it must not start asking for rendered boundary tokens."""
+    """A stream reads the raw deltas; it must not start asking for rendered boundary
+    tokens."""
     from vllm_mlx.engine.base import GenerationOutput
 
     _use_parsers(monkeypatch, tool="harmony", reasoning="gpt_oss")
@@ -329,14 +330,7 @@ def test_streaming_is_left_alone(monkeypatch, path):
         "/v1/responses": {
             "model": "test-model",
             "input": "go",
-            "tools": [
-                {"type": "function", "name": "get_weather"}
-                | {
-                    k: v
-                    for k, v in WEATHER_TOOL["function"].items()
-                    if k != "name"
-                }
-            ],
+            "tools": [{"type": "function", **WEATHER_TOOL["function"]}],
         },
         "/v1/messages": {
             "model": "test-model",
@@ -361,9 +355,9 @@ def test_streaming_is_left_alone(monkeypatch, path):
 def test_tool_choice_none_returns_no_call_and_no_control_token(
     monkeypatch, path, tool, reasoning
 ):
-    """tools + ``tool_choice: none``: the model was not offered the tools, a call is not honoured, and
-    the raw channel text the parsers now read never reaches the client (the final cleaning of every
-    endpoint still runs)."""
+    """tools + ``tool_choice: none``: the model was not offered the tools, a call is
+    not honoured, and the raw channel text the parsers now read never reaches the
+    client (the final cleaning of every endpoint still runs)."""
     _use_parsers(monkeypatch, tool=tool, reasoning=reasoning)
     choice = {"type": "none"} if path == "/v1/messages" else "none"
 
@@ -376,13 +370,19 @@ def test_tool_choice_none_returns_no_call_and_no_control_token(
 
 
 def test_a_response_format_failure_does_not_echo_the_channel_text(monkeypatch):
-    """The ``response_format`` fallback (``cleaned_text or output.text``) can now be handed the raw channel
-    text (a harmony output with no final channel); the 422 it ends in must not carry it.
+    """The ``response_format`` fallback (``cleaned_text or output.text``) can now be
+    handed the raw channel text (a harmony output with no final channel); the 422 it
+    ends in must not carry it.
 
-    The JSON logits processor is switched off (the stand-in engine has no tokenizer to build one from), so the
-    request reaches the validation of the generated text, which is what this pins."""
+    The JSON logits processor is switched off (the stand-in engine has no tokenizer
+    to build one from), so the request reaches the validation of the generated text,
+    which is what this pins."""
     _use_parsers(monkeypatch, tool=None, reasoning="gpt_oss")
-    monkeypatch.setattr(srv, "_prepare_json_logits_processor", lambda engine, messages, *a, **k: (messages, None))
+    monkeypatch.setattr(
+        srv,
+        "_prepare_json_logits_processor",
+        lambda engine, messages, *a, **k: (messages, None),
+    )
     validated = []
     real = srv._apply_response_format_or_raise
 
@@ -391,7 +391,7 @@ def test_a_response_format_failure_does_not_echo_the_channel_text(monkeypatch):
         return real(text, response_format, **kwargs)
 
     monkeypatch.setattr(srv, "_apply_response_format_or_raise", spy)
-    # a generation cut off inside the analysis: no final channel, no content for the parser to return
+    # a generation cut off inside the analysis: no final channel, no content
     monkeypatch.setattr(srv, "_engine", _engine(CALL.split("<|end|>")[0]))
 
     response = TestClient(srv.app).post(
@@ -403,10 +403,12 @@ def test_a_response_format_failure_does_not_echo_the_channel_text(monkeypatch):
         },
     )
 
-    assert validated and "<|channel|>" in validated[0]  # the fallback got the raw channel text
+    # the fallback got the raw channel text
+    assert validated and "<|channel|>" in validated[0]
     assert response.status_code == 422, response.text
     assert response.json()["detail"]["error"] == "invalid_response_format_output"
-    assert "<|" not in response.text and "get_weather" not in response.text and "analysis" not in response.text
+    for echoed in ("<|", "get_weather", "analysis"):
+        assert echoed not in response.text
 
 
 def test_a_client_that_asks_for_skip_special_tokens_false_still_gets_the_call(
