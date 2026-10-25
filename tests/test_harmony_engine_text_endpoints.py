@@ -356,27 +356,43 @@ def test_streaming_is_left_alone(monkeypatch, path):
     assert seen and "skip_special_tokens" not in seen
 
 
-@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
+@pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize("tool,reasoning", PARSERS)
 def test_tool_choice_none_returns_no_call_and_no_control_token(
     monkeypatch, path, tool, reasoning
 ):
     """tools + ``tool_choice: none``: the model was not offered the tools, a call is not honoured, and
-    the raw channel text the parsers now read never reaches the client."""
+    the raw channel text the parsers now read never reaches the client (the final cleaning of every
+    endpoint still runs)."""
     _use_parsers(monkeypatch, tool=tool, reasoning=reasoning)
+    choice = {"type": "none"} if path == "/v1/messages" else "none"
 
-    _, payload = _post(monkeypatch, path, CALL, WEATHER_TOOL, tool_choice="none")
+    _, payload = _post(monkeypatch, path, CALL, WEATHER_TOOL, tool_choice=choice)
 
     r, content, calls = _seen(path, payload)
     assert calls == []
+    assert r.strip() == CALL_REASONING  # the reasoning parser still separates it
     assert re.findall(r"<\|[a-z]+\|>", r + content) == []
 
 
 def test_a_response_format_failure_does_not_echo_the_channel_text(monkeypatch):
-    """The ``response_format`` fallback can now be handed the raw channel text (a harmony output with no
-    final channel); the 422 it ends in must not carry it."""
+    """The ``response_format`` fallback (``cleaned_text or output.text``) can now be handed the raw channel
+    text (a harmony output with no final channel); the 422 it ends in must not carry it.
+
+    The JSON logits processor is switched off (the stand-in engine has no tokenizer to build one from), so the
+    request reaches the validation of the generated text, which is what this pins."""
     _use_parsers(monkeypatch, tool=None, reasoning="gpt_oss")
-    monkeypatch.setattr(srv, "_engine", _engine(CALL))
+    monkeypatch.setattr(srv, "_prepare_json_logits_processor", lambda engine, messages, *a, **k: (messages, None))
+    validated = []
+    real = srv._apply_response_format_or_raise
+
+    def spy(text, response_format, **kwargs):
+        validated.append(text)
+        return real(text, response_format, **kwargs)
+
+    monkeypatch.setattr(srv, "_apply_response_format_or_raise", spy)
+    # a generation cut off inside the analysis: no final channel, no content for the parser to return
+    monkeypatch.setattr(srv, "_engine", _engine(CALL.split("<|end|>")[0]))
 
     response = TestClient(srv.app).post(
         "/v1/chat/completions",
@@ -387,8 +403,10 @@ def test_a_response_format_failure_does_not_echo_the_channel_text(monkeypatch):
         },
     )
 
+    assert validated and "<|channel|>" in validated[0]  # the fallback got the raw channel text
     assert response.status_code == 422, response.text
-    assert "<|" not in response.text and "get_weather" not in response.text
+    assert response.json()["detail"]["error"] == "invalid_response_format_output"
+    assert "<|" not in response.text and "get_weather" not in response.text and "analysis" not in response.text
 
 
 def test_a_client_that_asks_for_skip_special_tokens_false_still_gets_the_call(
