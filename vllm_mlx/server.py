@@ -945,6 +945,47 @@ def _attach_skip_special_tokens(kwargs: dict, request) -> None:
         kwargs["skip_special_tokens"] = False
 
 
+def _attach_parser_control_tokens(kwargs: dict, request, *, stream: bool) -> None:
+    """Keep the control tokens in the text a non-streaming response hands the parsers.
+
+    The engines run ``clean_output_text`` over ``GenerationOutput.text`` unless the
+    request says ``skip_special_tokens=false``: it deletes the Harmony channel tokens
+    (``<|channel|>``, ``<|message|>``, ``<|start|>``, ``<|end|>``, ``<|call|>``) and
+    flattens the channels, so the harmony reasoning and tool parsers, which read the
+    channels out of the text, find nothing: the analysis text and the call arguments
+    end up in ``content`` and no call is returned (py-quantbench#244). The response
+    is still cleaned for the client, with the request's own flag, after the parsers
+    have run.
+
+    vLLM's text-based tool parsers do the same in ``adjust_request`` (hermes, jamba,
+    kimi_k2, ...: ``skip_special_tokens = False`` when the request has tools and
+    ``tool_choice != "none"``, streaming included); vLLM's own Harmony parser reads
+    token ids instead and does not use the flag. Here:
+
+    * Streaming reads the raw ``new_text`` deltas, which the engines do not clean,
+      so only a non-streaming request needs it.
+    * A request that carries tools needs it for a tool parser that reads the raw
+      output; a reasoning parser that reads control tokens needs it on every
+      request. ``tool_choice="none"`` is not special-cased: the final cleaning
+      still removes the control tokens, and the reasoning parsers read them anyway.
+    * The flag also lifts the engine's hiding of BOS/PAD/UNK/EOS markers a
+      generation runs past (``ignore_eos``): those are rendered into the text the
+      parsers read, and the final cleaning does not remove all of them (gpt-oss's
+      ``<|startoftext|>``). The engines have no separate switch for the channel
+      cleaning (py-vllm-mlx#129).
+    * A client's explicit ``skip_special_tokens=true`` is the request default and
+      cannot be told apart from it; it is overridden for the engine and honoured in
+      the response.
+    """
+    if stream or kwargs.get("skip_special_tokens") is False:
+        return
+    tool_parser_reads = bool(
+        getattr(request, "tools", None) and _configured_tool_parser_reads_raw_output()
+    )
+    if tool_parser_reads or _reasoning_parser_reads_control_tokens(_reasoning_parser):
+        kwargs["skip_special_tokens"] = False
+
+
 def _attach_logit_bias_processor(
     chat_kwargs: dict, logit_bias: dict[str, float] | None
 ):
@@ -991,6 +1032,9 @@ def _prepare_chat_completion_invocation(
     if getattr(request, "ignore_eos", False):
         chat_kwargs["ignore_eos"] = True
     _attach_skip_special_tokens(chat_kwargs, request)
+    _attach_parser_control_tokens(
+        chat_kwargs, request, stream=bool(getattr(request, "stream", False))
+    )
 
     if has_media:
         chat_kwargs["images"] = images if images else None
@@ -1103,6 +1147,11 @@ def _prepare_anthropic_invocation(
             openai_request.repetition_penalty
         ),
     }
+    _attach_parser_control_tokens(
+        chat_kwargs,
+        openai_request,
+        stream=bool(getattr(openai_request, "stream", False)),
+    )
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         openai_request.chat_template_kwargs
     )
@@ -3454,6 +3503,9 @@ def _prepare_responses_request(
     if chat_request.ignore_eos:
         chat_kwargs["ignore_eos"] = True
     _attach_skip_special_tokens(chat_kwargs, chat_request)
+    _attach_parser_control_tokens(
+        chat_kwargs, chat_request, stream=bool(getattr(request, "stream", False))
+    )
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         chat_request.chat_template_kwargs
     )
