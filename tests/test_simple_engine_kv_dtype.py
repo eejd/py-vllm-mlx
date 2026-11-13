@@ -112,3 +112,15 @@ async def test_inspection_exposes_observed_evidence(monkeypatch):
     assert result["cache"]["kv_dtype_source"] == "observed-cache-arrays"
     assert result["cache"]["observed_after_generation_requests"] == 1
     assert result["cache"]["kv_dtype_reason"] is None
+
+
+def test_none_cache_observation_preserves_prior_valid_observation():
+    from vllm_mlx.engine import SimpleEngine
+
+    engine = SimpleEngine("fixture")
+    prior = {"kv_dtype": "bfloat16", "complete": True}
+    engine._kv_dtype_observation = dict(prior)
+    engine._observed_after_generation_requests = 5
+    engine._observe_request_kv_cache(None)
+    assert engine._kv_dtype_observation == prior
+    assert engine._observed_after_generation_requests == 5

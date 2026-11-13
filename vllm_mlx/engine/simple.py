@@ -502,6 +502,8 @@ class SimpleEngine(BaseEngine):
 
     def _observe_request_kv_cache(self, cache: Any) -> None:
         """Record metadata only; never retain the request's MLX arrays."""
+        if cache is None:
+            return
         layers = []
         dtypes = set()
         complete = bool(cache)
@@ -3186,9 +3188,9 @@ class SimpleEngine(BaseEngine):
                     backbone_cache = None
                     prompt_to_send = full_prompt
 
-            # --- Normal path (mlx_lm stream_generate) ---
             if backbone_cache is None:
-                backbone_cache = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
+                backbone_cache = make_prompt_cache(model)
+            # --- Normal path (mlx_lm stream_generate) ---
             observed_cache = backbone_cache
             prompt_cache = None
             if backbone_cache is not None:

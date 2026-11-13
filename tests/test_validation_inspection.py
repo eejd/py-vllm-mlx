@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression coverage for admission request decoding behavior."""
+import asyncio
 
 from types import SimpleNamespace
 
@@ -144,7 +145,7 @@ def test_bounded_context_refuses_unavailable_renderer(monkeypatch):
 
     monkeypatch.setattr(server, "_max_context_tokens", 4096)
     with pytest.raises(HTTPException, match="context rendering unavailable"):
-        server._enforce_context(SimpleNamespace(), [], {"max_tokens": 1024})
+        asyncio.run(server._enforce_context(SimpleNamespace(), [], {"max_tokens": 1024}))
 
 
 def test_unavailable_mllm_text_route_refuses_without_guessing(monkeypatch):
@@ -165,7 +166,7 @@ def test_unavailable_mllm_text_route_refuses_without_guessing(monkeypatch):
     assert body["model"]["render_path"] is None
     assert body["template"]["sha256"] is None
     with pytest.raises(HTTPException):
-        server._enforce_context(engine, [{"role": "user", "content": "x"}], {"max_tokens": 10})
+        asyncio.run(server._enforce_context(engine, [{"role": "user", "content": "x"}], {"max_tokens": 10}))
 
 
 def test_inspection_reports_effective_mllm_text_cache_after_probe(monkeypatch):
@@ -498,3 +499,32 @@ def test_real_server_subprocess_inspection_and_counter_delta(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+
+
+def test_mllm_text_route_initializes_before_rendering(monkeypatch):
+    # Draft-mode MLLM skips eager text init in start(); the guard must init
+    # lazily before rendering instead of refusing a loadable route forever.
+    from vllm_mlx.engine import SimpleEngine
+    import vllm_mlx.server as server
+
+    engine = SimpleEngine("fixture", force_mllm=True)
+    engine._loaded = True
+    engine._model = SimpleNamespace()
+    engine._text_model = None
+    engine._text_tokenizer = None
+    calls = []
+
+    async def ensure(*, mllm_draft_requested):
+        calls.append(mllm_draft_requested)
+        engine._text_model = SimpleNamespace()
+        engine._text_tokenizer = SimpleNamespace(
+            bos_token=None, encode=lambda prompt, add_special_tokens=True: [0] * 5)
+
+    monkeypatch.setattr(engine, "_ensure_text_model_for_request", ensure)
+    monkeypatch.setattr(engine, "_should_route_text_through_text_model",
+                        lambda *, mllm_draft_requested: True)
+    monkeypatch.setattr(engine, "_render_text_model_prompt",
+                        lambda messages, tools, kwargs, enable_thinking: ("prompt", None, None))
+    monkeypatch.setattr(server, "_max_context_tokens", 4096)
+    asyncio.run(server._enforce_context(engine, [{"role": "user", "content": "x"}], {"max_tokens": 10}))
+    assert calls == [False]

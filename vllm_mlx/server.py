@@ -331,7 +331,7 @@ def _resolve_chat_template_kwargs(
         resolved.update(request_value)
     return resolved
 
-def _render_inspection_prompt(engine, messages, kwargs, *, with_settings=False):
+async def _render_inspection_prompt(engine, messages, kwargs, *, with_settings=False):
     """Render a loaded SimpleEngine's selected text-only route."""
     if not isinstance(engine, _IMPORTED_SIMPLE_ENGINE):
         raise ValueError("rendering is unavailable for this engine path")
@@ -342,6 +342,7 @@ def _render_inspection_prompt(engine, messages, kwargs, *, with_settings=False):
     tools = convert_tools_for_template(kwargs.get("tools")) if kwargs.get("tools") else None
     if engine._is_mllm:
         draft = kwargs.get("mllm_draft", engine._default_mllm_draft)
+        await engine._ensure_text_model_for_request(mllm_draft_requested=bool(draft))
         if (engine._text_model is None or engine._text_tokenizer is None
                 or not engine._should_route_text_through_text_model(mllm_draft_requested=bool(draft))
                 or has_media_content(messages)):
@@ -367,11 +368,11 @@ def _render_inspection_prompt(engine, messages, kwargs, *, with_settings=False):
                    if key not in {"tools", "tokenize", "add_generation_prompt"}}
 
 
-def _enforce_context(engine, messages, kwargs):
+async def _enforce_context(engine, messages, kwargs):
     if _max_context_tokens is None:
         return
     try:
-        prompt_tokens = _render_inspection_prompt(engine, messages, kwargs)
+        prompt_tokens = await _render_inspection_prompt(engine, messages, kwargs)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="context rendering unavailable") from exc
     if prompt_tokens + kwargs["max_tokens"] > _max_context_tokens:
@@ -419,9 +420,9 @@ def _generation_rejected(route):
         _generation_outcomes[route]["rejected"] += 1
 
 
-def _enforce_stream_context(engine, route, messages, kwargs):
+async def _enforce_stream_context(engine, route, messages, kwargs):
     try:
-        _enforce_context(engine, messages, kwargs)
+        await _enforce_context(engine, messages, kwargs)
     except HTTPException:
         _generation_rejected(route)
         raise
@@ -429,7 +430,7 @@ def _enforce_stream_context(engine, route, messages, kwargs):
 
 async def _observed_chat(engine, route, messages, kwargs):
     try:
-        _enforce_context(engine, messages, kwargs)
+        await _enforce_context(engine, messages, kwargs)
     except HTTPException:
         _generation_rejected(route)
         raise
@@ -451,7 +452,7 @@ async def _observed_chat(engine, route, messages, kwargs):
 
 async def _observed_stream_chat(engine, route, messages, kwargs):
     try:
-        _enforce_context(engine, messages, kwargs)
+        await _enforce_context(engine, messages, kwargs)
     except HTTPException:
         _generation_rejected(route)
         raise
@@ -4718,7 +4719,7 @@ async def inspect_serving(request: InspectionRequest):
             enable_thinking=request.enable_thinking,
         )
         prepared = _prepare_chat_completion_invocation(engine, chat_request, output)
-        count, effective_kwargs = _render_inspection_prompt(
+        count, effective_kwargs = await _render_inspection_prompt(
             engine, prepared.messages, prepared.chat_kwargs, with_settings=True
         )
         if has_actual_request:
@@ -6141,6 +6142,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     release_on_exit = True
 
     try:
+        if request.stream and _max_context_tokens is not None:
+            _generation_rejected("completions")
+            raise HTTPException(status_code=400, detail="bounded text completions unavailable")
         if request.stream:
             response = StreamingResponse(
                 _disconnect_guard(
@@ -6359,7 +6363,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _raise_remote_media_http_error(exc)
 
         if request.stream:
-            _enforce_stream_context(engine, "chat", prepared.messages, prepared.chat_kwargs)
+            await _enforce_stream_context(engine, "chat", prepared.messages, prepared.chat_kwargs)
             response, release_on_exit = await _build_chat_streaming_response(
                 engine,
                 prepared.messages,
@@ -6554,7 +6558,7 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             chat_request = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
             engine, _, messages, chat_kwargs = _prepare_streaming_responses_request(request)
-            _enforce_stream_context(engine, "responses", messages, chat_kwargs)
+            await _enforce_stream_context(engine, "responses", messages, chat_kwargs)
             return StreamingResponse(
                 _disconnect_guard(_stream_responses_request(request), raw_request),
                 media_type="text/event-stream",
@@ -6793,7 +6797,7 @@ async def create_anthropic_message(
             effective_max_tokens,
         )
         if anthropic_request.stream:
-            _enforce_stream_context(engine, "messages", prepared.messages, prepared.chat_kwargs)
+            await _enforce_stream_context(engine, "messages", prepared.messages, prepared.chat_kwargs)
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             )
