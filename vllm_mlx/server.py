@@ -6144,6 +6144,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     try:
         if request.stream and _max_context_tokens is not None:
             _generation_rejected("completions")
+            tracker.finish(result="client_error")
             raise HTTPException(status_code=400, detail="bounded text completions unavailable")
         if request.stream:
             response = StreamingResponse(

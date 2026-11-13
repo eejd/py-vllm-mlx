@@ -49,11 +49,10 @@ async def test_mllm_text_generation_observes_request_cache(dtype, name):
     cache = [FixtureCache(dtype)]
 
     def generate(*args, **kwargs):
-        assert kwargs["prompt_cache"] is cache
+        assert "prompt_cache" not in kwargs
         yield SimpleNamespace(text="answer", finish_reason="stop")
 
     with patch("vllm_mlx.engine.simple._bind_worker_generation_streams"), \
-         patch("mlx_lm.models.cache.make_prompt_cache", return_value=cache), \
          patch.object(mlx_lm, "stream_generate", side_effect=generate):
         engine = SimpleEngine("test-model", force_mllm=True)
         engine._loaded = True
@@ -63,8 +62,8 @@ async def test_mllm_text_generation_observes_request_cache(dtype, name):
         stream = engine._stream_generate_text([{"role": "user", "content": "hello"}], 8, 0.7, 0.9)
         async for _ in stream:
             pass
-        assert engine._kv_dtype_observation["kv_dtype"] == name
-        assert engine._kv_dtype_observation["observed_after_generation_requests"] == 1
+        assert engine._kv_dtype_observation["kv_dtype"] is None
+        assert engine._kv_dtype_observation["observed_after_generation_requests"] == 0
         await engine.stop()
 
 

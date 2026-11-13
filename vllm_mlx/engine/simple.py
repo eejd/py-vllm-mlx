@@ -3188,8 +3188,6 @@ class SimpleEngine(BaseEngine):
                     backbone_cache = None
                     prompt_to_send = full_prompt
 
-            if backbone_cache is None:
-                backbone_cache = make_prompt_cache(model)
             # --- Normal path (mlx_lm stream_generate) ---
             observed_cache = backbone_cache
             prompt_cache = None
@@ -3218,6 +3216,7 @@ class SimpleEngine(BaseEngine):
                     shared_cache = make_prompt_cache(
                         model, max_kv_size=self._max_kv_size or None
                     )
+                observed_cache = shared_cache
                 gen_kwargs["prompt_cache"] = shared_cache
 
                 token_count = 0

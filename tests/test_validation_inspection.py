@@ -528,3 +528,52 @@ def test_mllm_text_route_initializes_before_rendering(monkeypatch):
     monkeypatch.setattr(server, "_max_context_tokens", 4096)
     asyncio.run(server._enforce_context(engine, [{"role": "user", "content": "x"}], {"max_tokens": 10}))
     assert calls == [False]
+
+
+def test_bounded_completions_stream_refusal_finishes_metrics_tracker(monkeypatch):
+    """A bounded /v1/completions stream is refused with 400 before headers and
+    the metrics tracker must be finished on that path (no leaked in-flight)."""
+    from fastapi.testclient import TestClient
+
+    import vllm_mlx.server as server
+    from vllm_mlx.engine import SimpleEngine
+
+    finishes = []
+
+    class Tracker:
+        def finish(self, **kwargs):
+            finishes.append(kwargs)
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    class Metrics:
+        enabled = True
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+        def track_inference(self, *args, **kwargs):
+            return Tracker()
+
+    class Engine(SimpleEngine):
+        def __init__(self):
+            super().__init__("fixture")
+            self._loaded = True
+            self.calls = 0
+
+    engine = Engine()
+    monkeypatch.setattr(server, "_engine", engine)
+    monkeypatch.setattr(server, "_model_name", "fixture")
+    monkeypatch.setattr(server, "_api_key", None)
+    monkeypatch.setattr(server, "_max_context_tokens", 12)
+    monkeypatch.setattr(server, "_metrics", Metrics())
+    client = TestClient(server.app)
+    response = client.post(
+        "/v1/completions",
+        json={"model": "fixture", "prompt": "hello", "max_tokens": 3, "stream": True},
+    )
+    assert response.status_code == 400
+    assert "text/event-stream" not in response.headers.get("content-type", "")
+    assert engine.calls == 0
+    assert finishes == [{"result": "client_error"}]
