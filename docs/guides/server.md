@@ -58,6 +58,13 @@ vllm-mlx serve mlx-community/Qwen3-8B-4bit \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
 
+The authenticated `/v1/inspection` response reports the most recently observed
+SimpleEngine text request's KV array dtype in `cache.kv_dtype`, together with
+its source, observed request count, and per-layer key/value dtype and cache
+class evidence. Before an observation, or when arrays are missing or disagree,
+the dtype is null and `kv_dtype_reason` explains why. This is runtime evidence,
+not a dtype inferred from model weights or configuration.
+
 ## Server Options
 
 | Option | Description | Default |

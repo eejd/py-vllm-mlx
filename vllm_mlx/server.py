@@ -147,6 +147,7 @@ from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
     clean_output_text,
     extract_multimodal_content,
+    has_media_content,
     is_mllm_model,  # noqa: F401
 )
 from .audio_limits import (
@@ -162,6 +163,7 @@ from .cli_arg_types import (
     make_positive_int_arg_parser,
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .engine.simple import _generation_admission_hook
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
     resolve_stt_model_name,
@@ -186,6 +188,23 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _IMPORTED_SIMPLE_ENGINE = SimpleEngine
+_inspection_instance_id = str(uuid.uuid4())
+try:
+    import psutil
+    _inspection_started_at = psutil.Process(os.getpid()).create_time()
+except Exception:
+    _inspection_started_at = None
+_max_context_tokens: int | None = None
+_inspection_lock = threading.Lock()
+_generation_active = 0
+_generation_accepted = 0
+_generation_routes = {"chat": 0, "responses": 0, "messages": 0, "completions": 0}
+_generation_outcomes = {
+    route: {"rejected": 0, "failed": 0, "cancelled": 0}
+    for route in _generation_routes
+}
+_generation_accounting_unknown = False
+
 
 # Global engine instance
 _engine: BaseEngine | None = None
@@ -311,6 +330,199 @@ def _resolve_chat_template_kwargs(
     if request_value:
         resolved.update(request_value)
     return resolved
+
+def _render_inspection_prompt(engine, messages, kwargs, *, with_settings=False):
+    """Render a loaded SimpleEngine's selected text-only route."""
+    if not isinstance(engine, _IMPORTED_SIMPLE_ENGINE):
+        raise ValueError("rendering is unavailable for this engine path")
+    if not engine._loaded or engine._model is None:
+        raise ValueError("model is not loaded")
+    if kwargs.get("images") or kwargs.get("videos") or kwargs.get("audios"):
+        raise ValueError("multimodal rendering is unavailable")
+    tools = convert_tools_for_template(kwargs.get("tools")) if kwargs.get("tools") else None
+    if engine._is_mllm:
+        draft = kwargs.get("mllm_draft", engine._default_mllm_draft)
+        if (engine._text_model is None or engine._text_tokenizer is None
+                or not engine._should_route_text_through_text_model(mllm_draft_requested=bool(draft))
+                or has_media_content(messages)):
+            raise ValueError("multimodal request rendering is unavailable")
+        tokenizer = engine._text_tokenizer
+        prompt, applied_kwargs, _ = engine._render_text_model_prompt(
+            messages, tools, dict(kwargs.get("chat_template_kwargs") or {}),
+            kwargs.get("enable_thinking"),
+        )
+    else:
+        tokenizer = engine._model.tokenizer
+        prompt, applied_kwargs, _ = engine._render_chat_prompt(
+            messages, tools, dict(kwargs.get("chat_template_kwargs") or {}),
+            kwargs.get("enable_thinking"),
+        )
+    bos = getattr(tokenizer, "bos_token", None)
+    count = len(tokenizer.encode(prompt, add_special_tokens=bos is None or not prompt.startswith(bos)))
+    if not with_settings:
+        return count
+    if applied_kwargs is None:
+        return count, None
+    return count, {key: value for key, value in applied_kwargs.items()
+                   if key not in {"tools", "tokenize", "add_generation_prompt"}}
+
+
+def _enforce_context(engine, messages, kwargs):
+    if _max_context_tokens is None:
+        return
+    try:
+        prompt_tokens = _render_inspection_prompt(engine, messages, kwargs)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="context rendering unavailable") from exc
+    if prompt_tokens + kwargs["max_tokens"] > _max_context_tokens:
+        raise HTTPException(status_code=400, detail="rendered prompt plus output exceeds max context")
+
+
+def _generation_begin(route):
+    global _generation_active
+    state = {"accepted": False}
+    with _inspection_lock:
+        _generation_active += 1
+
+    def admitted():
+        global _generation_accepted
+        with _inspection_lock:
+            if not state["accepted"]:
+                state["accepted"] = True
+                _generation_accepted += 1
+                _generation_routes[route] += 1
+
+    _generation_admission_hook.set(admitted)
+    return state
+
+
+def _generation_end(route, state, outcome):
+    global _generation_active, _generation_accounting_unknown
+    _generation_admission_hook.set(None)
+    with _inspection_lock:
+        _generation_active -= 1
+        if outcome == "cancelled":
+            _generation_outcomes[route]["cancelled"] += 1
+        elif outcome == "failed" and state["accepted"]:
+            _generation_outcomes[route]["failed"] += 1
+        if not state["accepted"]:
+            if outcome == "success":
+                # An engine implementation that bypasses SimpleEngine's
+                # admission slot cannot prove when it accepted the request.
+                _generation_accounting_unknown = True
+            elif outcome != "cancelled":
+                _generation_outcomes[route]["rejected"] += 1
+
+
+def _generation_rejected(route):
+    with _inspection_lock:
+        _generation_outcomes[route]["rejected"] += 1
+
+
+def _enforce_stream_context(engine, route, messages, kwargs):
+    try:
+        _enforce_context(engine, messages, kwargs)
+    except HTTPException:
+        _generation_rejected(route)
+        raise
+
+
+async def _observed_chat(engine, route, messages, kwargs):
+    try:
+        _enforce_context(engine, messages, kwargs)
+    except HTTPException:
+        _generation_rejected(route)
+        raise
+    if _max_context_tokens is not None:
+        kwargs = {**kwargs, "_bounded_stream": True}
+    state = _generation_begin(route)
+    outcome = "success"
+    try:
+        return await engine.chat(messages=messages, **kwargs)
+    except (asyncio.CancelledError, GeneratorExit):
+        outcome = "cancelled"
+        raise
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        _generation_end(route, state, outcome)
+
+
+async def _observed_stream_chat(engine, route, messages, kwargs):
+    try:
+        _enforce_context(engine, messages, kwargs)
+    except HTTPException:
+        _generation_rejected(route)
+        raise
+    state = _generation_begin(route)
+    outcome = "success"
+    stream = None
+    try:
+        stream = engine.stream_chat(messages=messages, **kwargs)
+        async for output in stream:
+            yield output
+    except (asyncio.CancelledError, GeneratorExit):
+        outcome = "cancelled"
+        raise
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        try:
+            if stream is not None:
+                await stream.aclose()
+        except BaseException:
+            outcome = "failed"
+            raise
+        finally:
+            _generation_end(route, state, outcome)
+
+
+async def _observed_generate(engine, kwargs):
+    if _max_context_tokens is not None:
+        _generation_rejected("completions")
+        raise HTTPException(status_code=400, detail="bounded text completions unavailable")
+    state = _generation_begin("completions")
+    outcome = "success"
+    try:
+        return await engine.generate(**kwargs)
+    except (asyncio.CancelledError, GeneratorExit):
+        outcome = "cancelled"
+        raise
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        _generation_end("completions", state, outcome)
+
+
+async def _observed_stream_generate(engine, kwargs):
+    if _max_context_tokens is not None:
+        _generation_rejected("completions")
+        raise HTTPException(status_code=400, detail="bounded text completions unavailable")
+    state = _generation_begin("completions")
+    outcome = "success"
+    stream = None
+    try:
+        stream = engine.stream_generate(**kwargs)
+        async for output in stream:
+            yield output
+    except (asyncio.CancelledError, GeneratorExit):
+        outcome = "cancelled"
+        raise
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        try:
+            if stream is not None:
+                await stream.aclose()
+        except BaseException:
+            outcome = "failed"
+            raise
+        finally:
+            _generation_end("completions", state, outcome)
 
 
 @dataclass
@@ -3008,7 +3220,7 @@ async def _run_responses_request(
 
     timeout = _default_timeout
     output = await _wait_with_disconnect(
-        engine.chat(messages=messages, **chat_kwargs),
+        _observed_chat(engine, "responses", messages, chat_kwargs),
         raw_request,
         timeout=timeout,
     )
@@ -3214,7 +3426,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 )
         return content
 
-    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+    async for output in _observed_stream_chat(engine, "responses", messages, chat_kwargs):
         last_output = output
         finish_reason = output.finish_reason
         if hasattr(output, "prompt_tokens") and output.prompt_tokens:
@@ -4397,6 +4609,179 @@ def _embedding_status() -> dict[str, object] | None:
         # int | None, a single consistent type API consumers can rely on.
         "max_length_ceiling": _embedding_max_length,
         "overflow_policy": _embedding_overflow_policy,
+    }
+
+class InspectionRequest(BaseModel):
+    route: str = "chat"
+    tools_present: bool = False
+    chat_template_kwargs: dict[str, object] | None = None
+    reasoning_effort: str | None = None
+    messages: list[dict] | None = None
+    tools: list[dict] | None = None
+    max_tokens: int | None = None
+    enable_thinking: bool | None = None
+
+
+def _parser_source(parser):
+    if parser is None:
+        return None
+    try:
+        return inspect.getsourcefile(type(parser))
+    except (TypeError, OSError):
+        return None
+
+
+def _inspection_cache_policy(engine, *, text_route):
+    """Report cache capability for the selected route, not constructor defaults."""
+    requested = {
+        "media_cache_enabled": engine._enable_cache,
+        "prefix_trie_enabled": engine._prefix_trie_cache_enabled,
+        "prefix_trie_capacity": engine._prefix_trie_cache_size,
+        "system_kv_capacity": engine._system_kv_capacity,
+    }
+    if not text_route:
+        enabled = prefix = prefix_capacity = system_capacity = system_supported = None
+        reason = "selected render path cache policy unavailable"
+    else:
+        system_supported = engine._supports_system_kv_cache
+        # Pure text's snapshot and trie branches share the static feature gate.
+        # The multimodal text route uses only the probed system snapshot gate.
+        static_allowed = engine._is_mllm or not (
+            engine._mtp or engine._draft_model is not None
+            or (engine._max_kv_size or 0) > 0
+            or getattr(engine, "use_harmony_rendering", False)
+        )
+        snapshot = system_supported and static_allowed
+        prefix = bool(engine._prefix_trie_cache_enabled and not engine._is_mllm and snapshot)
+        prefix_capacity = engine._prefix_trie_cache_size if prefix else 0
+        system_capacity = engine._system_kv_capacity if snapshot else 0
+        enabled = bool(prefix or snapshot)
+        reason = None
+    effective = {
+        "enabled": enabled,
+        "prefix_trie_enabled": prefix,
+        "prefix_trie_capacity": prefix_capacity,
+        "system_kv_capacity": system_capacity,
+        "system_kv_supported": system_supported,
+    }
+    return {
+        **effective,
+        "requested": requested,
+        "effective": dict(effective),
+        "unknown_reason": reason,
+        "max_kv_size": engine._max_kv_size,
+        "persistence": False if not hasattr(engine, "save_cache_to_disk") and not hasattr(engine, "load_cache_from_disk") else None,
+        **engine._kv_dtype_observation,
+    }
+
+
+
+@app.post("/v1/inspection", dependencies=[Depends(verify_api_key)])
+async def inspect_serving(request: InspectionRequest):
+    engine = _engine
+    simple = isinstance(engine, _IMPORTED_SIMPLE_ENGINE)
+    text = simple and engine._loaded and engine._model is not None
+    if text and engine._is_mllm:
+        text = (engine._text_model is not None and engine._text_tokenizer is not None
+                and engine._should_route_text_through_text_model(mllm_draft_requested=engine._default_mllm_draft))
+    tokenizer = (engine._text_tokenizer if engine._is_mllm else engine._model.tokenizer) if text else None
+    template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(template, str) or getattr(engine, "use_harmony_rendering", False):
+        template = None
+    kwargs = _resolve_chat_template_kwargs(request.chat_template_kwargs, request.reasoning_effort)
+    tool_parser = None
+    if _enable_auto_tool_choice and _tool_call_parser:
+        try:
+            tool_parser = _build_tool_parser(engine)
+        except Exception:
+            logger.debug("Inspection could not instantiate tool parser", exc_info=True)
+    rendered = None
+    render_error = None
+    output_tokens = None
+    effective_kwargs = None
+    reasoning = {"enable_thinking": None, "source": None, "reason": "selected template settings unavailable"}
+    has_actual_request = request.messages is not None
+    try:
+        if request.route != "chat" or template is None:
+            raise ValueError("selected template rendering unavailable")
+        if request.tools_present and not request.tools:
+            raise ValueError("actual tools required to establish template settings")
+        if not engine._is_mllm and _max_context_tokens is None and not request.tools:
+            raise ValueError("unbounded simple-text streaming and blocking renderers differ")
+        output = _resolve_request_max_tokens(request.max_tokens)
+        chat_request = ChatCompletionRequest(
+            model=_model_name or "",
+            messages=request.messages if has_actual_request else [{"role": "user", "content": "inspection"}],
+            tools=request.tools, max_tokens=output,
+            chat_template_kwargs=request.chat_template_kwargs,
+            reasoning_effort=request.reasoning_effort,
+            enable_thinking=request.enable_thinking,
+        )
+        prepared = _prepare_chat_completion_invocation(engine, chat_request, output)
+        count, effective_kwargs = _render_inspection_prompt(
+            engine, prepared.messages, prepared.chat_kwargs, with_settings=True
+        )
+        if has_actual_request:
+            rendered, output_tokens = count, output
+        if effective_kwargs is None or "enable_thinking" not in effective_kwargs:
+            reasoning["reason"] = "effective enable_thinking was not applied by the renderer"
+        elif type(effective_kwargs["enable_thinking"]) is not bool:
+            reasoning["reason"] = "effective enable_thinking is not a boolean"
+        else:
+            if "enable_thinking" in (request.chat_template_kwargs or {}):
+                source = "request"
+            elif "enable_thinking" in (_default_chat_template_kwargs or {}):
+                source = "server-default"
+            elif request.enable_thinking is not None or "enable_thinking" in prepared.chat_kwargs:
+                source = "request"
+            else:
+                source = "engine-default"
+            reasoning = {"enable_thinking": effective_kwargs["enable_thinking"], "source": source, "reason": None}
+    except Exception:
+        if has_actual_request:
+            render_error = "request rendering unavailable"
+    with _inspection_lock:
+        accepted = _generation_accepted
+        active = _generation_active
+        routes = dict(_generation_routes)
+        accounting_unknown = _generation_accounting_unknown or bool(_warm_prompts_path) or (simple and engine._untracked_generation_seen)
+        outcomes = {route: dict(counts) for route, counts in _generation_outcomes.items()}
+    running = int(engine._generation_lock.locked()) if simple else None
+    queued = max(engine._generation_waiters, active - running) if simple else None
+    return {
+        "schema": 1, "kind": "vllm-mlx-inspection",
+        "instance": {"id": _inspection_instance_id, "pid": os.getpid(), "started_at": _inspection_started_at},
+        "model": {"path": getattr(engine, "_model_path", None) if simple else None, "served_id": _model_name,
+                  "render_path": ("mllm-text" if engine._is_mllm else "simple-text") if text else None},
+        "template": {
+            "source": ("text_tokenizer" if engine._is_mllm else "tokenizer") if template is not None else None,
+            "sha256": hashlib.sha256(template.encode()).hexdigest() if template is not None else None,
+            "kwargs": kwargs,
+            "effective_kwargs": effective_kwargs,
+            "reasoning": reasoning,
+        },
+        "tool_parser": {"enabled": _enable_auto_tool_choice, "id": _tool_call_parser if _enable_auto_tool_choice else None, "class_source": _parser_source(tool_parser)},
+        "reasoning_parser": {"enabled": _reasoning_parser is not None, "id": _reasoning_parser_name, "class_source": _parser_source(_reasoning_parser)},
+        "limits": {"context_tokens": _max_context_tokens, "output_tokens": _max_request_tokens, "default_output_tokens": _default_max_tokens, "concurrency": 1 if simple else None},
+        "cache": _inspection_cache_policy(engine, text_route=text) if simple else None,
+        "generation": {
+            "active_generation": running,
+            "queued_generation": queued,
+            "queue_policy": engine._generation_lock_admission if simple else None,
+            "accepted_generation_requests": accepted if simple and not accounting_unknown else None,
+            "routes": routes if simple and not accounting_unknown else None,
+            "outcomes": outcomes if simple and not accounting_unknown else None,
+            "rejected_before_admission": sum(v["rejected"] for v in outcomes.values()) if simple and not accounting_unknown else None,
+            "failed_generation_requests": sum(v["failed"] for v in outcomes.values()) if simple and not accounting_unknown else None,
+            "cancelled_generation_requests": sum(v["cancelled"] for v in outcomes.values()) if simple and not accounting_unknown else None,
+            "rejection_scope": "engine-bound requests after endpoint validation",
+            "unknown_reason": ("internal generation not accounted" if _warm_prompts_path or engine._untracked_generation_seen else "engine bypassed observable admission") if simple and accounting_unknown else (None if simple else "engine scheduler accounting unavailable"),
+        },
+        "rendering": {
+            "rendered_prompt_tokens": rendered, "output_tokens": output_tokens,
+            "total_tokens": rendered + output_tokens if rendered is not None and output_tokens is not None else None,
+            "unknown_reason": render_error,
+        },
     }
 
 
@@ -5812,10 +6197,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 generate_kwargs["mllm_draft"] = mllm_draft
             try:
                 if raw_request is None:
-                    output = await engine.generate(**generate_kwargs)
+                    output = await _observed_generate(engine, generate_kwargs)
                 else:
                     output = await _wait_with_disconnect(
-                        engine.generate(**generate_kwargs),
+                        _observed_generate(engine, generate_kwargs),
                         raw_request,
                         timeout=_remaining_request_timeout(total_timeout, deadline),
                         timeout_detail_seconds=total_timeout,
@@ -5974,6 +6359,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _raise_remote_media_http_error(exc)
 
         if request.stream:
+            _enforce_stream_context(engine, "chat", prepared.messages, prepared.chat_kwargs)
             response, release_on_exit = await _build_chat_streaming_response(
                 engine,
                 prepared.messages,
@@ -5991,7 +6377,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
         try:
             output = await _wait_with_disconnect(
-                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
+                _observed_chat(engine, "chat", prepared.messages, prepared.chat_kwargs),
                 raw_request,
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
@@ -6167,6 +6553,8 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
         if request.stream:
             chat_request = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
+            engine, _, messages, chat_kwargs = _prepare_streaming_responses_request(request)
+            _enforce_stream_context(engine, "responses", messages, chat_kwargs)
             return StreamingResponse(
                 _disconnect_guard(_stream_responses_request(request), raw_request),
                 media_type="text/event-stream",
@@ -6405,6 +6793,7 @@ async def create_anthropic_message(
             effective_max_tokens,
         )
         if anthropic_request.stream:
+            _enforce_stream_context(engine, "messages", prepared.messages, prepared.chat_kwargs)
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             )
@@ -6437,7 +6826,7 @@ async def create_anthropic_message(
         start_time = time.perf_counter()
         try:
             output = await _wait_with_disconnect(
-                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
+                _observed_chat(engine, "messages", prepared.messages, prepared.chat_kwargs),
                 request,
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
@@ -6787,7 +7176,7 @@ async def _stream_anthropic_messages(
     tool_request_context = openai_request.model_dump()
 
     try:
-        async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+        async for output in _observed_stream_chat(engine, "messages", messages, chat_kwargs):
             _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
@@ -7075,7 +7464,7 @@ async def stream_completion(
         generate_kwargs["mllm_draft"] = mllm_draft
 
     try:
-        async for output in engine.stream_generate(**generate_kwargs):
+        async for output in _observed_stream_generate(engine, generate_kwargs):
             _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
@@ -7221,7 +7610,7 @@ async def stream_chat_completion(
 
     try:
         # Stream content
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in _observed_stream_chat(engine, "chat", messages, kwargs):
             _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
@@ -7875,6 +8264,8 @@ def main():
     global _default_presence_penalty, _default_repetition_penalty
     global _max_audio_upload_bytes, _max_tts_input_chars
     global _embedding_max_length, _embedding_overflow_policy
+    global _max_context_tokens
+    _max_context_tokens = args.max_context_tokens
     _api_key = args.api_key
     _default_timeout = args.timeout
     _metrics_enabled = args.enable_metrics
@@ -8100,6 +8491,12 @@ Examples:
         type=int,
         default=32768,
         help="Maximum max_tokens accepted from API clients (default: 32768)",
+    )
+    parser.add_argument(
+        "--max-context-tokens",
+        type=make_positive_int_arg_parser("--max-context-tokens"),
+        default=None,
+        help="Maximum rendered prompt plus requested output tokens",
     )
     parser.add_argument(
         "--api-key",
