@@ -3256,6 +3256,11 @@ class SimpleEngine(BaseEngine):
                         max_tokens - token_count,
                     )
             else:
+                if gen_kwargs.get("prompt_cache") is None and not use_mtp:
+                    # mlx_lm would build this same unbounded default cache itself; building it
+                    # here keeps the semantics and makes the real KV arrays observable.
+                    observed_cache = make_prompt_cache(model)
+                    gen_kwargs["prompt_cache"] = observed_cache
                 for resp in mlx_stream_generate(
                     model,
                     self._text_tokenizer,

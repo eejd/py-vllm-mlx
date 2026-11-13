@@ -2382,8 +2382,14 @@ class TestSimpleEngineConcurrency:
             captured_prompts.append(prompt)
             yield SimpleNamespace(text="Hello", finish_reason="stop")
 
-        def fail_if_manual_cache_path_runs(*args, **kwargs):
-            raise AssertionError("manual system-cache path must be skipped")
+        cache_builds = []
+
+        def record_request_cache(*args, **kwargs):
+            # The only cache built is the request's own default (unbounded, as mlx_lm would
+            # build it itself, built here so its real KV arrays are observable) -- never a
+            # system-prompt snapshot.
+            cache_builds.append((args, kwargs))
+            return []
 
         engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
         engine._loaded = True
@@ -2396,7 +2402,7 @@ class TestSimpleEngineConcurrency:
             patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
             patch(
                 "mlx_lm.models.cache.make_prompt_cache",
-                side_effect=fail_if_manual_cache_path_runs,
+                side_effect=record_request_cache,
             ),
         ):
             outputs = [
@@ -2414,11 +2420,12 @@ class TestSimpleEngineConcurrency:
 
         assert outputs[-1].text == "Hello"
         assert captured_prompts == [tokenizer.apply_chat_template.return_value]
-        # The manual system-cache path is skipped -- asserted by
-        # fail_if_manual_cache_path_runs above. encode() is no longer a proxy
+        # The manual system-cache path is skipped: exactly one default request cache and no
+        # bounded/system cache was built. encode() is no longer a proxy
         # for that: the full prompt is now tokenized on every request so
         # usage.prompt_tokens can be reported (it used to be 0 on this route).
         # What must NOT happen is the second, system-prefix encode.
+        assert len(cache_builds) == 1 and cache_builds[0][1].get("max_kv_size") is None
         assert tokenizer.encode.call_count == 1
         assert (
             tokenizer.encode.call_args.args[0]
