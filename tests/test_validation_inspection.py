@@ -286,6 +286,94 @@ def test_context_guard_blocks_generation_on_all_routes(monkeypatch, path, payloa
     assert after["generation"]["routes"][route] == before + 1
 
 
+def _native_inspection_fixture(monkeypatch):
+    from fastapi.testclient import TestClient
+    from vllm_mlx.engine import SimpleEngine
+    from vllm_mlx.engine import GenerationOutput
+    import vllm_mlx.server as server
+
+    class Tokenizer:
+        chat_template = "{{ messages }}"
+        bos_token = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "rendered prompt"
+
+        def encode(self, prompt, add_special_tokens=True):
+            return list(range(10))
+
+    class FixtureEngine(SimpleEngine):
+        def __init__(self):
+            super().__init__("fixture")
+            self._is_mllm = False
+            self._loaded = True
+            self._model = SimpleNamespace(tokenizer=Tokenizer())
+            self.calls = 0
+
+        async def chat(self, **kwargs):
+            async with self._acquire_generation_slot("fixture"):
+                self.calls += 1
+                return GenerationOutput(text="ok", prompt_tokens=10, completion_tokens=1)
+
+    engine = FixtureEngine()
+    monkeypatch.setattr(server, "_engine", engine)
+    monkeypatch.setattr(server, "_model_name", "fixture")
+    monkeypatch.setattr(server, "_api_key", None)
+    monkeypatch.setattr(server, "_max_context_tokens", 1000)
+    monkeypatch.setattr(server, "_generation_accounting_unknown", False)
+    return engine, TestClient(server.app), server
+
+
+@pytest.mark.parametrize(
+    ("route", "path", "body"),
+    [
+        ("responses", "/v1/responses", {"model": "fixture", "input": "hello", "max_output_tokens": 7}),
+        ("messages", "/v1/messages", {"model": "fixture", "max_tokens": 7, "messages": [{"role": "user", "content": "hello"}]}),
+    ],
+)
+def test_native_inspection_counts_exactly_what_enforcement_counts(monkeypatch, route, path, body):
+    engine, client, server = _native_inspection_fixture(monkeypatch)
+    before = client.post("/v1/inspection", json={}).json()["generation"]["accepted_generation_requests"]
+    inspection = client.post("/v1/inspection", json={"route": route, "body": body})
+    assert inspection.status_code == 200
+    rendering = inspection.json()["rendering"]
+    prompt = rendering["rendered_prompt_tokens"]
+    assert prompt == 10
+    assert rendering["output_tokens"] == 7
+    assert rendering["total_tokens"] == prompt + 7
+    assert rendering["unknown_reason"] is None
+    assert client.post("/v1/inspection", json={}).json()["generation"]["accepted_generation_requests"] == before
+
+    monkeypatch.setattr(server, "_max_context_tokens", prompt + 7)
+    accepted = client.post(path, json=body)
+    assert accepted.status_code == 200
+    assert engine.calls == 1
+
+    monkeypatch.setattr(server, "_max_context_tokens", prompt + 6)
+    refused = client.post(path, json=body)
+    assert refused.status_code == 400
+    assert engine.calls == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"route": "other", "body": {"model": "fixture", "input": "hello"}},
+        {"route": "responses"},
+        {"route": "messages"},
+    ],
+)
+def test_native_inspection_refuses_unsupported_or_bodyless_routes(monkeypatch, payload):
+    engine, client, _server = _native_inspection_fixture(monkeypatch)
+    before = client.post("/v1/inspection", json={}).json()["generation"]["accepted_generation_requests"]
+    rendering = client.post("/v1/inspection", json=payload).json()["rendering"]
+    assert rendering["rendered_prompt_tokens"] is None
+    assert rendering["output_tokens"] is None
+    assert rendering["unknown_reason"] == "request rendering unavailable"
+    assert engine.calls == 0
+    assert client.post("/v1/inspection", json={}).json()["generation"]["accepted_generation_requests"] == before
+
+
 @pytest.mark.asyncio
 async def test_stream_accounting_stays_active_until_generator_closes(monkeypatch):
     import asyncio

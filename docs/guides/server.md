@@ -65,6 +65,11 @@ class evidence. Before an observation, or when arrays are missing or disagree,
 the dtype is null and `kv_dtype_reason` explains why. This is runtime evidence,
 not a dtype inferred from model weights or configuration.
 
+`/v1/inspection` accepts `{"route": "chat", ...}` (the message-based fields) or
+`{"route": "responses" | "messages", "body": <native request body>}`. Native
+bodies are rendered through the same preparation the generation route uses, so
+`rendering.rendered_prompt_tokens` equals the count context enforcement applies.
+
 ## Server Options
 
 | Option | Description | Default |
