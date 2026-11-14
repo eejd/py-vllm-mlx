@@ -133,6 +133,7 @@ def serve_command(args):
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
     server._max_request_tokens = max_request_tokens
+    server._max_context_tokens = getattr(args, "max_context_tokens", None)
     server._embedding_max_length = args.embedding_max_length
     server._embedding_overflow_policy = args.embedding_overflow_policy
     if args.rate_limit > 0:
@@ -1316,6 +1317,12 @@ Examples:
         type=int,
         default=32768,
         help="Maximum max_tokens accepted from API clients (default: 32768)",
+    )
+    serve_parser.add_argument(
+        "--max-context-tokens",
+        type=make_positive_int_arg_parser("--max-context-tokens"),
+        default=None,
+        help="Maximum rendered prompt plus requested output tokens",
     )
     serve_parser.add_argument(
         "--continuous-batching",

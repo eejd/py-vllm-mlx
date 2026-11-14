@@ -2382,8 +2382,14 @@ class TestSimpleEngineConcurrency:
             captured_prompts.append(prompt)
             yield SimpleNamespace(text="Hello", finish_reason="stop")
 
-        def fail_if_manual_cache_path_runs(*args, **kwargs):
-            raise AssertionError("manual system-cache path must be skipped")
+        cache_builds = []
+
+        def record_request_cache(*args, **kwargs):
+            # The only cache built is the request's own default (unbounded, as mlx_lm would
+            # build it itself, built here so its real KV arrays are observable) -- never a
+            # system-prompt snapshot.
+            cache_builds.append((args, kwargs))
+            return []
 
         engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
         engine._loaded = True
@@ -2396,7 +2402,7 @@ class TestSimpleEngineConcurrency:
             patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
             patch(
                 "mlx_lm.models.cache.make_prompt_cache",
-                side_effect=fail_if_manual_cache_path_runs,
+                side_effect=record_request_cache,
             ),
         ):
             outputs = [
@@ -2414,11 +2420,12 @@ class TestSimpleEngineConcurrency:
 
         assert outputs[-1].text == "Hello"
         assert captured_prompts == [tokenizer.apply_chat_template.return_value]
-        # The manual system-cache path is skipped -- asserted by
-        # fail_if_manual_cache_path_runs above. encode() is no longer a proxy
+        # The manual system-cache path is skipped: exactly one default request cache and no
+        # bounded/system cache was built. encode() is no longer a proxy
         # for that: the full prompt is now tokenized on every request so
         # usage.prompt_tokens can be reported (it used to be 0 on this route).
         # What must NOT happen is the second, system-prefix encode.
+        assert len(cache_builds) == 1 and cache_builds[0][1].get("max_kv_size") is None
         assert tokenizer.encode.call_count == 1
         assert (
             tokenizer.encode.call_args.args[0]
@@ -3566,3 +3573,71 @@ def test_mlx_language_model_name_fixes_use_identity_not_path():
     assert load.call_args.args[0] == "/models/snapshots/abc123"
     assert load.call_args.kwargs["tokenizer_config"]["eos_token"] == "<|im_end|>"
     assert load.call_args.kwargs["model_id"] == "mlx-community/Qwen3-8B-4bit"
+
+
+@pytest.mark.anyio
+async def test_mllm_text_shared_cache_branch_honors_bounded_kv(monkeypatch):
+    """Retire-capable processors take the shared-cache branch. With --max-kv-size
+    that branch must build a bounded cache and the observed cache must be the
+    cache the path actually built (not an unbounded backbone pre-build)."""
+    from types import SimpleNamespace
+
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    monkeypatch.setenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME", "1")
+    built = []
+    sentinel_cache = []
+
+    def fake_make_prompt_cache(model, *args, **kwargs):
+        built.append(kwargs)
+        return sentinel_cache
+
+    seen_prompt_cache = []
+
+    def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+        seen_prompt_cache.append(kwargs.get("prompt_cache"))
+        yield SimpleNamespace(token=1, text="ok", finish_reason="stop")
+
+    class RetirableProcessor:
+        is_retired = False
+
+        def __call__(self, tokens, logits):
+            return logits
+
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+    tokenizer.bos_token = None
+    tokenizer.eos_token_id = 42
+    tokenizer.encode.return_value = [11]
+
+    text_model = MagicMock()
+    text_model.mtp = None
+
+    engine = SimpleEngine("test-model", force_mllm=True, max_kv_size=7)
+    engine._loaded = True
+    engine._text_model = text_model
+    engine._text_tokenizer = tokenizer
+    observed = []
+    monkeypatch.setattr(
+        engine, "_observe_request_kv_cache", lambda cache: observed.append(cache)
+    )
+
+    with (
+        patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+        patch("mlx_lm.models.cache.make_prompt_cache", side_effect=fake_make_prompt_cache),
+    ):
+        outputs = [
+            chunk
+            async for chunk in engine._stream_generate_text(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=8,
+                temperature=0.0,
+                top_p=1.0,
+                logits_processors=[RetirableProcessor()],
+            )
+        ]
+
+    assert outputs[-1].text == "ok"
+    assert built == [{"max_kv_size": 7}], built
+    assert seen_prompt_cache == [sentinel_cache]
+    assert observed == [sentinel_cache]

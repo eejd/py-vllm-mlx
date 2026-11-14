@@ -28,6 +28,10 @@ from typing import Any
 _in_tracker: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_simple_engine_in_tracker", default=False
 )
+_generation_admission_hook: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "_simple_generation_admission_hook", default=None
+)
+
 
 import mlx.core as mx
 
@@ -213,6 +217,14 @@ class SimpleEngine(BaseEngine):
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(self._model_path)
+        self._untracked_generation_seen = False
+        self._kv_dtype_observation = {
+            "kv_dtype": None,
+            "kv_dtype_source": None,
+            "kv_dtype_reason": "no completed or cancelled text generation observed",
+            "observed_after_generation_requests": 0,
+            "kv_dtype_layers": [],
+        }
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
@@ -488,6 +500,41 @@ class SimpleEngine(BaseEngine):
         for i, saved_state in enumerate(snapshot):
             prompt_cache[i].state = cls._clone_cache_state(saved_state)
 
+    def _observe_request_kv_cache(self, cache: Any) -> None:
+        """Record metadata only; never retain the request's MLX arrays."""
+        if cache is None:
+            return
+        layers = []
+        dtypes = set()
+        complete = bool(cache)
+        for index, entry in enumerate(cache or ()):
+            key = getattr(entry, "keys", None)
+            value = getattr(entry, "values", None)
+            key_dtype = str(key.dtype).split(".")[-1] if hasattr(key, "dtype") else None
+            value_dtype = str(value.dtype).split(".")[-1] if hasattr(value, "dtype") else None
+            layers.append({
+                "layer": index,
+                "cache_class": type(entry).__name__,
+                "key_dtype": key_dtype,
+                "value_dtype": value_dtype,
+            })
+            if key_dtype is None or value_dtype is None:
+                complete = False
+            dtypes.update(dtype for dtype in (key_dtype, value_dtype) if dtype is not None)
+        dtype = next(iter(dtypes)) if complete and len(dtypes) == 1 else None
+        self._kv_dtype_observation = {
+            "kv_dtype": dtype,
+            "kv_dtype_source": "observed-cache-arrays" if dtype is not None else None,
+            "kv_dtype_reason": None if dtype is not None else (
+                "cache arrays have mixed dtypes" if len(dtypes) > 1
+                else "cache key/value arrays unavailable"
+            ),
+            "observed_after_generation_requests": (
+                self._kv_dtype_observation["observed_after_generation_requests"] + 1
+            ),
+            "kv_dtype_layers": layers,
+        }
+
     @staticmethod
     def _iter_cache_state_arrays(value: Any):
         if isinstance(value, (tuple, list)):
@@ -754,6 +801,9 @@ class SimpleEngine(BaseEngine):
             async with self._generation_lock:
                 acquired = True
                 self._generation_waiters -= 1
+                admission_hook = _generation_admission_hook.get()
+                if admission_hook is not None:
+                    admission_hook()
                 yield
         finally:
             if not acquired and self._generation_waiters > 0:
@@ -1334,6 +1384,8 @@ class SimpleEngine(BaseEngine):
         **kwargs,
     ) -> AsyncGenerator[GenerationOutput, None]:
         """Public stream-generate wrapper with request stats tracking."""
+        if _generation_admission_hook.get() is None:
+            self._untracked_generation_seen = True
         tracked_stream = self._track_request_stream(
             self._stream_generate_impl(
                 prompt=prompt,
@@ -1452,6 +1504,35 @@ class SimpleEngine(BaseEngine):
             worker = self._generation_worker()
             iterator = None
             aborted_by_stop = False
+            request_cache = None
+
+            def _make_iterator():
+                nonlocal request_cache
+                self._bind_generation_streams_once()
+                options = dict(kwargs)
+                request_cache = options.get("prompt_cache")
+                if request_cache is None:
+                    try:
+                        from mlx_lm.models.cache import make_prompt_cache
+
+                        model = self._model.model
+                        request_cache = make_prompt_cache(model)
+                        if self._mtp and hasattr(model, "make_mtp_cache"):
+                            request_cache += model.make_mtp_cache()
+                        options["prompt_cache"] = request_cache
+                    except Exception:
+                        logger.debug("Request KV cache unavailable for inspection", exc_info=True)
+                        request_cache = None
+                return self._model.stream_generate(
+                    prompt=prompt, max_tokens=max_tokens, temperature=temperature,
+                    top_p=top_p, stop=stop, **options,
+                )
+
+            def _close_iterator():
+                try:
+                    iterator.close()
+                finally:
+                    self._observe_request_kv_cache(request_cache)
 
             def _next_chunk():
                 self._bind_generation_streams_once()
@@ -1467,14 +1548,7 @@ class SimpleEngine(BaseEngine):
                     completion_tokens = 0
                     finished = False
 
-                    iterator = self._model.stream_generate(
-                        prompt=prompt,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        stop=stop,
-                        **kwargs,
-                    )
+                    iterator = await self._submit_to_generation_worker(worker, _make_iterator)
 
                     while True:
                         if not self._generation_worker_is_live(worker):
@@ -1558,7 +1632,7 @@ class SimpleEngine(BaseEngine):
                     if iterator is not None:
                         try:
                             await self._submit_to_generation_worker(
-                                worker, iterator.close, during_shutdown=True
+                                worker, _close_iterator, during_shutdown=True
                             )
                         except EngineStopped:
                             # The worker is already gone, so no thread is left
@@ -1600,10 +1674,13 @@ class SimpleEngine(BaseEngine):
         Returns:
             GenerationOutput with assistant response
         """
+        if _generation_admission_hook.get() is None:
+            self._untracked_generation_seen = True
         if not self._loaded:
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        bounded_stream = kwargs.pop("_bounded_stream", False)
 
         async def aggregate_stream_chat() -> GenerationOutput:
             final_output = GenerationOutput(text="")
@@ -1634,7 +1711,7 @@ class SimpleEngine(BaseEngine):
         # local models, while the streaming path completes normally. Reuse the
         # streaming implementation and aggregate its final state so both chat
         # APIs share the same tool-capable execution path.
-        if tools and not self._is_mllm:
+        if (tools or bounded_stream) and not self._is_mllm:
             return await aggregate_stream_chat()
 
         # Request-local logits processors (response_format / constrained JSON)
@@ -1722,6 +1799,28 @@ class SimpleEngine(BaseEngine):
         )
         return prompt
 
+    def _render_text_model_prompt(self, messages, tools, chat_template_kwargs, enable_thinking):
+        """Render the text-only route of a loaded multimodal model."""
+        if enable_thinking is None:
+            enable_thinking = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true").lower() in ("true", "1", "yes")
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        template_kwargs.update(chat_template_kwargs)
+        if tools:
+            template_kwargs["tools"] = tools
+        safe_messages = normalize_messages_for_chat_template(messages)
+        try:
+            prompt = self._text_tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+        except TypeError:
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            prompt = self._text_tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+        return prompt, template_kwargs, safe_messages
+
+
     def _render_chat_prompt(
         self,
         messages: list[dict[str, Any]],
@@ -1800,6 +1899,8 @@ class SimpleEngine(BaseEngine):
         **kwargs,
     ) -> AsyncGenerator[GenerationOutput, None]:
         """Public stream-chat wrapper with request stats tracking."""
+        if _generation_admission_hook.get() is None:
+            self._untracked_generation_seen = True
         tracked_stream = self._track_request_stream(
             self._stream_chat_impl(
                 messages=messages,
@@ -2235,8 +2336,17 @@ class SimpleEngine(BaseEngine):
 
             def _emit_error(exc: BaseException) -> None:
                 loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
+            observed_cache = None
+
+            def _run_with_cache_observed() -> None:
+                try:
+                    _run_with_cache()
+                finally:
+                    self._observe_request_kv_cache(observed_cache)
+
 
             def _run_with_cache() -> None:
+                nonlocal observed_cache
                 from mlx_lm import stream_generate as mlx_stream_generate
                 from mlx_lm.models.cache import make_prompt_cache
                 from mlx_lm.sample_utils import make_sampler
@@ -2349,6 +2459,7 @@ class SimpleEngine(BaseEngine):
                     )
                 else:
                     bc = make_prompt_cache(model)
+                observed_cache = bc
 
                 prompt_tokens_for_decode = (
                     prefix_trie_rest_tokens
@@ -2380,7 +2491,7 @@ class SimpleEngine(BaseEngine):
             async def _produce_responses() -> None:
                 try:
                     await self._run_blocking_serialized(
-                        _run_with_cache,
+                        _run_with_cache_observed,
                         on_cancel=abort_event.set,
                     )
                 except asyncio.CancelledError:
@@ -2498,6 +2609,7 @@ class SimpleEngine(BaseEngine):
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
         cancel_requested = Event()
+        observed_cache = None
 
         def _request_cancel() -> None:
             cancel_requested.set()
@@ -2508,15 +2620,19 @@ class SimpleEngine(BaseEngine):
 
         def _run_all():
             try:
-                return _run_specprefill()
-            except _SpecPrefillCancelled:
-                raise
-            except Exception as e:
-                logger.error("SpecPrefill failed, falling back to normal path: %s", e)
-                return _run_normal()
+                try:
+                    return _run_specprefill()
+                except _SpecPrefillCancelled:
+                    raise
+                except Exception as e:
+                    logger.error("SpecPrefill failed, falling back to normal path: %s", e)
+                    return _run_normal()
+            finally:
+                self._observe_request_kv_cache(observed_cache)
 
         def _run_specprefill():
             """Score tokens, sparse prefill, generate autoregressively."""
+            nonlocal observed_cache
             import time
             from types import SimpleNamespace
 
@@ -2532,6 +2648,7 @@ class SimpleEngine(BaseEngine):
             )
 
             cache = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
+            observed_cache = cache
 
             try:
                 # Phase 1: Score with draft model
@@ -2623,6 +2740,14 @@ class SimpleEngine(BaseEngine):
             """Fallback: normal generation without specprefill."""
             from types import SimpleNamespace
 
+            nonlocal observed_cache
+            from mlx_lm.models.cache import make_prompt_cache
+
+            observed_cache = make_prompt_cache(model)
+            if self._mtp and hasattr(model, "make_mtp_cache"):
+                observed_cache += model.make_mtp_cache()
+            options = dict(kwargs)
+            options["prompt_cache"] = observed_cache
             results = []
             for chunk in self._model.stream_generate(
                 prompt=prompt,
@@ -2630,7 +2755,7 @@ class SimpleEngine(BaseEngine):
                 temperature=temperature,
                 top_p=top_p,
                 stop=stop,
-                **kwargs,
+                **options,
             ):
                 _cancel_check()
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
@@ -2720,34 +2845,9 @@ class SimpleEngine(BaseEngine):
         external_logits_processors = kwargs.pop("logits_processors", None)
         abort_event = threading.Event()
 
-        # Per-request enable_thinking override; fall back to env var / default True.
-        enable_thinking = kwargs.pop("enable_thinking", None)
-        if enable_thinking is None:
-            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
-            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
-
-        # Apply chat template for full prompt
-        template_kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-            "enable_thinking": enable_thinking,
-        }
-        template_kwargs.update(chat_template_kwargs)
-        if tools:
-            template_kwargs["tools"] = tools
-        safe_messages = normalize_messages_for_chat_template(messages)
-
-        try:
-            full_prompt = self._text_tokenizer.apply_chat_template(
-                safe_messages, **template_kwargs
-            )
-        except TypeError:
-            # Template doesn't accept tools= or enable_thinking=
-            template_kwargs.pop("tools", None)
-            template_kwargs.pop("enable_thinking", None)
-            full_prompt = self._text_tokenizer.apply_chat_template(
-                safe_messages, **template_kwargs
-            )
+        full_prompt, template_kwargs, safe_messages = self._render_text_model_prompt(
+            messages, tools, chat_template_kwargs, kwargs.pop("enable_thinking", None)
+        )
 
         sampler = make_sampler(
             temp=temperature,
@@ -2992,9 +3092,17 @@ class SimpleEngine(BaseEngine):
                     break
                 _emit_response(resp)
 
+        observed_cache = None
+
+        def _run_all_observed():
+            try:
+                _run_all()
+            finally:
+                self._observe_request_kv_cache(observed_cache)
+
         # Run all Metal ops in a single serialized thread.
         def _run_all():
-            nonlocal backbone_cache, prompt_to_send
+            nonlocal backbone_cache, prompt_to_send, observed_cache
 
             model = self._text_model
             can_retire_processors = _processors_can_retire(all_processors)
@@ -3081,6 +3189,7 @@ class SimpleEngine(BaseEngine):
                     prompt_to_send = full_prompt
 
             # --- Normal path (mlx_lm stream_generate) ---
+            observed_cache = backbone_cache
             prompt_cache = None
             if backbone_cache is not None:
                 # Add MTP cache on top of backbone
@@ -3107,6 +3216,7 @@ class SimpleEngine(BaseEngine):
                     shared_cache = make_prompt_cache(
                         model, max_kv_size=self._max_kv_size or None
                     )
+                observed_cache = shared_cache
                 gen_kwargs["prompt_cache"] = shared_cache
 
                 token_count = 0
@@ -3146,6 +3256,11 @@ class SimpleEngine(BaseEngine):
                         max_tokens - token_count,
                     )
             else:
+                if gen_kwargs.get("prompt_cache") is None and not use_mtp:
+                    # mlx_lm would build this same unbounded default cache itself; building it
+                    # here keeps the semantics and makes the real KV arrays observable.
+                    observed_cache = make_prompt_cache(model)
+                    gen_kwargs["prompt_cache"] = observed_cache
                 for resp in mlx_stream_generate(
                     model,
                     self._text_tokenizer,
@@ -3171,9 +3286,11 @@ class SimpleEngine(BaseEngine):
                 sparse_prefill,
             )
 
+            nonlocal observed_cache
             # Create backbone cache if not already from system KV
             if bc is None:
                 bc = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
+            observed_cache = bc
 
             try:
                 # Phase 1: Score with draft model
@@ -3339,7 +3456,7 @@ class SimpleEngine(BaseEngine):
         async def _produce_responses() -> None:
             try:
                 await self._run_blocking_serialized(
-                    _run_all,
+                    _run_all_observed,
                     on_cancel=abort_event.set,
                 )
             except asyncio.CancelledError:
