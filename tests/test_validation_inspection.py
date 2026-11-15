@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression coverage for admission request decoding behavior."""
 import asyncio
+import json
 
 from types import SimpleNamespace
 
@@ -293,14 +294,17 @@ def _native_inspection_fixture(monkeypatch):
     import vllm_mlx.server as server
 
     class Tokenizer:
+        """Renders a prompt that depends on messages, tools and template kwargs."""
+
         chat_template = "{{ messages }}"
         bos_token = None
 
         def apply_chat_template(self, messages, **kwargs):
-            return "rendered prompt"
+            settings = {k: v for k, v in kwargs.items() if k not in {"tokenize", "add_generation_prompt"}}
+            return json.dumps({"messages": messages, "settings": settings}, sort_keys=True, default=str)
 
         def encode(self, prompt, add_special_tokens=True):
-            return list(range(10))
+            return list(range(len(prompt.split())))
 
     class FixtureEngine(SimpleEngine):
         def __init__(self):
@@ -324,11 +328,32 @@ def _native_inspection_fixture(monkeypatch):
     return engine, TestClient(server.app), server
 
 
+_MESSAGES_HELLO = [{"role": "user", "content": "hello"}]
+_TOOL = {
+    "name": "lookup",
+    "description": "Look up a value by key.",
+    "input_schema": {"type": "object", "properties": {"key": {"type": "string"}}},
+}
+
+
 @pytest.mark.parametrize(
     ("route", "path", "body"),
     [
         ("responses", "/v1/responses", {"model": "fixture", "input": "hello", "max_output_tokens": 7}),
-        ("messages", "/v1/messages", {"model": "fixture", "max_tokens": 7, "messages": [{"role": "user", "content": "hello"}]}),
+        ("responses", "/v1/responses", {"model": "fixture", "input": "hello", "max_output_tokens": 7,
+                                        "instructions": "Be brief.",
+                                        "chat_template_kwargs": {"enable_thinking": False}}),
+        ("messages", "/v1/messages", {"model": "fixture", "max_tokens": 7, "messages": _MESSAGES_HELLO}),
+        ("messages", "/v1/messages", {"model": "fixture", "max_tokens": 7, "system": "Be brief.",
+                                      "messages": _MESSAGES_HELLO}),
+        ("messages", "/v1/messages", {"model": "fixture", "max_tokens": 7, "messages": _MESSAGES_HELLO,
+                                      "tools": [_TOOL]}),
+        ("messages", "/v1/messages", {"model": "fixture", "max_tokens": 7, "messages": _MESSAGES_HELLO,
+                                      "chat_template_kwargs": {"enable_thinking": False}}),
+        ("messages", "/v1/messages", {"model": "fixture", "max_tokens": 7, "messages": _MESSAGES_HELLO,
+                                      "tools": []}),
+        ("messages", "/v1/messages", {"model": "fixture", "max_tokens": 7, "messages": _MESSAGES_HELLO,
+                                      "tools": None}),
     ],
 )
 def test_native_inspection_counts_exactly_what_enforcement_counts(monkeypatch, route, path, body):
@@ -338,10 +363,11 @@ def test_native_inspection_counts_exactly_what_enforcement_counts(monkeypatch, r
     assert inspection.status_code == 200
     rendering = inspection.json()["rendering"]
     prompt = rendering["rendered_prompt_tokens"]
-    assert prompt == 10
+    assert isinstance(prompt, int) and prompt > 0
     assert rendering["output_tokens"] == 7
     assert rendering["total_tokens"] == prompt + 7
     assert rendering["unknown_reason"] is None
+    assert inspection.json()["template"]["kwargs"] == (body.get("chat_template_kwargs") or {})
     assert client.post("/v1/inspection", json={}).json()["generation"]["accepted_generation_requests"] == before
 
     monkeypatch.setattr(server, "_max_context_tokens", prompt + 7)

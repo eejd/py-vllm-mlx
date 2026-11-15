@@ -4691,7 +4691,11 @@ async def inspect_serving(request: InspectionRequest):
     template = getattr(tokenizer, "chat_template", None)
     if not isinstance(template, str) or getattr(engine, "use_harmony_rendering", False):
         template = None
-    kwargs = _resolve_chat_template_kwargs(request.chat_template_kwargs, request.reasoning_effort)
+    native = request.route != "chat"
+    native_body = request.body or {}
+    req_chat_template_kwargs = native_body.get("chat_template_kwargs") if native else request.chat_template_kwargs
+    # Native routes resolve kwargs exactly as their generation handlers do: request kwargs only, no effort.
+    kwargs = _resolve_chat_template_kwargs(req_chat_template_kwargs, None if native else request.reasoning_effort)
     tool_parser = None
     if _enable_auto_tool_choice and _tool_call_parser:
         try:
@@ -4704,10 +4708,7 @@ async def inspect_serving(request: InspectionRequest):
     effective_kwargs = None
     reasoning = {"enable_thinking": None, "source": None, "reason": "selected template settings unavailable"}
     has_actual_request = request.messages is not None
-    native = request.route != "chat"
-    native_body = request.body or {}
-    req_chat_template_kwargs = native_body.get("chat_template_kwargs") if native else request.chat_template_kwargs
-    req_enable_thinking = native_body.get("enable_thinking") if native else request.enable_thinking
+    req_enable_thinking = None if native else request.enable_thinking
     try:
         if template is None:
             raise ValueError("selected template rendering unavailable")
@@ -4716,7 +4717,8 @@ async def inspect_serving(request: InspectionRequest):
         if native and request.body is None:
             raise ValueError("native request body required")
         if native:
-            tools_present = "tools" in native_body
+            # Empty or null tools carry no template settings; only non-empty tools count as actual tools.
+            tools_present = False
             has_tools = bool(native_body.get("tools"))
         else:
             tools_present = request.tools_present
