@@ -44,9 +44,28 @@ class GenerationOutput:
 
 
 class EngineBusy(RuntimeError):
-    """Raised when a serialized engine route is already serving a request."""
+    """Raised when a serialized engine route cannot admit a request now.
+
+    Retryable: the HTTP layer maps it to 503 with ``Retry-After``.
+    """
 
     code = "text_generation_busy"
+
+    def __init__(self, message: str = "", *, retry_after_s: int = 1):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
+class EngineQueueFull(EngineBusy):
+    """The bounded admission queue already holds its maximum waiters."""
+
+    code = "text_generation_queue_full"
+
+
+class EngineQueueTimeout(EngineBusy):
+    """A queued request waited longer than the configured queue timeout."""
+
+    code = "text_generation_queue_timeout"
 
 
 class EngineStopped(RuntimeError):

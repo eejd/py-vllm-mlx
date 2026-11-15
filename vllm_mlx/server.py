@@ -59,7 +59,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.routing import Match
@@ -1442,15 +1442,105 @@ def _anthropic_sse_error_frame(exc: Exception) -> str:
     return f"event: error\ndata: {json.dumps(data)}\n\n"
 
 
+def _engine_busy_detail(exc: EngineBusy) -> dict[str, str]:
+    return {"error": exc.code, "message": str(exc)}
+
+
 def _raise_engine_busy(exc: EngineBusy) -> None:
     """Translate serialized-engine admission failures into retryable HTTP 503."""
     raise HTTPException(
         status_code=503,
-        detail={
-            "error": exc.code,
-            "message": str(exc),
-        },
+        detail=_engine_busy_detail(exc),
+        headers={"Retry-After": str(exc.retry_after_s)},
     ) from exc
+
+
+async def _engine_busy_exception_handler(request, exc: EngineBusy):
+    """Uncaught admission failures (non-stream responses/messages) are 503, not 500."""
+    return JSONResponse(
+        status_code=503,
+        content={"detail": _engine_busy_detail(exc)},
+        headers={"Retry-After": str(exc.retry_after_s)},
+    )
+
+
+class _StreamPreamble(str):
+    """SSE frame a stream emits before it reaches engine admission.
+
+    Preamble frames are buffered by ``_prime_streaming_body`` so that the
+    first engine-derived frame (which is only produced once the serialized
+    generation slot is acquired) is pulled before HTTP headers are committed.
+    """
+
+
+async def _chain_primed_stream(
+    buffered: list[str],
+    generator: AsyncIterator[str],
+    error: BaseException | None = None,
+):
+    try:
+        for chunk in buffered:
+            yield chunk
+        if error is not None:
+            raise error
+        async for chunk in generator:
+            yield chunk
+    finally:
+        await generator.aclose()
+
+
+async def _prime_streaming_body(
+    generator: AsyncIterator[str],
+    raw_request: Request,
+    total_timeout: float,
+    deadline: float,
+) -> AsyncIterator[str] | None:
+    """Admit a stream before its HTTP headers are committed.
+
+    Pulls preamble frames plus the first engine-derived frame while the client
+    is still waiting, so admission failures (EngineBusy while queued or
+    fail-fast rejected) become HTTP 503 with Retry-After instead of a 200 stream
+    that errors. A client that disconnects while queued cancels the admission
+    wait. Returns None on disconnect; the caller answers 499.
+    """
+
+    async def _first():
+        buffered: list[str] = []
+        try:
+            while True:
+                item = await generator.__anext__()
+                buffered.append(item)
+                if not isinstance(item, _StreamPreamble):
+                    return buffered, None
+        except StopAsyncIteration:
+            return buffered, None
+        except EngineBusy:
+            raise
+        except Exception as exc:
+            # Non-admission failures keep the mid-stream error-frame contract.
+            return buffered, exc
+
+    remaining = (
+        total_timeout
+        if deadline is None
+        else _remaining_request_timeout(total_timeout, deadline)
+    )
+    try:
+        primed = await _wait_with_disconnect(
+            _first(),
+            raw_request,
+            timeout=remaining,
+            timeout_detail_seconds=total_timeout,
+        )
+    except EngineBusy as exc:
+        _raise_engine_busy(exc)
+    if primed is None:
+        await generator.aclose()
+        return None
+    buffered, error = primed
+    if not buffered and error is None:
+        return generator
+    return _chain_primed_stream(buffered, generator, error)
 
 
 @dataclass
@@ -2195,6 +2285,8 @@ app = FastAPI(
     version="0.4.1",
     lifespan=lifespan,
 )
+
+app.add_exception_handler(EngineBusy, _engine_busy_exception_handler)
 
 security = HTTPBearer(auto_error=False)
 
@@ -3290,14 +3382,18 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     base_response.status = "in_progress"
     base_response.usage = None
 
-    yield _responses_sse_event(
-        "response.created",
-        ResponseCreatedEvent(sequence_number=sequence, response=base_response),
+    yield _StreamPreamble(
+        _responses_sse_event(
+            "response.created",
+            ResponseCreatedEvent(sequence_number=sequence, response=base_response),
+        )
     )
     sequence += 1
-    yield _responses_sse_event(
-        "response.in_progress",
-        ResponseInProgressEvent(sequence_number=sequence, response=base_response),
+    yield _StreamPreamble(
+        _responses_sse_event(
+            "response.in_progress",
+            ResponseInProgressEvent(sequence_number=sequence, response=base_response),
+        )
     )
     sequence += 1
 
@@ -5645,9 +5741,14 @@ async def _build_chat_streaming_response(
             return Response(status_code=499), True
         return StreamingResponse(iter(chunks), media_type="text/event-stream"), True
 
+    primed = await _prime_streaming_body(
+        stream_generator, raw_request, total_timeout, deadline
+    )
+    if primed is None:
+        return Response(status_code=499), True
     response = StreamingResponse(
         _disconnect_guard(
-            _ensure_sse_terminal(stream_generator, "data: [DONE]\n\n"),
+            _ensure_sse_terminal(primed, "data: [DONE]\n\n"),
             raw_request,
             cleanup=_make_release_cleanup(raw_request),
             timeout=total_timeout,
@@ -6179,19 +6280,24 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             tracker.finish(result="client_error")
             raise HTTPException(status_code=400, detail="bounded text completions unavailable")
         if request.stream:
+            primed = await _prime_streaming_body(
+                stream_completion(
+                    engine,
+                    prompts[0],
+                    request,
+                    effective_max_tokens,
+                    repetition_penalty=comp_rep_penalty,
+                    metrics_tracker=tracker,
+                ),
+                raw_request,
+                total_timeout,
+                deadline,
+            )
+            if primed is None:
+                return Response(status_code=499)
             response = StreamingResponse(
                 _disconnect_guard(
-                    _ensure_sse_terminal(
-                        stream_completion(
-                            engine,
-                            prompts[0],
-                            request,
-                            effective_max_tokens,
-                            repetition_penalty=comp_rep_penalty,
-                            metrics_tracker=tracker,
-                        ),
-                        "data: [DONE]\n\n",
-                    ),
+                    _ensure_sse_terminal(primed, "data: [DONE]\n\n"),
                     raw_request,
                     cleanup=_make_release_cleanup(raw_request),
                     timeout=total_timeout,
@@ -6592,8 +6698,14 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             _validate_remote_media_urls(chat_request.messages)
             engine, _, messages, chat_kwargs = _prepare_streaming_responses_request(request)
             await _enforce_stream_context(engine, "responses", messages, chat_kwargs)
+            total_timeout, deadline = _start_request_budget(None)
+            primed = await _prime_streaming_body(
+                _stream_responses_request(request), raw_request, total_timeout, deadline
+            )
+            if primed is None:
+                return Response(status_code=499)
             return StreamingResponse(
-                _disconnect_guard(_stream_responses_request(request), raw_request),
+                _disconnect_guard(primed, raw_request),
                 media_type="text/event-stream",
             )
 
@@ -6834,16 +6946,24 @@ async def create_anthropic_message(
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             )
+            primed = await _prime_streaming_body(
+                _stream_anthropic_messages(
+                    engine,
+                    openai_request,
+                    anthropic_request,
+                    prepared,
+                    metrics_tracker=tracker,
+                ),
+                request,
+                total_timeout,
+                deadline,
+            )
+            if primed is None:
+                return Response(status_code=499)
             response = StreamingResponse(
                 _disconnect_guard(
                     _ensure_sse_terminal(
-                        _stream_anthropic_messages(
-                            engine,
-                            openai_request,
-                            anthropic_request,
-                            prepared,
-                            metrics_tracker=tracker,
-                        ),
+                        primed,
                         anthropic_terminal,
                         _anthropic_sse_error_frame,
                     ),
@@ -7168,7 +7288,7 @@ async def _stream_anthropic_messages(
             },
         },
     }
-    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+    yield _StreamPreamble(f"event: message_start\ndata: {json.dumps(message_start)}\n\n")
 
     reasoning_parser = _prepare_streaming_reasoning_parser(
         engine,
@@ -7198,7 +7318,7 @@ async def _stream_anthropic_messages(
 
     if not use_reasoning:
         # No reasoning parser — start text block immediately
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        yield _StreamPreamble(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n")
         text_block_started = True
 
     # Stream content deltas
@@ -7593,7 +7713,7 @@ async def stream_chat_completion(
             )
         ],
     )
-    yield f"data: {first_chunk.model_dump_json()}\n\n"
+    yield _StreamPreamble(f"data: {first_chunk.model_dump_json()}\n\n")
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block

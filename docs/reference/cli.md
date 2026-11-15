@@ -45,6 +45,8 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--prefix-trie-cache-size` | Maximum SimpleEngine prompt-trie entries | 32 |
 | `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 | `--max-tokens` | Default max tokens | 32768 |
+| `--max-queued-requests` | SimpleEngine (non-continuous-batching) only. Opt in to bounded FIFO waiting for the single serialized generation slot: up to N requests wait; further requests get HTTP 503 with `Retry-After` (`text_generation_queue_full`). Unset keeps fail-fast: a request arriving while the slot is busy gets HTTP 503 immediately (`text_generation_busy`). | Unset (fail-fast) |
+| `--queue-timeout-s` | Maximum seconds a queued request waits for the slot; expiry returns HTTP 503 with `Retry-After` (`text_generation_queue_timeout`). Requires `--max-queued-requests`. | None (wait until request timeout) |
 | `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--stream-interval` | Tokens per stream chunk | 1 |
 | `--mcp-config` | Path to MCP config file | None |

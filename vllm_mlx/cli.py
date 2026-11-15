@@ -21,6 +21,7 @@ from .cli_arg_types import (
     make_json_object_arg_parser,
     make_positive_int_arg_parser,
     memory_budget_gb_arg,
+    parse_positive_finite_float,
 )
 from .tool_parsers import ToolParserManager
 
@@ -134,6 +135,19 @@ def serve_command(args):
     server._metrics.configure(enabled=args.enable_metrics)
     server._max_request_tokens = max_request_tokens
     server._max_context_tokens = getattr(args, "max_context_tokens", None)
+    max_queued_requests = getattr(args, "max_queued_requests", None)
+    queue_timeout_s = getattr(args, "queue_timeout_s", None)
+    if queue_timeout_s is not None and max_queued_requests is None:
+        print("Error: --queue-timeout-s requires --max-queued-requests")
+        sys.exit(1)
+    if max_queued_requests is not None:
+        # SimpleEngine reads its admission policy from these variables at init.
+        os.environ["VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION"] = "queue"
+        os.environ["VLLM_MLX_SIMPLE_ENGINE_MAX_QUEUED_REQUESTS"] = str(
+            max_queued_requests
+        )
+        if queue_timeout_s is not None:
+            os.environ["VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S"] = repr(queue_timeout_s)
     server._embedding_max_length = args.embedding_max_length
     server._embedding_overflow_policy = args.embedding_overflow_policy
     if args.rate_limit > 0:
@@ -1323,6 +1337,26 @@ Examples:
         type=make_positive_int_arg_parser("--max-context-tokens"),
         default=None,
         help="Maximum rendered prompt plus requested output tokens",
+    )
+    serve_parser.add_argument(
+        "--max-queued-requests",
+        type=make_positive_int_arg_parser("--max-queued-requests"),
+        default=None,
+        help=(
+            "SimpleEngine only: queue up to N generation requests FIFO behind the "
+            "active one instead of answering 503 immediately. Overflow returns "
+            "503 with Retry-After. Default: fail fast (no queue)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--queue-timeout-s",
+        type=lambda value: parse_positive_finite_float(value, "--queue-timeout-s"),
+        default=None,
+        help=(
+            "With --max-queued-requests: longest a request may wait in the queue "
+            "before a 503 with Retry-After (default: wait until admitted or the "
+            "request timeout)"
+        ),
     )
     serve_parser.add_argument(
         "--continuous-batching",
