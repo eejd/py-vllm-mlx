@@ -30,6 +30,7 @@ class GenerationOutput:
     text: str
     tokens: list[int]
     finish_reason: str | None = None
+    prompt_tokens: int = 0
 
 
 @dataclass
@@ -278,6 +279,7 @@ class MLXLanguageModel:
             text=output_text,
             tokens=tokens,
             finish_reason=finish_reason,
+            prompt_tokens=len(prompt_ids),
         )
 
     def stream_generate(
