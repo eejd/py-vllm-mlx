@@ -541,9 +541,12 @@ class PreparedChatInvocation:
 def _prepare_chat_messages(
     engine: BaseEngine,
     request_messages: list[Message | dict],
+    *,
+    validate_remote_media: bool = True,
 ) -> tuple[list[dict], list, list, list, bool]:
     """Normalize messages and collect media once for both stream/non-stream paths."""
-    _validate_remote_media_urls(request_messages)
+    if validate_remote_media:
+        _validate_remote_media_urls(request_messages)
 
     is_mllm = bool(getattr(engine, "is_mllm", False))
     preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
@@ -3269,14 +3272,11 @@ def _prepare_responses_request(
             f"tools={len(request.tools)}"
         )
 
-    if validate_remote_media:
-        _validate_remote_media_urls(chat_request.messages)
-
-    messages, images, videos, audios = extract_multimodal_content(
+    messages, images, videos, _audios, _has_media = _prepare_chat_messages(
+        engine,
         chat_request.messages,
-        preserve_native_format=engine.preserve_native_tool_format,
+        validate_remote_media=validate_remote_media,
     )
-    messages = canonicalize_system_messages(messages)
 
     chat_kwargs = {
         "max_tokens": chat_request.max_tokens or _default_max_tokens,

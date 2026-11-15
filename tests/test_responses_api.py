@@ -59,6 +59,8 @@ def _mock_engine(*outputs):
     engine = MagicMock()
     engine.model_name = "test-model"
     engine.preserve_native_tool_format = False
+    engine.is_mllm = False
+    engine.use_harmony_rendering = False
     engine.chat = AsyncMock(side_effect=list(outputs))
     stream_calls = []
 
@@ -504,6 +506,47 @@ class TestResponsesEndpoint:
         assert messages[2]["role"] == "user"
         assert "[Tool Result (call_1)]" in messages[2]["content"]
         assert "/tmp/work" in messages[2]["content"]
+
+    @pytest.mark.parametrize(
+        "is_mllm,native", [(True, False), (False, True)], ids=["mllm", "native-flag"]
+    )
+    def test_function_call_history_is_structured_on_native_engines(
+        self, client, is_mllm, native
+    ):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("Done"))
+        engine.is_mllm = is_mllm
+        engine.preserve_native_tool_format = native
+        srv._engine = engine
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [
+                    {"type": "message", "role": "user", "content": "Run it"},
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "shell",
+                        "arguments": '{"cmd":"pwd"}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "/tmp/work",
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        messages = engine.chat.call_args.kwargs["messages"]
+        assert messages[1]["tool_calls"][0]["function"]["name"] == "shell"
+        assert messages[2]["role"] == "tool"
+        assert messages[2]["tool_call_id"] == "call_1"
+        assert not any("[Calling tool:" in str(m.get("content")) for m in messages)
 
     def test_unsupported_tools_and_items_do_not_fail(self, client):
         import vllm_mlx.server as srv
