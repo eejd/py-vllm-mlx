@@ -55,6 +55,7 @@ import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
+from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -4621,6 +4622,7 @@ class InspectionRequest(BaseModel):
     tools: list[dict] | None = None
     max_tokens: int | None = None
     enable_thinking: bool | None = None
+    body: dict[str, Any] | None = None
 
 
 def _parser_source(parser):
@@ -4689,7 +4691,11 @@ async def inspect_serving(request: InspectionRequest):
     template = getattr(tokenizer, "chat_template", None)
     if not isinstance(template, str) or getattr(engine, "use_harmony_rendering", False):
         template = None
-    kwargs = _resolve_chat_template_kwargs(request.chat_template_kwargs, request.reasoning_effort)
+    native = request.route != "chat"
+    native_body = request.body or {}
+    req_chat_template_kwargs = native_body.get("chat_template_kwargs") if native else request.chat_template_kwargs
+    # Native routes resolve kwargs exactly as their generation handlers do: request kwargs only, no effort.
+    kwargs = _resolve_chat_template_kwargs(req_chat_template_kwargs, None if native else request.reasoning_effort)
     tool_parser = None
     if _enable_auto_tool_choice and _tool_call_parser:
         try:
@@ -4702,44 +4708,70 @@ async def inspect_serving(request: InspectionRequest):
     effective_kwargs = None
     reasoning = {"enable_thinking": None, "source": None, "reason": "selected template settings unavailable"}
     has_actual_request = request.messages is not None
+    req_enable_thinking = None if native else request.enable_thinking
     try:
-        if request.route != "chat" or template is None:
+        if template is None:
             raise ValueError("selected template rendering unavailable")
-        if request.tools_present and not request.tools:
+        if request.route not in ("chat", "responses", "messages"):
+            raise ValueError("unsupported inspection route")
+        if native and request.body is None:
+            raise ValueError("native request body required")
+        if native:
+            # Empty or null tools carry no template settings; only non-empty tools count as actual tools.
+            tools_present = False
+            has_tools = bool(native_body.get("tools"))
+        else:
+            tools_present = request.tools_present
+            has_tools = bool(request.tools)
+        if tools_present and not has_tools:
             raise ValueError("actual tools required to establish template settings")
-        if not engine._is_mllm and _max_context_tokens is None and not request.tools:
+        if not engine._is_mllm and _max_context_tokens is None and not has_tools:
             raise ValueError("unbounded simple-text streaming and blocking renderers differ")
-        output = _resolve_request_max_tokens(request.max_tokens)
-        chat_request = ChatCompletionRequest(
-            model=_model_name or "",
-            messages=request.messages if has_actual_request else [{"role": "user", "content": "inspection"}],
-            tools=request.tools, max_tokens=output,
-            chat_template_kwargs=request.chat_template_kwargs,
-            reasoning_effort=request.reasoning_effort,
-            enable_thinking=request.enable_thinking,
-        )
-        prepared = _prepare_chat_completion_invocation(engine, chat_request, output)
+        if request.route == "chat":
+            output = _resolve_request_max_tokens(request.max_tokens)
+            chat_request = ChatCompletionRequest(
+                model=_model_name or "",
+                messages=request.messages if has_actual_request else [{"role": "user", "content": "inspection"}],
+                tools=request.tools, max_tokens=output,
+                chat_template_kwargs=request.chat_template_kwargs,
+                reasoning_effort=request.reasoning_effort,
+                enable_thinking=request.enable_thinking,
+            )
+            prepared = _prepare_chat_completion_invocation(engine, chat_request, output)
+            prepared_messages, prepared_kwargs = prepared.messages, prepared.chat_kwargs
+        elif request.route == "responses":
+            responses_request = ResponsesRequest.model_validate(request.body)
+            _, _chat_request, prepared_messages, prepared_kwargs = _prepare_responses_request(
+                responses_request, validate_remote_media=False
+            )
+            output = prepared_kwargs["max_tokens"]
+        else:
+            anthropic_request = AnthropicRequest.model_validate(request.body)
+            openai_request = anthropic_to_openai(anthropic_request)
+            output = _resolve_request_max_tokens(anthropic_request.max_tokens)
+            prepared = _prepare_anthropic_endpoint_invocation(engine, openai_request, output)
+            prepared_messages, prepared_kwargs = prepared.messages, prepared.chat_kwargs
         count, effective_kwargs = await _render_inspection_prompt(
-            engine, prepared.messages, prepared.chat_kwargs, with_settings=True
+            engine, prepared_messages, prepared_kwargs, with_settings=True
         )
-        if has_actual_request:
+        if has_actual_request or native:
             rendered, output_tokens = count, output
         if effective_kwargs is None or "enable_thinking" not in effective_kwargs:
             reasoning["reason"] = "effective enable_thinking was not applied by the renderer"
         elif type(effective_kwargs["enable_thinking"]) is not bool:
             reasoning["reason"] = "effective enable_thinking is not a boolean"
         else:
-            if "enable_thinking" in (request.chat_template_kwargs or {}):
+            if "enable_thinking" in (req_chat_template_kwargs or {}):
                 source = "request"
             elif "enable_thinking" in (_default_chat_template_kwargs or {}):
                 source = "server-default"
-            elif request.enable_thinking is not None or "enable_thinking" in prepared.chat_kwargs:
+            elif req_enable_thinking is not None or "enable_thinking" in prepared_kwargs:
                 source = "request"
             else:
                 source = "engine-default"
             reasoning = {"enable_thinking": effective_kwargs["enable_thinking"], "source": source, "reason": None}
     except Exception:
-        if has_actual_request:
+        if has_actual_request or native:
             render_error = "request rendering unavailable"
     with _inspection_lock:
         accepted = _generation_accepted
