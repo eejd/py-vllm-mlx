@@ -10,6 +10,7 @@ import asyncio
 import contextvars
 import hashlib
 import logging
+import math
 import os
 import threading
 import time
@@ -40,6 +41,8 @@ from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from .base import (
     BaseEngine,
     EngineBusy,
+    EngineQueueFull,
+    EngineQueueTimeout,
     EngineStopped,
     GenerationOutput,
     cleanup_startup_cancellation,
@@ -57,6 +60,33 @@ from ..mlx_streams import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, raw, default)
+        return default
+    return max(0, value)
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; ignoring", name, raw)
+        return None
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("Invalid %s=%r; ignoring", name, raw)
+        return None
+    return value
 
 
 def _bind_worker_generation_streams(stream: object | None = None) -> object:
@@ -283,22 +313,35 @@ class SimpleEngine(BaseEngine):
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
-        # NOTE: "fail_fast" rejects whenever the lock is held. That used to be
-        # rare for streaming requests by accident — generation ran on the event
-        # loop, so a second request could not reach this check until the first
-        # had finished. Now that generation has its own thread the loop stays
-        # responsive and genuinely concurrent requests reach it, so operators
-        # who prefer queuing to 503s want
-        # VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait.
+        # Admission policies:
+        #   fail_fast: reject with EngineBusy (HTTP 503) whenever the lock is held.
+        #   queue:     FIFO-wait for the lock with at most
+        #              VLLM_MLX_SIMPLE_ENGINE_MAX_QUEUED_REQUESTS waiters and an
+        #              optional VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S wait bound.
+        #              Overflow is EngineQueueFull; timeout is EngineQueueTimeout.
+        #   wait:      legacy unbounded FIFO wait.
+        # Default is fail_fast. `--max-queued-requests` selects queue.
         self._generation_lock_admission = (
             os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "fail_fast")
             .strip()
             .lower()
         )
-        if self._generation_lock_admission not in {"fail_fast", "wait"}:
+        if self._generation_lock_admission not in {"fail_fast", "wait", "queue"}:
             logger.warning(
                 "Invalid VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=%r; using fail_fast",
                 self._generation_lock_admission,
+            )
+            self._generation_lock_admission = "fail_fast"
+        self._generation_queue_limit = _env_int(
+            "VLLM_MLX_SIMPLE_ENGINE_MAX_QUEUED_REQUESTS", 0
+        )
+        self._generation_queue_timeout_s = _env_float(
+            "VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S"
+        )
+        if self._generation_lock_admission == "queue" and self._generation_queue_limit < 1:
+            logger.warning(
+                "VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=queue requires "
+                "VLLM_MLX_SIMPLE_ENGINE_MAX_QUEUED_REQUESTS >= 1; using fail_fast"
             )
             self._generation_lock_admission = "fail_fast"
         self._generation_waiters = 0
@@ -781,11 +824,14 @@ class SimpleEngine(BaseEngine):
 
     @asynccontextmanager
     async def _acquire_generation_slot(self, request_id: str):
-        """Admission control for SimpleEngine's serialized MLX route."""
-        if (
-            self._generation_lock_admission == "fail_fast"
-            and self._generation_lock.locked()
-        ):
+        """Admission control for SimpleEngine's serialized MLX route.
+
+        Queued waiters are woken by asyncio.Lock in FIFO order. A waiter that is
+        cancelled (client disconnect or request timeout) leaves the queue before
+        it ever runs its body, so dropped requests never touch MLX.
+        """
+        locked = self._generation_lock.locked()
+        if self._generation_lock_admission == "fail_fast" and locked:
             self._generation_busy_rejections += 1
             raise EngineBusy(
                 "SimpleEngine serialized route is busy; "
@@ -794,19 +840,56 @@ class SimpleEngine(BaseEngine):
                 f"waiters={self._generation_waiters}; "
                 "retry later"
             )
+        if (
+            self._generation_lock_admission == "queue"
+            and locked
+            and self._generation_waiters >= self._generation_queue_limit
+        ):
+            self._generation_busy_rejections += 1
+            raise EngineQueueFull(
+                "SimpleEngine generation queue is full; "
+                f"request_id={request_id}; "
+                f"active={self._generation_lock_holder_summary()}; "
+                f"waiters={self._generation_waiters}; "
+                f"max_queued_requests={self._generation_queue_limit}; "
+                "retry later"
+            )
 
         self._generation_waiters += 1
         acquired = False
         try:
-            async with self._generation_lock:
-                acquired = True
-                self._generation_waiters -= 1
-                admission_hook = _generation_admission_hook.get()
-                if admission_hook is not None:
-                    admission_hook()
-                yield
+            if (
+                self._generation_lock_admission == "queue"
+                and self._generation_queue_timeout_s is not None
+            ):
+                try:
+                    await asyncio.wait_for(
+                        self._generation_lock.acquire(),
+                        timeout=self._generation_queue_timeout_s,
+                    )
+                except TimeoutError as exc:
+                    self._generation_busy_rejections += 1
+                    raise EngineQueueTimeout(
+                        "SimpleEngine generation queue wait timed out; "
+                        f"request_id={request_id}; "
+                        f"queue_timeout_s={self._generation_queue_timeout_s}; "
+                        "retry later",
+                        retry_after_s=max(
+                            1, math.ceil(self._generation_queue_timeout_s)
+                        ),
+                    ) from exc
+            else:
+                await self._generation_lock.acquire()
+            acquired = True
+            self._generation_waiters -= 1
+            admission_hook = _generation_admission_hook.get()
+            if admission_hook is not None:
+                admission_hook()
+            yield
         finally:
-            if not acquired and self._generation_waiters > 0:
+            if acquired:
+                self._generation_lock.release()
+            elif self._generation_waiters > 0:
                 self._generation_waiters -= 1
 
     def _bind_generation_streams_once(self) -> None:
