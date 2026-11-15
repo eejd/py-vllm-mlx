@@ -276,6 +276,46 @@ def test_llm_chat_applies_chat_template_kwargs_before_generate():
 
 
 @pytest.mark.anyio
+async def test_simple_blocking_chat_counts_the_prompt_actually_generated(monkeypatch):
+    from vllm_mlx.engine.simple import SimpleEngine
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, tokenize=False, **kwargs):
+            prompt = "plain" if kwargs.get("enable_thinking", True) else "plain think"
+            return prompt.split() if tokenize else prompt
+
+        def encode(self, text, add_special_tokens=False):
+            return text.split()
+
+    model = MLXLanguageModel.__new__(MLXLanguageModel)
+    model._loaded = True
+    model.tokenizer = Tokenizer()
+    model.model = object()
+    model._create_sampler = lambda *args: None
+    model._create_logits_processors = lambda *args: []
+    model._generation_tokenizer = lambda *args: model.tokenizer
+    seen = []
+
+    def generate(_model, _tokenizer, *, prompt, **kwargs):
+        seen.append(prompt)
+        yield SimpleNamespace(text="ok", token=1, finish_reason="stop")
+
+    monkeypatch.setattr("mlx_lm.stream_generate", generate)
+    with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        engine = SimpleEngine("test-model")
+    engine._loaded = True
+    engine._model = model
+    engine._prefix_trie_cache_enabled = False
+    result = await engine.chat(
+        [{"role": "user", "content": "hello"}],
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    assert seen == [["plain", "think"]]
+    assert result.prompt_tokens == len(seen[0]) == 2
+
+
+@pytest.mark.anyio
 async def test_simple_engine_mllm_chat_forwards_chat_template_kwargs():
     from vllm_mlx.engine.simple import SimpleEngine
 
