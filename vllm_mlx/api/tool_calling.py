@@ -195,7 +195,7 @@ def parse_tool_calls(
 
     for name, args_str in bracket_matches:
         try:
-            arguments = json.loads(args_str)
+            arguments = json.loads(args_str, strict=False)
             tool_calls.append(
                 ToolCall(
                     id=f"call_{uuid.uuid4().hex[:8]}",
@@ -294,7 +294,7 @@ def parse_tool_calls(
 
     for name, args_str in llama_matches:
         try:
-            arguments = json.loads(args_str)
+            arguments = json.loads(args_str, strict=False)
             tool_calls.append(
                 ToolCall(
                     id=f"call_{uuid.uuid4().hex[:8]}",
