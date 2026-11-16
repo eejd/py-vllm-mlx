@@ -420,6 +420,42 @@ class TestMemoryAwarePrefixCache:
         assert cache.reserve_grid([1, 2], mock_kv_cache(1000), 2) is None
         assert cache._reserved_memory == 0
 
+    def test_grid_collision_preserves_exact_logits_and_state(
+        self, small_cache, mock_kv_cache
+    ):
+        pytest.importorskip("mlx.core")
+        tokens = [1, 2]
+        exact = small_cache.prepare_store(
+            tokens, mock_kv_cache(1000), {"last_logits": MockArray(100)}
+        )
+        assert exact is not None and small_cache.commit_prepared(exact)
+        grid = small_cache.reserve_grid(tokens, mock_kv_cache(2000), 2)
+        assert grid is not None
+        assert not small_cache.commit_grid(grid)
+        assert small_cache._entries[tuple(tokens)] is exact
+        assert small_cache.fetch_exact_auxiliary(tokens) == exact.auxiliary
+        assert small_cache._current_memory == exact.memory_bytes
+        assert small_cache._reserved_memory == 0
+
+    def test_exact_logits_replace_grid_with_same_forward_state(
+        self, small_cache, mock_kv_cache
+    ):
+        pytest.importorskip("mlx.core")
+        tokens = [1, 2]
+        grid = small_cache.reserve_grid(tokens, mock_kv_cache(1000), 2)
+        assert grid is not None and small_cache.commit_grid(grid)
+        live = mock_kv_cache(2000)
+        exact = small_cache.prepare_store(tokens, live, {"last_logits": MockArray(100)})
+        assert exact is not None and exact is not grid
+        assert not small_cache.commit_prepared(exact, commit_guard=lambda: False)
+        assert small_cache._entries[tuple(tokens)] is grid
+        assert small_cache.commit_prepared(exact)
+        assert small_cache._entries[tuple(tokens)] is exact
+        assert exact.cache[0].keys is live[0].keys
+        assert "last_logits" in small_cache.fetch_exact_auxiliary(tokens)
+        assert small_cache._current_memory == exact.memory_bytes
+        assert small_cache._sorted_keys.count(tuple(tokens)) == 1
+
     def test_store_and_fetch_exact_match(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3, 4, 5]
         kv = mock_kv_cache(1000)

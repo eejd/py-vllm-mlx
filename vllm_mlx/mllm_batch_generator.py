@@ -1622,11 +1622,12 @@ class MLLMBatchGenerator:
         finally:
             self._release_grid_checkpoints(request_id)
 
-    def _fetch_prefill_prefix(self, tokens):
+    def _fetch_prefill_prefix(self, tokens, suffix=()):
         """Prefer a compatible grid entry, never replay an unaligned hybrid."""
         cache = self.prefix_cache
+        full_tokens = tokens + list(suffix)
         if getattr(self, "hybrid_prefix_checkpoints", False):
-            found, remaining = cache.fetch_grid(tokens, self.prefill_step_size)
+            found, remaining = cache.fetch_grid(full_tokens, self.prefill_step_size)
             if found is not None:
                 return found, remaining
         found, remaining = cache.fetch(tokens)
@@ -1635,9 +1636,11 @@ class MLLMBatchGenerator:
                 and self._needs_prefill_checkpoint(found)):
             matched = len(tokens) - len(remaining)
             auxiliary = fetch_auxiliary(tokens[:matched]) or {}
-            if remaining or "hybrid_grid_step" in auxiliary:
+            if remaining or suffix or "hybrid_grid_step" in auxiliary:
                 cache.settle_hit(matched, 0)
-                return None, tokens
+                return None, full_tokens
+        if found is not None:
+            remaining = list(remaining) + list(suffix)
         return found, remaining
 
     def _publish_prefill_checkpoint(
@@ -2266,11 +2269,11 @@ class MLLMBatchGenerator:
                         # matching by stripping the generated think suffix.
                         S = self._think_suffix_len
                         lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                        cached_kv, remaining_ids = self._fetch_prefill_prefix(lookup_ids)
+                        cached_kv, remaining_ids = self._fetch_prefill_prefix(
+                            lookup_ids, input_ids_list[-S:] if S > 0 else ()
+                        )
                         if cached_kv is not None:
-                            cache_credited = len(lookup_ids) - len(remaining_ids)
-                        if cached_kv is not None and S > 0:
-                            remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+                            cache_credited = len(input_ids_list) - len(remaining_ids)
 
                 # A hit is only usable if every layer holds exactly the
                 # positions of the tokens the cache says it matched (and an
@@ -4495,11 +4498,11 @@ def install_chunked_prefill_mllm(
                         return _generation_step()
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                    cached_kv, remaining_ids = batch_gen._fetch_prefill_prefix(lookup_ids)
+                    cached_kv, remaining_ids = batch_gen._fetch_prefill_prefix(
+                        lookup_ids, input_ids_list[-S:] if S > 0 else ()
+                    )
                     if cached_kv is not None:
-                        cache_credited = len(lookup_ids) - len(remaining_ids)
-                    if cached_kv is not None and S > 0:
-                        remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+                        cache_credited = len(input_ids_list) - len(remaining_ids)
 
                     if cached_kv is not None and not batch_gen._hit_is_aligned(
                         cached_kv, cache_credited

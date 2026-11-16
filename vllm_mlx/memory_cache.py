@@ -1586,6 +1586,10 @@ class MemoryAwarePrefixCache:
                     return False
                 key = entry.tokens
                 old = self._entries.get(key)
+                # Never replace an exact-prompt snapshot (and its logits)
+                # with state from a different forward pass.
+                if old is not None and "last_logits" in (old.auxiliary or {}):
+                    return False
                 if old is not None:
                     self._current_memory -= old.memory_bytes
                 else:
@@ -1629,7 +1633,10 @@ class MemoryAwarePrefixCache:
         tokens_key = tuple(tokens)
         with self._memory_lock:
             existing = self._entries.get(tokens_key)
-            if existing is not None:
+            if existing is not None and not (
+                "hybrid_grid_step" in (existing.auxiliary or {})
+                and "last_logits" in (auxiliary or {})
+            ):
                 return existing
 
         try:
@@ -1716,7 +1723,13 @@ class MemoryAwarePrefixCache:
                         self._max_memory / _BYTES_PER_MB,
                     )
                     return False
-                if tokens_key in self._entries:
+                existing = self._entries.get(tokens_key)
+                replace_grid = (
+                    existing is not None
+                    and "hybrid_grid_step" in (existing.auxiliary or {})
+                    and "last_logits" in (entry.auxiliary or {})
+                )
+                if existing is not None and not replace_grid:
                     self._entries.move_to_end(tokens_key)
                     return True
 
@@ -1729,6 +1742,11 @@ class MemoryAwarePrefixCache:
                         or self._grid_reservation_count >= self._config.max_entries):
                     self._stats.store_rejections += 1
                     return False
+                if replace_grid:
+                    self._current_memory -= existing.memory_bytes
+                    del self._entries[tokens_key]
+                    self._remove_from_sorted(tokens_key)
+
 
                 if evict_prefixes and self._sorted_keys:
                     to_remove = []
