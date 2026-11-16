@@ -1223,6 +1223,7 @@ class MemoryAwarePrefixCache:
         self._reserved_memory = 0
         self._grid_reservations: dict[int, _CacheEntry] = {}
         self._grid_reservation_count = 0
+        self._grid_generation = 0
         self._memory_lock = threading.RLock()
         # Serializes the entry-sized snapshot copy in store().  Separate
         # from _memory_lock so accounting stays responsive during the GPU
@@ -1494,7 +1495,7 @@ class MemoryAwarePrefixCache:
         """
         with self._memory_lock:
             self._last_matched_key = None
-            if len(tokens) < self._config.min_prefix_tokens:
+            if self._config.kv_quantize or step <= 0 or len(tokens) < self._config.min_prefix_tokens:
                 return None, tokens
             key = tuple(tokens)
             idx = bisect.bisect_left(self._sorted_keys, key)
@@ -1505,7 +1506,8 @@ class MemoryAwarePrefixCache:
                 if len(candidate) >= len(key) or key[:len(candidate)] != candidate:
                     continue
                 entry = self._entries[candidate]
-                if (entry.auxiliary or {}).get("hybrid_grid_step") != step:
+                if ((entry.auxiliary or {}).get("hybrid_grid_step") != step
+                        or len(candidate) % step):
                     continue
                 self._entries.move_to_end(candidate)
                 self._stats.hits += 1
@@ -1524,7 +1526,8 @@ class MemoryAwarePrefixCache:
         release every returned handle, including on cancellation.
         """
         if (self._config.kv_quantize or not tokens or not cache
-                or len(tokens) < self._config.min_prefix_tokens or step <= 0):
+                or len(tokens) < self._config.min_prefix_tokens or step <= 0
+                or len(tokens) % step):
             return None
         try:
             projected = estimate_kv_cache_memory(cache)
@@ -1539,6 +1542,7 @@ class MemoryAwarePrefixCache:
                 return None
             self._reserved_memory += projected
             self._grid_reservation_count += 1
+            generation = self._grid_generation
         entry = None
         try:
             with self._copy_lock:
@@ -1546,7 +1550,7 @@ class MemoryAwarePrefixCache:
             entry = _CacheEntry.create(tokens, detached, {"hybrid_grid_step": step})
             with self._memory_lock:
                 # The estimate must cover the allocation before it is made.
-                if entry.memory_bytes > projected:
+                if generation != self._grid_generation or entry.memory_bytes > projected:
                     self._stats.store_rejections += 1
                     entry = None
                 else:
@@ -1927,6 +1931,12 @@ class MemoryAwarePrefixCache:
         meant to drop back into RAM, so the tier is emptied with the RAM cache.
         """
         with self._memory_lock:
+            self._grid_generation += 1
+            self._reserved_memory -= sum(
+                entry.memory_bytes for entry in self._grid_reservations.values()
+            )
+            self._grid_reservation_count -= len(self._grid_reservations)
+            self._grid_reservations.clear()
             self._entries.clear()
             self._sorted_keys.clear()
             self._current_memory = 0

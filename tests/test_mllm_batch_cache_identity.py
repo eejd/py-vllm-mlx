@@ -396,6 +396,22 @@ class TestHybridGridCheckpoints:
         assert serve(gen, "divergent", query) == greedy_continuation(query, 6)
         assert lm.calls[0][0][0] == query[16]
 
+    @pytest.mark.parametrize("chunked", [0, 5], ids=["blocking", "interleaved"])
+    def test_unaligned_full_prompt_is_not_replayed_with_think_suffix(self, chunked):
+        gen, lm = make_generator(
+            hybrid=True, hybrid_prefix_checkpoints=False,
+            prefill_step_size=self.STEP, chunked_prefill=chunked,
+        )
+        source = self.SOURCE[:19]
+        serve(gen, "source", source)
+        assert tuple(source) in stored_entries(gen)
+        gen.hybrid_prefix_checkpoints = True
+        gen._think_suffix_len = 2
+        query = source + [60, 61]
+        lm.calls.clear()
+        assert serve(gen, "suffix", query) == greedy_continuation(query, 6)
+        assert lm.calls[0][0][0] == query[0]
+
     def test_interleaved_abort_releases_staged_checkpoint_budget(self):
         gen, _ = make_generator(
             hybrid=True,

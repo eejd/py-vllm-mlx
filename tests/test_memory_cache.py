@@ -386,6 +386,14 @@ class TestMemoryAwarePrefixCache:
         assert tuple([9]) in cache._entries
         assert cache.get_stats()["evictions"] == 0
 
+    def test_clear_invalidates_staged_grid_entries(self, small_cache, mock_kv_cache):
+        entry = small_cache.reserve_grid([1, 2], mock_kv_cache(1000), 2)
+        assert entry is not None
+        small_cache.clear()
+        assert small_cache._reserved_memory == 0
+        assert not small_cache.commit_grid(entry)
+        assert len(small_cache) == 0
+
     def test_fetch_grid_longest_valid_prefix_and_step(self, small_cache, mock_kv_cache):
         def checkpoint(tokens, step):
             entry = small_cache.reserve_grid(tokens, mock_kv_cache(1000), step)
