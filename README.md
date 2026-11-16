@@ -89,6 +89,13 @@ for versions, API transports, reproduction commands, and coverage limits.
   Reservations never evict existing entries and are rejected when the cache
   lacks capacity. Restored prompts do not add deeper checkpoints. Enabling the
   feature overrides `--chunked-prefill-tokens` with the prefill step size.
+  For a strict-prefix extension, such as a completion follow-up or multi-turn
+  request, the enabled feature resumes at the last available grid boundary
+  rather than the entire previous prompt. This can increase time-to-first-token
+  while preserving cold-output parity in the measured case. In one
+  Qwen3.5-0.8B completion follow-up, cache credit
+  fell from 697 tokens (base/flag off) to 512 (flag on); the flag-on output
+  matched cold ("sequence"), while base/flag off produced "list".
   Qwen3.5-0.8B sequential HTTP testing matched cold greedy output; exact greedy
   IDs and selected logprobs were observed in direct-generator single-request
   interleaved and concurrent blocking prefill tests, not established by HTTP.
