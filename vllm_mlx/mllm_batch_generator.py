@@ -1591,7 +1591,7 @@ class MLLMBatchGenerator:
 
     def _prefill_checkpoint_plan(self, input_ids, cache_list):
         """Capture only boundaries already present in cold chunked prefill."""
-        if (not self.hybrid_prefix_checkpoints or self.prefix_cache is None
+        if (not getattr(self, "hybrid_prefix_checkpoints", False) or self.prefix_cache is None
                 or not self._needs_prefill_checkpoint(cache_list)):
             return None, None
         step = self.prefill_step_size
@@ -1606,7 +1606,7 @@ class MLLMBatchGenerator:
             self._grid_staged.setdefault(request_id, []).append(handle)
 
     def _release_grid_checkpoints(self, request_id):
-        for handle in self._grid_staged.pop(request_id, []):
+        for handle in getattr(self, "_grid_staged", {}).pop(request_id, []):
             self.prefix_cache.release_grid(handle)
 
     def _commit_grid_checkpoints(self, request_id):
@@ -1625,14 +1625,16 @@ class MLLMBatchGenerator:
     def _fetch_prefill_prefix(self, tokens):
         """Prefer a compatible grid entry, never replay an unaligned hybrid."""
         cache = self.prefix_cache
-        if self.hybrid_prefix_checkpoints:
+        if getattr(self, "hybrid_prefix_checkpoints", False):
             found, remaining = cache.fetch_grid(tokens, self.prefill_step_size)
             if found is not None:
                 return found, remaining
         found, remaining = cache.fetch(tokens)
-        if found is not None and self._needs_prefill_checkpoint(found):
+        fetch_auxiliary = getattr(cache, "fetch_exact_auxiliary", None)
+        if (found is not None and callable(fetch_auxiliary)
+                and self._needs_prefill_checkpoint(found)):
             matched = len(tokens) - len(remaining)
-            auxiliary = cache.fetch_exact_auxiliary(tokens[:matched]) or {}
+            auxiliary = fetch_auxiliary(tokens[:matched]) or {}
             if remaining or "hybrid_grid_step" in auxiliary:
                 cache.settle_hit(matched, 0)
                 return None, tokens
@@ -1797,7 +1799,7 @@ class MLLMBatchGenerator:
         # A disconnect may arrive while the final suffix is executing.  Do
         # not let an aborted or failed prefill populate or evict shared cache
         # state merely because its checkpoint was reached.
-        if self._grid_staged.get(request.request_id):
+        if getattr(self, "_grid_staged", {}).get(request.request_id):
             _eval_prompt_cache(cache)
             mx.eval(final_output)
             self._commit_grid_checkpoints(request.request_id)
@@ -3957,7 +3959,7 @@ def install_chunked_prefill_mllm(
     _orig_next = batch_gen._next
     batch_gen._partial = None
     batch_gen._chunked_prefill_budget = (
-        batch_gen.prefill_step_size if batch_gen.hybrid_prefix_checkpoints else budget
+        batch_gen.prefill_step_size if getattr(batch_gen, "hybrid_prefix_checkpoints", False) else budget
     )
 
     logger.info(
@@ -4089,7 +4091,7 @@ def install_chunked_prefill_mllm(
                 return _generation_step()
 
             step = (
-                batch_gen.prefill_step_size if batch_gen.hybrid_prefix_checkpoints
+                batch_gen.prefill_step_size if getattr(batch_gen, "hybrid_prefix_checkpoints", False)
                 else batch_gen._chunked_prefill_budget
             )
             remaining = partial["remaining_ids"]
@@ -4281,7 +4283,7 @@ def install_chunked_prefill_mllm(
                             return _generation_step()
 
                 checkpoint_entry = partial.get("checkpoint_entry")
-                if batch_gen._grid_staged.get(req.request_id):
+                if getattr(batch_gen, "_grid_staged", {}).get(req.request_id):
                     try:
                         batch_gen._commit_grid_checkpoints(req.request_id)
                     except PrefillAbortedError:
@@ -4599,7 +4601,7 @@ def install_chunked_prefill_mllm(
 
                     # Process first chunk immediately
                     step = (
-                        batch_gen.prefill_step_size if batch_gen.hybrid_prefix_checkpoints
+                        batch_gen.prefill_step_size if getattr(batch_gen, "hybrid_prefix_checkpoints", False)
                         else batch_gen._chunked_prefill_budget
                     )
                     take = min(step, remaining_count)
