@@ -1618,6 +1618,7 @@ class MLLMBatchGenerator:
                     commit_guard=lambda: request_id not in self._aborted_request_ids,
                 )
                 if request_id in self._aborted_request_ids:
+                    self._aborted_request_ids.discard(request_id)
                     raise PrefillAbortedError(request_id)
         finally:
             self._release_grid_checkpoints(request_id)
