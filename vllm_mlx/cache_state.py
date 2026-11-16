@@ -28,6 +28,7 @@ CONTINUOUS_BATCHING_ONLY: dict[str, tuple[str, Any]] = {
     "--prefix-cache-dir": ("prefix_cache_dir", None),
     "--prefix-cache-persist": ("prefix_cache_persist", "auto"),
     "--prefix-cache-reset": ("prefix_cache_reset", "never"),
+    "--enable-hybrid-prefix-checkpoints": ("enable_hybrid_prefix_checkpoints", False),
     "--cache-memory-mb": ("cache_memory_mb", None),
     "--cache-memory-percent": ("cache_memory_percent", 0.20),
     "--no-memory-aware-cache": ("no_memory_aware_cache", False),
@@ -129,6 +130,7 @@ def launch_options(args: Any) -> dict[str, Any]:
         "ssd_cache_dir": getattr(args, "ssd_cache_dir", None),
         "ssd_cache_max_gb": getattr(args, "ssd_cache_max_gb", None),
         "prefill_step_size": getattr(args, "prefill_step_size", None),
+        "hybrid_prefix_checkpoints": bool(getattr(args, "enable_hybrid_prefix_checkpoints", False)),
         "prefix_trie_cache": bool(getattr(args, "prefix_trie_cache", False)),
         "kv_cache_quantization": {
             "requested": kv_requested,
