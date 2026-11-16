@@ -37,6 +37,9 @@ def test_measured_passing_prompts_are_admitted(scheduler, monkeypatch, tokens):
     from vllm_mlx import mllm_scheduler
     monkeypatch.setattr(mllm_scheduler, "encode_prompt", lambda *args: range(tokens))
     request_id = scheduler.add_request(prompt="long", max_tokens=128)
+    if tokens == 431_295:
+        soft_budget = 24_159_191_040 * 105 // 100 - 8_200_000_000
+        assert soft_budget - ((tokens + 128) * 32768 + 2_000_000_000) >= 1_000_000_000
     assert request_id in scheduler.requests
 
 
