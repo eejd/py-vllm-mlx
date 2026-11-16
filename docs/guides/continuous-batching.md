@@ -193,6 +193,14 @@ vllm-mlx serve model --continuous-batching --cache-memory-percent 0.10
 | `--cache-memory-percent` | Fraction of available RAM (default: 0.20) |
 | `--no-memory-aware-cache` | Use legacy entry-count based cache |
 
+For multimodal hybrid models that expose their full-attention interval and KV
+dimensions, admission estimates the unquantized live KV cache for the prompt,
+requested output and already admitted requests, with extra room for prefill.
+Requests that exceed the available system or MLX memory budget are rejected.
+This is an estimate, not a guarantee against out-of-memory conditions; media
+tokens and other processes can change the actual requirement. Quantizing stored
+prefix-cache entries does not quantize the live generation cache.
+
 ## Prefix Cache
 
 Prefix caching reuses KV cache for repeated prompts.

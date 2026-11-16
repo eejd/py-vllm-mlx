@@ -33,6 +33,8 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
+from .engine.base import RequestPreprocessingError
+from .memory_cache import _get_available_memory
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
@@ -416,6 +418,47 @@ class MLLMScheduler:
                         num_draft_tokens=self.config.mtp_num_draft_tokens,
                     )
 
+    def validate_prompt_memory(
+        self, prompt: str, max_tokens: int, add_special_tokens: Optional[bool]
+    ) -> None:
+        """Preflight the same text-token estimate used for scheduler admission."""
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        tokens = len(encode_prompt(tokenizer, prompt, add_special_tokens))
+        self._check_prompt_memory(tokens, max_tokens)
+
+    def _check_prompt_memory(self, prompt_tokens: int, max_tokens: int) -> None:
+        # Hybrid models keep an unquantized KV cache while generating; prefix
+        # cache quantization applies only to stored snapshots. Reserve queued
+        # requests and allow 50% for cache growth and prefill temporaries.
+        text_config = getattr(getattr(self, "model_config", None), "text_config", None)
+        interval = getattr(text_config, "full_attention_interval", None)
+        layers = getattr(text_config, "num_hidden_layers", None)
+        heads = getattr(text_config, "num_key_value_heads", None)
+        head_dim = getattr(text_config, "head_dim", None)
+        if not all(
+            isinstance(v, int) and v > 0 for v in (interval, layers, heads, head_dim)
+        ):
+            return
+        bytes_per_token = (layers // interval) * heads * head_dim * 4
+        if not bytes_per_token or not prompt_tokens:
+            return
+        tokens = prompt_tokens + max_tokens
+        tokens += sum(
+            r.num_prompt_tokens + r.sampling_params.max_tokens
+            for r in self.requests.values()
+        )
+        estimate = tokens * bytes_per_token * 3 // 2
+        budget = max(0, mx.get_memory_limit() - mx.get_active_memory())
+        available = _get_available_memory()
+        if available > 0:
+            budget = min(budget, available)
+        if estimate > budget:
+            raise RequestPreprocessingError(
+                f"Prompt exceeds the available memory budget: estimated "
+                f"{estimate} bytes for KV cache and prefill, "
+                f"{budget} bytes available"
+            )
+
     # ========== Sync API (step-based) ==========
 
     def add_request(
@@ -502,6 +545,7 @@ class MLLMScheduler:
             )
         except Exception:
             pass
+        self._check_prompt_memory(request.num_prompt_tokens, max_tokens)
 
         self.requests[request_id] = request
         self.waiting.append(request)

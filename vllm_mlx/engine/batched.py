@@ -1125,16 +1125,15 @@ class BatchedEngine(BaseEngine):
         enable_thinking: bool | None = None,
         **_chat_kwargs: Any,
     ) -> None:
-        """Render the prompt ``chat``/``stream_chat`` would build, discarding it.
+        """Preflight the template and known hybrid prompt memory budget.
 
-        Raises ``ChatTemplateRejected`` when the template refuses the messages, so a
-        streaming request is answered 400 before its response starts. Same inputs,
-        same renderer (``_apply_chat_template``) as the request itself.
+        Uses the same renderer as ``chat``/``stream_chat`` so streaming errors
+        can be returned before response headers are sent.
         """
         if not self._loaded:
             await self.start()
         _, extracted_images, _videos, audios = extract_multimodal_content(messages)
-        self._apply_chat_template(
+        prompt = self._apply_chat_template(
             messages,
             convert_tools_for_template(tools) if tools else None,
             num_images=len(images or []) + len(extracted_images),
@@ -1142,6 +1141,10 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=dict(chat_template_kwargs or {}),
             enable_thinking=enable_thinking,
         )
+        if self._is_mllm and self._mllm_scheduler:
+            self._mllm_scheduler.validate_prompt_memory(
+                prompt, _chat_kwargs.get("max_tokens", 256), False
+            )
 
     async def chat(
         self,
