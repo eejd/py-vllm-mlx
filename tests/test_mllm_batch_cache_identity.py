@@ -387,7 +387,9 @@ class TestHybridGridCheckpoints:
         serve(gen, "source", self.SOURCE)
         # This complete prompt leaves a longer non-grid snapshot in the trie.
         non_grid = self.SOURCE[:18] + [55]
+        gen.hybrid_prefix_checkpoints = False
         serve(gen, "non-grid", non_grid)
+        gen.hybrid_prefix_checkpoints = True
         assert tuple(non_grid) in stored_entries(gen)
         query = self.SOURCE[:18] + [60, 61, 62]
         lm.calls.clear()

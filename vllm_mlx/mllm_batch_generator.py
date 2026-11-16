@@ -3956,9 +3956,9 @@ def install_chunked_prefill_mllm(
 
     _orig_next = batch_gen._next
     batch_gen._partial = None
-    batch_gen._chunked_prefill_budget = budget
-    if batch_gen.hybrid_prefix_checkpoints:
-        batch_gen.prefill_step_size = budget
+    batch_gen._chunked_prefill_budget = (
+        batch_gen.prefill_step_size if batch_gen.hybrid_prefix_checkpoints else budget
+    )
 
     logger.info(
         f"[chunked-prefill-mllm] Installing interleaved prefill/decode "
@@ -4088,7 +4088,10 @@ def install_chunked_prefill_mllm(
                 )
                 return _generation_step()
 
-            step = batch_gen._chunked_prefill_budget
+            step = (
+                batch_gen.prefill_step_size if batch_gen.hybrid_prefix_checkpoints
+                else batch_gen._chunked_prefill_budget
+            )
             remaining = partial["remaining_ids"]
             remaining_count = remaining.shape[1]
             take = min(step, remaining_count)
@@ -4595,7 +4598,10 @@ def install_chunked_prefill_mllm(
                     text_only_req.vision_encoded = True
 
                     # Process first chunk immediately
-                    step = batch_gen._chunked_prefill_budget
+                    step = (
+                        batch_gen.prefill_step_size if batch_gen.hybrid_prefix_checkpoints
+                        else batch_gen._chunked_prefill_budget
+                    )
                     take = min(step, remaining_count)
                     if checkpoint_at is not None and checkpoint_at < take:
                         take = checkpoint_at

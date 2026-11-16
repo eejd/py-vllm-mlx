@@ -1219,6 +1219,10 @@ class MemoryAwarePrefixCache:
         self._memory_limit_info = self._config.memory_limit_details()
         self._max_memory = int(self._memory_limit_info["bytes"])
         self._current_memory = 0
+        # Grid snapshots reserve both bytes and an entry slot before copying.
+        self._reserved_memory = 0
+        self._grid_reservations: dict[int, _CacheEntry] = {}
+        self._grid_reservation_count = 0
         self._memory_lock = threading.RLock()
         # Serializes the entry-sized snapshot copy in store().  Separate
         # from _memory_lock so accounting stays responsive during the GPU
@@ -1481,6 +1485,123 @@ class MemoryAwarePrefixCache:
 
         return None, tokens
 
+    def fetch_grid(
+        self, tokens: list[int], step: int
+    ) -> tuple[list[Any] | None, list[int]]:
+        """Find the longest strictly shorter checkpoint for this grid.
+
+        A miss is deliberately uncounted: callers may fall back to fetch().
+        """
+        with self._memory_lock:
+            self._last_matched_key = None
+            if len(tokens) < self._config.min_prefix_tokens:
+                return None, tokens
+            key = tuple(tokens)
+            idx = bisect.bisect_left(self._sorted_keys, key)
+            for i in range(idx - 1, -1, -1):
+                candidate = self._sorted_keys[i]
+                if candidate[0] != key[0]:
+                    break
+                if len(candidate) >= len(key) or key[:len(candidate)] != candidate:
+                    continue
+                entry = self._entries[candidate]
+                if (entry.auxiliary or {}).get("hybrid_grid_step") != step:
+                    continue
+                self._entries.move_to_end(candidate)
+                self._stats.hits += 1
+                self._stats.tokens_saved += len(candidate)
+                self._last_match_type = "prefix"
+                self._last_matched_key = candidate
+                return entry.cache, tokens[len(candidate):]
+            return None, tokens
+
+    def reserve_grid(
+        self, tokens: list[int], cache: list[Any], step: int
+    ) -> _CacheEntry | None:
+        """Reserve capacity and detach a grid checkpoint without publishing it.
+
+        Reservations never evict resident entries. The caller must commit or
+        release every returned handle, including on cancellation.
+        """
+        if (self._config.kv_quantize or not tokens or not cache
+                or len(tokens) < self._config.min_prefix_tokens or step <= 0):
+            return None
+        try:
+            projected = estimate_kv_cache_memory(cache)
+        except Exception as exc:
+            logger.warning("[cache_store] grid estimation failed: %s", exc)
+            return None
+        with self._memory_lock:
+            if (self._current_memory + self._reserved_memory + projected > self._max_memory
+                    or len(self._entries) + self._grid_reservation_count
+                    >= self._config.max_entries):
+                self._stats.store_rejections += 1
+                return None
+            self._reserved_memory += projected
+            self._grid_reservation_count += 1
+        entry = None
+        try:
+            with self._copy_lock:
+                detached = _detach_cache_for_storage(_trim_to_offset(cache))
+            entry = _CacheEntry.create(tokens, detached, {"hybrid_grid_step": step})
+            with self._memory_lock:
+                # The estimate must cover the allocation before it is made.
+                if entry.memory_bytes > projected:
+                    self._stats.store_rejections += 1
+                    entry = None
+                else:
+                    self._reserved_memory -= projected - entry.memory_bytes
+                    self._grid_reservations[id(entry)] = entry
+            return entry
+        except Exception as exc:
+            entry = None
+            with self._memory_lock:
+                self._stats.store_rejections += 1
+            logger.warning("[cache_store] grid snapshot rejected: %s", exc)
+            return None
+        finally:
+            if entry is None:
+                with self._memory_lock:
+                    self._reserved_memory -= projected
+                    self._grid_reservation_count -= 1
+
+    def release_grid(self, entry: _CacheEntry) -> None:
+        """Release an unpublished grid checkpoint; repeated calls are safe."""
+        with self._memory_lock:
+            if self._grid_reservations.pop(id(entry), None) is entry:
+                self._reserved_memory -= entry.memory_bytes
+                self._grid_reservation_count -= 1
+
+    def commit_grid(
+        self, entry: _CacheEntry, *, commit_lock: Any = None,
+        commit_guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Publish a reserved checkpoint after successful prefill."""
+        context = commit_lock if commit_lock is not None else nullcontext()
+        try:
+            with self._memory_lock, context:
+                if self._grid_reservations.get(id(entry)) is not entry:
+                    return False
+                if commit_guard is not None and not commit_guard():
+                    return False
+                key = entry.tokens
+                old = self._entries.get(key)
+                if old is not None:
+                    self._current_memory -= old.memory_bytes
+                else:
+                    bisect.insort(self._sorted_keys, key)
+                self._entries[key] = entry
+                self._entries.move_to_end(key)
+                self._current_memory += entry.memory_bytes
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
+                return True
+        except Exception as exc:
+            logger.warning("[cache_store] grid commit rejected: %s", exc)
+            return False
+        finally:
+            self.release_grid(entry)
+
     def prepare_store(
         self,
         tokens: list[int],
@@ -1599,6 +1720,16 @@ class MemoryAwarePrefixCache:
                     self._entries.move_to_end(tokens_key)
                     return True
 
+                # Reservations belong to in-flight snapshots and cannot be
+                # displaced by an ordinary store.
+                nonresident = self._current_memory - sum(
+                    resident.memory_bytes for resident in self._entries.values()
+                )
+                if (nonresident + self._reserved_memory + entry.memory_bytes > self._max_memory
+                        or self._grid_reservation_count >= self._config.max_entries):
+                    self._stats.store_rejections += 1
+                    return False
+
                 if evict_prefixes and self._sorted_keys:
                     to_remove = []
                     idx = bisect.bisect_left(self._sorted_keys, tokens_key)
@@ -1625,8 +1756,8 @@ class MemoryAwarePrefixCache:
                         )
 
                 while (
-                    self._current_memory + entry.memory_bytes > self._max_memory
-                    or len(self._entries) >= self._config.max_entries
+                    self._current_memory + self._reserved_memory + entry.memory_bytes > self._max_memory
+                    or len(self._entries) + self._grid_reservation_count >= self._config.max_entries
                 ) and self._entries:
                     self._evict_lru()
 
@@ -1836,9 +1967,9 @@ class MemoryAwarePrefixCache:
             reclaimable = sum(
                 e.memory_bytes for k, e in self._entries.items() if k not in protect
             )
-            if self._current_memory - reclaimable + nbytes > self._max_memory:
+            if self._current_memory - reclaimable + self._reserved_memory + nbytes > self._max_memory:
                 return False
-            while self._current_memory + nbytes > self._max_memory:
+            while self._current_memory + self._reserved_memory + nbytes > self._max_memory:
                 if not self._evict_lru(protect):
                     return False
             self._current_memory += nbytes
