@@ -59,3 +59,13 @@ def test_running_kv_is_not_reserved_twice_but_queued_kv_is(scheduler, monkeypatc
     assert request_id in scheduler.requests
     with pytest.raises(RequestPreprocessingError, match="memory"):
         scheduler.add_request(prompt="queued", max_tokens=128)
+
+
+def test_activation_allowance_scales_with_prefill_chunk(scheduler, monkeypatch):
+    from vllm_mlx import mllm_scheduler
+    monkeypatch.setattr(mllm_scheduler, "_get_available_memory", lambda: 15_500_000_000)
+    monkeypatch.setattr(mllm_scheduler, "encode_prompt", lambda *args: range(431_295))
+    with pytest.raises(RequestPreprocessingError, match="memory"):
+        scheduler.add_request(prompt="long", max_tokens=128)
+    scheduler.config.prefill_step_size = 512
+    assert scheduler.add_request(prompt="long", max_tokens=128) in scheduler.requests
