@@ -544,3 +544,39 @@ class TestPreCheckBusyEngine:
                 await server.create_anthropic_message(_FakeRequest(body))
         assert exc_info.value.status_code == 503
         assert exc_info.value.detail["error"] == "text_generation_busy"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("endpoint", ["chat", "responses", "anthropic"])
+async def test_streaming_memory_refusal_returns_400_and_records_metric(
+    served, monkeypatch, endpoint
+):
+    import httpx
+    from unittest.mock import Mock
+    from vllm_mlx.engine.base import RequestPreprocessingError
+
+    async def refuse(*args, **kwargs):
+        raise RequestPreprocessingError("Prompt exceeds the available memory budget")
+
+    tracker = Mock()
+    monkeypatch.setattr(server._metrics, "track_inference", lambda *a, **kw: tracker)
+    monkeypatch.setattr(served, "validate_chat_template", refuse)
+    payloads = {
+        "chat": ("/v1/chat/completions", {
+            "model": "served", "messages": VALID, "max_tokens": 16, "stream": True,
+        }),
+        "responses": ("/v1/responses", {
+            "model": "served", "input": "hi", "stream": True,
+        }),
+        "anthropic": ("/v1/messages", {
+            "model": "served", "messages": VALID, "max_tokens": 16, "stream": True,
+        }),
+    }
+    path, body = payloads[endpoint]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.app), base_url="http://test"
+    ) as client:
+        response = await client.post(path, json=body)
+    assert response.status_code == 400
+    assert "memory budget" in response.text
+    tracker.finish.assert_called_once_with(result="client_error")
