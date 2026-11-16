@@ -615,6 +615,7 @@ class MLLMBatchGenerator:
         specprefill_keep_pct: float = 0.3,
         specprefill_backbone_pct: float = 0.0,
         specprefill_runtime_reason: Optional[str] = None,
+        hybrid_prefix_checkpoints: bool = False,
     ):
         """
         Initialize MLLM batch generator.
@@ -684,6 +685,8 @@ class MLLMBatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.prefill_step_size = prefill_step_size
+        self.hybrid_prefix_checkpoints = hybrid_prefix_checkpoints
+        self._grid_staged = {}
 
         # Request management
         self.unprocessed_requests: List[MLLMBatchRequest] = []
@@ -1587,14 +1590,53 @@ class MLLMBatchGenerator:
         return mx.concatenate(deltas, axis=0)
 
     def _prefill_checkpoint_plan(self, input_ids, cache_list):
-        """Return ``(token_count, key)`` for a non-rewindable prompt cache."""
-        if self.prefix_cache is None or not self._needs_prefill_checkpoint(cache_list):
+        """Capture only boundaries already present in cold chunked prefill."""
+        if (not self.hybrid_prefix_checkpoints or self.prefix_cache is None
+                or not self._needs_prefill_checkpoint(cache_list)):
             return None, None
-        # Hybrid recurrent state cannot be replayed from a numerically exact
-        # mid-prompt split on every backend. Store the full prompt state and
-        # its final logits instead; exact hits can then start generation
-        # without replaying or rewinding recurrent state.
-        return None, None
+        step = self.prefill_step_size
+        if input_ids.shape[-1] <= step:
+            return None, None
+        return step, input_ids.reshape(-1)[:step].tolist()
+
+    def _stage_grid_checkpoint(self, request_id, tokens, cache):
+        _eval_prompt_cache(cache)
+        handle = self.prefix_cache.reserve_grid(tokens, cache, self.prefill_step_size)
+        if handle is not None:
+            self._grid_staged.setdefault(request_id, []).append(handle)
+
+    def _release_grid_checkpoints(self, request_id):
+        for handle in self._grid_staged.pop(request_id, []):
+            self.prefix_cache.release_grid(handle)
+
+    def _commit_grid_checkpoints(self, request_id):
+        try:
+            for handle in self._grid_staged.get(request_id, []):
+                self.prefix_cache.commit_grid(
+                    handle,
+                    commit_lock=self._prefix_checkpoint_lock,
+                    commit_guard=lambda: request_id not in self._aborted_request_ids,
+                )
+                if request_id in self._aborted_request_ids:
+                    raise PrefillAbortedError(request_id)
+        finally:
+            self._release_grid_checkpoints(request_id)
+
+    def _fetch_prefill_prefix(self, tokens):
+        """Prefer a compatible grid entry, never replay an unaligned hybrid."""
+        cache = self.prefix_cache
+        if self.hybrid_prefix_checkpoints:
+            found, remaining = cache.fetch_grid(tokens, self.prefill_step_size)
+            if found is not None:
+                return found, remaining
+        found, remaining = cache.fetch(tokens)
+        if found is not None and self._needs_prefill_checkpoint(found):
+            matched = len(tokens) - len(remaining)
+            auxiliary = cache.fetch_exact_auxiliary(tokens[:matched]) or {}
+            if remaining or "hybrid_grid_step" in auxiliary:
+                cache.settle_hit(matched, 0)
+                return None, tokens
+        return found, remaining
 
     def _publish_prefill_checkpoint(
         self, request_id: str, checkpoint_entry: Any
@@ -1636,6 +1678,14 @@ class MLLMBatchGenerator:
         return stored
 
     def _run_chunked_text_prefill(
+        self, request: MLLMBatchRequest, cache: List[Any]
+    ) -> mx.array:
+        try:
+            return self._run_chunked_text_prefill_impl(request, cache)
+        finally:
+            self._release_grid_checkpoints(request.request_id)
+
+    def _run_chunked_text_prefill_impl(
         self, request: MLLMBatchRequest, cache: List[Any]
     ) -> mx.array:
         """
@@ -1685,7 +1735,6 @@ class MLLMBatchGenerator:
         processed = 0
         chunk_count = 0
         output = None
-        checkpoint_entry = None
         while processed < total:
             # Check for abort between chunks (client disconnect)
             if request.request_id in self._aborted_request_ids:
@@ -1710,27 +1759,12 @@ class MLLMBatchGenerator:
             chunk_count += 1
 
             if checkpoint_at is not None and processed == checkpoint_at:
-                # KVCache writes suffix tokens into preallocated arrays in
-                # place. Materialize the active state before detaching it so
-                # the cold continuation and the restored continuation start
-                # from the same realized recurrent/KV state. Publish only
-                # after the remaining prefill succeeds.
-                _eval_prompt_cache(cache)
-                checkpoint_snapshot = self._rewind_prefix_cache(cache, 0)
-                if checkpoint_snapshot is not None:
-                    checkpoint_entry = self.prefix_cache.prepare_store(
-                        checkpoint_key, checkpoint_snapshot
-                    )
-                    if checkpoint_entry is not None:
-                        continuation = self._clone_prefix_for_replay(
-                            checkpoint_entry.cache
-                        )
-                        if continuation is None or not self._prepare_rotating_caches(
-                            continuation
-                        ):
-                            checkpoint_entry = None
-                        else:
-                            cache[:] = continuation
+                self._stage_grid_checkpoint(request.request_id, checkpoint_key, cache)
+                checkpoint_at += step
+                if checkpoint_at < total:
+                    checkpoint_key = input_ids.reshape(-1)[:checkpoint_at].tolist()
+                else:
+                    checkpoint_at = None
 
             if processed == total:
                 break
@@ -1763,14 +1797,10 @@ class MLLMBatchGenerator:
         # A disconnect may arrive while the final suffix is executing.  Do
         # not let an aborted or failed prefill populate or evict shared cache
         # state merely because its checkpoint was reached.
-        if checkpoint_entry is not None:
-            # The final suffix forward is lazy. Complete both its logits and
-            # cache-state writes before the publication guard can declare the
-            # prompt checkpoint valid. Ordinary rewindable prefill retains its
-            # existing lazy sampling path.
+        if self._grid_staged.get(request.request_id):
             _eval_prompt_cache(cache)
             mx.eval(final_output)
-            self._publish_prefill_checkpoint(request.request_id, checkpoint_entry)
+            self._commit_grid_checkpoints(request.request_id)
         elif request.request_id in self._aborted_request_ids:
             self._aborted_request_ids.discard(request.request_id)
             raise PrefillAbortedError(request.request_id)
@@ -2234,7 +2264,7 @@ class MLLMBatchGenerator:
                         # matching by stripping the generated think suffix.
                         S = self._think_suffix_len
                         lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                        cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
+                        cached_kv, remaining_ids = self._fetch_prefill_prefix(lookup_ids)
                         if cached_kv is not None:
                             cache_credited = len(lookup_ids) - len(remaining_ids)
                         if cached_kv is not None and S > 0:
@@ -3927,6 +3957,8 @@ def install_chunked_prefill_mllm(
     _orig_next = batch_gen._next
     batch_gen._partial = None
     batch_gen._chunked_prefill_budget = budget
+    if batch_gen.hybrid_prefix_checkpoints:
+        batch_gen.prefill_step_size = budget
 
     logger.info(
         f"[chunked-prefill-mllm] Installing interleaved prefill/decode "
@@ -4039,6 +4071,7 @@ def install_chunked_prefill_mllm(
 
             # Abort check
             if req.request_id in batch_gen._aborted_request_ids:
+                batch_gen._release_grid_checkpoints(req.request_id)
                 batch_gen._aborted_request_ids.discard(req.request_id)
                 batch_gen._partial = None
                 mx.clear_cache()
@@ -4085,27 +4118,17 @@ def install_chunked_prefill_mllm(
                     checkpoint_at is not None
                     and partial["cached_count"] + partial["processed"] == checkpoint_at
                 ):
-                    checkpoint_snapshot = batch_gen._rewind_prefix_cache(
-                        partial["cache"], 0
+                    batch_gen._stage_grid_checkpoint(
+                        req.request_id, partial["checkpoint_key"], partial["cache"]
                     )
-                    if checkpoint_snapshot is not None:
-                        partial["checkpoint_entry"] = (
-                            batch_gen.prefix_cache.prepare_store(
-                                partial["checkpoint_key"], checkpoint_snapshot
-                            )
+                    next_at = checkpoint_at + step
+                    partial["checkpoint_at"] = (
+                        next_at if next_at < partial["total"] else None
+                    )
+                    if partial["checkpoint_at"] is not None:
+                        partial["checkpoint_key"] = (
+                            req.input_ids.reshape(-1)[:next_at].tolist()
                         )
-                        checkpoint_entry = partial["checkpoint_entry"]
-                        if checkpoint_entry is not None:
-                            continuation = batch_gen._clone_prefix_for_replay(
-                                checkpoint_entry.cache
-                            )
-                            if (
-                                continuation is None
-                                or not batch_gen._prepare_rotating_caches(continuation)
-                            ):
-                                partial["checkpoint_entry"] = None
-                            else:
-                                partial["cache"][:] = continuation
                 batch_gen._prefill_progress[req.request_id] = (
                     partial["cached_count"] + partial["processed"],
                     partial["total"],
@@ -4239,6 +4262,7 @@ def install_chunked_prefill_mllm(
                                 req.request_id, full_prompt_entry
                             )
                         except PrefillAbortedError:
+                            batch_gen._release_grid_checkpoints(req.request_id)
                             batch_gen._partial = None
                             batch_gen._prefill_progress.pop(req.request_id, None)
                             batch_gen._pending_error_responses.append(
@@ -4254,11 +4278,9 @@ def install_chunked_prefill_mllm(
                             return _generation_step()
 
                 checkpoint_entry = partial.get("checkpoint_entry")
-                if checkpoint_entry is not None:
+                if batch_gen._grid_staged.get(req.request_id):
                     try:
-                        batch_gen._publish_prefill_checkpoint(
-                            req.request_id, checkpoint_entry
-                        )
+                        batch_gen._commit_grid_checkpoints(req.request_id)
                     except PrefillAbortedError:
                         batch_gen._partial = None
                         batch_gen._prefill_progress.pop(req.request_id, None)
@@ -4468,7 +4490,7 @@ def install_chunked_prefill_mllm(
                         return _generation_step()
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                    cached_kv, remaining_ids = batch_gen.prefix_cache.fetch(lookup_ids)
+                    cached_kv, remaining_ids = batch_gen._fetch_prefill_prefix(lookup_ids)
                     if cached_kv is not None:
                         cache_credited = len(lookup_ids) - len(remaining_ids)
                     if cached_kv is not None and S > 0:
@@ -4568,7 +4590,6 @@ def install_chunked_prefill_mllm(
                         "chunk_count": 0,
                         "checkpoint_at": checkpoint_at,
                         "checkpoint_key": checkpoint_key,
-                        "checkpoint_entry": None,
                     }
                     batch_gen.unprocessed_requests.remove(text_only_req)
                     text_only_req.vision_encoded = True
@@ -4591,29 +4612,17 @@ def install_chunked_prefill_mllm(
                     batch_gen._partial["processed"] = take
                     batch_gen._partial["chunk_count"] = 1
                     if checkpoint_at is not None and take == checkpoint_at:
-                        checkpoint_snapshot = batch_gen._rewind_prefix_cache(
-                            request_cache, 0
+                        batch_gen._stage_grid_checkpoint(
+                            text_only_req.request_id, checkpoint_key, request_cache
                         )
-                        if checkpoint_snapshot is not None:
-                            batch_gen._partial["checkpoint_entry"] = (
-                                batch_gen.prefix_cache.prepare_store(
-                                    checkpoint_key, checkpoint_snapshot
-                                )
+                        next_at = checkpoint_at + step
+                        batch_gen._partial["checkpoint_at"] = (
+                            next_at if next_at < total_tokens else None
+                        )
+                        if batch_gen._partial["checkpoint_at"] is not None:
+                            batch_gen._partial["checkpoint_key"] = (
+                                input_ids.reshape(-1)[:next_at].tolist()
                             )
-                            checkpoint_entry = batch_gen._partial["checkpoint_entry"]
-                            if checkpoint_entry is not None:
-                                continuation = batch_gen._clone_prefix_for_replay(
-                                    checkpoint_entry.cache
-                                )
-                                if (
-                                    continuation is None
-                                    or not batch_gen._prepare_rotating_caches(
-                                        continuation
-                                    )
-                                ):
-                                    batch_gen._partial["checkpoint_entry"] = None
-                                else:
-                                    request_cache[:] = continuation
                     batch_gen._prefill_progress[text_only_req.request_id] = (
                         cached_count + take,
                         total_tokens,
@@ -4639,11 +4648,25 @@ def install_chunked_prefill_mllm(
     def _patched_remove(uids: List[int]) -> None:
         if batch_gen._partial is not None:
             if batch_gen._partial["request"].uid in set(uids):
+                batch_gen._release_grid_checkpoints(
+                    batch_gen._partial["request"].request_id
+                )
                 batch_gen._partial = None
                 mx.clear_cache()
         _orig_remove(uids)
 
     batch_gen.remove = _patched_remove
-    batch_gen._next = _chunked_next
+    def _guarded_chunked_next():
+        try:
+            return _chunked_next()
+        except BaseException:
+            if batch_gen._partial is not None:
+                batch_gen._release_grid_checkpoints(
+                    batch_gen._partial["request"].request_id
+                )
+                batch_gen._partial = None
+            raise
+
+    batch_gen._next = _guarded_chunked_next
 
     logger.info(f"[chunked-prefill-mllm] Installed (budget={budget} tokens/step)")

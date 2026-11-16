@@ -80,6 +80,15 @@ for versions, API transports, reproduction commands, and coverage limits.
 - **SSD-tiered KV cache**: spill prefix cache to disk for long-context agents (`--ssd-cache-dir`)
 - **Warm prompts**: preload popular prefixes at startup (`--warm-prompts`) for 1.3-2.25x TTFT
 - **Prefix cache**: trie-based, shared across requests
+- **Hybrid prefix checkpoints**: experimental, opt-in grid-aligned snapshots for
+  text-only requests through the continuous-batching MLLM path. Enable with
+  `--enable-hybrid-prefix-checkpoints`; it is off by default pending end-to-end
+  equivalence validation. Checkpoints follow the prefill chunk-step grid and
+  share the existing memory-aware prefix-cache budget, including staged entries.
+  A measured 0.8B full checkpoint at 1,024 tokens uses 32,120,832 bytes
+  (19,537,920 recurrent + 12,582,912 KV). A calculated 4B checkpoint at the
+  same length uses 85,065,728 bytes (51,511,296 recurrent + 33,554,432 KV),
+  assuming BF16 KV/conv and FP32 recurrent state. KV memory scales with length.
 
 ### Multimodal
 - **Text + image + video + audio** from one server

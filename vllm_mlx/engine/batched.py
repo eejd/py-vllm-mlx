@@ -484,6 +484,9 @@ class BatchedEngine(BaseEngine):
             vision_cache_size=100,
             cache_memory_mb=cache_memory_mb,
             enable_prefix_cache=enable_prefix_cache,
+            hybrid_prefix_checkpoints=getattr(
+                self._scheduler_config, "hybrid_prefix_checkpoints", False
+            ),
             use_memory_aware_cache=use_memory_aware_cache,
             prefix_cache_memory_mb=prefix_cache_memory_mb,
             prefix_cache_memory_percent=prefix_cache_memory_percent,

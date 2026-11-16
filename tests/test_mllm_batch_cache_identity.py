@@ -303,6 +303,122 @@ class TestPrefixCacheKeepsKeyAndKvAligned:
         assert_entries_are_prompt_kv(gen)
 
 
+class TestHybridGridCheckpoints:
+    """Grid snapshots must replay recurrent state as well as attention KV."""
+
+    SOURCE = list(range(1, 24))
+    STEP = 8
+
+    @staticmethod
+    def assert_checkpoint(gen, tokens):
+        cache = stored_entries(gen)[tuple(tokens)]
+        layers = kv_layers(cache)
+        assert layer_offsets(layers) == [len(tokens)] * LAYERS
+        for layer in range(LAYERS):
+            assert layer_values(layers, layer) == [
+                float(h + layer) for h in chain_hashes(tokens)
+            ]
+        assert cache[-1][0].reshape(-1).tolist() == [float(chain_hashes(tokens)[-1])]
+
+    @pytest.mark.parametrize("chunked", [0, 5], ids=["blocking", "interleaved"])
+    @pytest.mark.parametrize(
+        ("shared", "reused"),
+        [(15, 8), (16, 16), (17, 16)],
+        ids=["before-boundary", "on-boundary", "after-boundary"],
+    )
+    def test_divergence_snaps_down_to_grid(self, chunked, shared, reused):
+        gen, lm = make_generator(
+            hybrid=True,
+            hybrid_prefix_checkpoints=True,
+            prefill_step_size=self.STEP,
+            chunked_prefill=chunked,
+        )
+        assert serve(gen, "source", self.SOURCE) == greedy_continuation(self.SOURCE, 6)
+        for boundary in (8, 16):
+            self.assert_checkpoint(gen, self.SOURCE[:boundary])
+
+        query = self.SOURCE[:shared] + [60, 61, 62]
+        lm.calls.clear()
+        assert serve(gen, "divergent", query) == greedy_continuation(query, 6)
+        # The first forward begins at the selected checkpoint, not at zero or
+        # at the non-rewindable point where the two prompts diverge.
+        assert lm.calls[0][0][0] == query[reused]
+        assert_entries_are_prompt_kv(gen)
+
+    @pytest.mark.parametrize("chunked", [0, 5], ids=["blocking", "interleaved"])
+    def test_disabled_does_not_capture_or_reuse_grid(self, chunked):
+        gen, lm = make_generator(
+            hybrid=True,
+            hybrid_prefix_checkpoints=False,
+            prefill_step_size=self.STEP,
+            chunked_prefill=chunked,
+        )
+        serve(gen, "source", self.SOURCE)
+        assert tuple(self.SOURCE[:16]) not in stored_entries(gen)
+        query = self.SOURCE[:17] + [60, 61, 62]
+        lm.calls.clear()
+        assert serve(gen, "divergent", query) == greedy_continuation(query, 6)
+        assert lm.calls[0][0][0] == query[0]
+
+    @pytest.mark.parametrize("chunked", [0, 5], ids=["blocking", "interleaved"])
+    def test_changed_step_does_not_reuse_off_grid_checkpoint(self, chunked):
+        gen, lm = make_generator(
+            hybrid=True,
+            hybrid_prefix_checkpoints=True,
+            prefill_step_size=8,
+            chunked_prefill=chunked,
+        )
+        serve(gen, "source", self.SOURCE)
+        self.assert_checkpoint(gen, self.SOURCE[:16])
+        gen.prefill_step_size = 10
+        query = self.SOURCE[:17] + [60, 61, 62]
+        lm.calls.clear()
+        assert serve(gen, "divergent", query) == greedy_continuation(query, 6)
+        assert lm.calls[0][0][0] == query[0]
+
+    @pytest.mark.parametrize("chunked", [0, 5], ids=["blocking", "interleaved"])
+    def test_falls_back_past_longer_non_grid_entry(self, chunked):
+        gen, lm = make_generator(
+            hybrid=True,
+            hybrid_prefix_checkpoints=True,
+            prefill_step_size=self.STEP,
+            chunked_prefill=chunked,
+        )
+        serve(gen, "source", self.SOURCE)
+        # This complete prompt leaves a longer non-grid snapshot in the trie.
+        non_grid = self.SOURCE[:18] + [55]
+        serve(gen, "non-grid", non_grid)
+        assert tuple(non_grid) in stored_entries(gen)
+        query = self.SOURCE[:18] + [60, 61, 62]
+        lm.calls.clear()
+        assert serve(gen, "divergent", query) == greedy_continuation(query, 6)
+        assert lm.calls[0][0][0] == query[16]
+
+    def test_interleaved_abort_releases_staged_checkpoint_budget(self):
+        gen, _ = make_generator(
+            hybrid=True,
+            hybrid_prefix_checkpoints=True,
+            prefill_step_size=self.STEP,
+            chunked_prefill=5,
+        )
+        request = make_request("aborted", self.SOURCE, 6)
+        gen.insert([request])
+        for _ in range(20):
+            gen.next()
+            if gen.prefix_cache._grid_reservations:
+                break
+        else:
+            pytest.fail("prefill never staged a grid checkpoint")
+
+        assert gen.prefix_cache._reserved_memory > 0
+        assert tuple(self.SOURCE[:8]) not in stored_entries(gen)
+        gen.abort_prefill(request.request_id)
+        gen.next()
+        assert not gen.prefix_cache._grid_reservations
+        assert gen.prefix_cache._reserved_memory == 0
+        assert tuple(self.SOURCE[:8]) not in stored_entries(gen)
+
+
 def kv_of(tokens, positions=None, layers=LAYERS):
     """A request cache holding the KV of ``tokens`` (``positions`` of them)."""
     cache = [KVCache() for _ in range(layers)]
