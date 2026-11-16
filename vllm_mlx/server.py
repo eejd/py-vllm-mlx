@@ -7032,6 +7032,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 )
             except (UnsupportedRequestOption, EngineBusy) as exc:
                 _raise_preflight_error(exc, tracker)
+            except EngineRequestError as exc:
+                tracker.finish(result=_engine_error_result(exc))
+                raise
             response, release_on_exit = await _build_chat_streaming_response(
                 engine,
                 prepared.messages,
@@ -7322,6 +7325,9 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
     except HTTPException as exc:
         tracker.finish(result=_metrics_result_from_status(exc.status_code))
         raise
+    except EngineRequestError as exc:
+        tracker.finish(result=_engine_error_result(exc))
+        raise
     except Exception as exc:
         tracker.finish(result=_engine_error_result(exc))
         raise
@@ -7569,6 +7575,9 @@ async def create_anthropic_message(
                 )
             except (UnsupportedRequestOption, EngineBusy) as exc:
                 _raise_preflight_error(exc, tracker)
+            except EngineRequestError as exc:
+                tracker.finish(result=_engine_error_result(exc))
+                raise
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             )

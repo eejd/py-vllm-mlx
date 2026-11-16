@@ -427,9 +427,12 @@ class MLLMScheduler:
         self._check_prompt_memory(tokens, max_tokens)
 
     def _check_prompt_memory(self, prompt_tokens: int, max_tokens: int) -> None:
-        # Hybrid models keep an unquantized KV cache while generating; prefix
-        # cache quantization applies only to stored snapshots. Reserve queued
-        # requests and allow 50% for cache growth and prefill temporaries.
+        # Live hybrid KV is unquantized even when stored prefixes are q8.
+        # Use one KV copy plus a chunk-scaled activation allowance, calibrated
+        # from three Qwen3.5-9B passes on a 32 GB M6. The 431k-token pass
+        # peaked above the MLX soft limit, so allow 5% over that soft limit;
+        # available host memory remains a separate bound. This is a heuristic,
+        # not a guarantee against OOM or concurrent system memory changes.
         text_config = getattr(getattr(self, "model_config", None), "text_config", None)
         interval = getattr(text_config, "full_attention_interval", None)
         layers = getattr(text_config, "num_hidden_layers", None)
@@ -445,10 +448,14 @@ class MLLMScheduler:
         tokens = prompt_tokens + max_tokens
         tokens += sum(
             r.num_prompt_tokens + r.sampling_params.max_tokens
-            for r in self.requests.values()
+            for r in self.waiting
         )
-        estimate = tokens * bytes_per_token * 3 // 2
-        budget = max(0, mx.get_memory_limit() - mx.get_active_memory())
+        # 2 GB per 2048-token prefill chunk on the measured host. Only one
+        # chunk's activations are reserved, not one per queued request.
+        step = self.config.prefill_step_size
+        activation = 2_000_000_000 * min(prompt_tokens, step) // 2048
+        estimate = tokens * bytes_per_token + activation
+        budget = max(0, mx.get_memory_limit() * 105 // 100 - mx.get_active_memory())
         available = _get_available_memory()
         if available > 0:
             budget = min(budget, available)

@@ -194,12 +194,14 @@ vllm-mlx serve model --continuous-batching --cache-memory-percent 0.10
 | `--no-memory-aware-cache` | Use legacy entry-count based cache |
 
 For multimodal hybrid models that expose their full-attention interval and KV
-dimensions, admission estimates the unquantized live KV cache for the prompt,
-requested output and already admitted requests, with extra room for prefill.
-Requests that exceed the available system or MLX memory budget are rejected.
-This is an estimate, not a guarantee against out-of-memory conditions; media
-tokens and other processes can change the actual requirement. Quantizing stored
-prefix-cache entries does not quantize the live generation cache.
+dimensions, admission estimates unquantized live KV for the new and queued
+requests, plus an activation allowance scaled to the prefill chunk size. The
+estimate is compared with available host memory and 105% of the MLX soft limit
+less active allocations. The allowance and soft-limit margin were calibrated
+using three Qwen3.5-9B runs on a 32 GB M6; actual peaks can exceed the soft limit.
+This is not an OOM guarantee: other models, expanded media tokens, and changing
+memory pressure can require more memory. Quantizing stored prefix-cache entries
+does not quantize the live generation cache.
 
 ## Prefix Cache
 
