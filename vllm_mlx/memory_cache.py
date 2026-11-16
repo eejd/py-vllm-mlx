@@ -1737,15 +1737,19 @@ class MemoryAwarePrefixCache:
                     self._entries.move_to_end(tokens_key)
                     return True
 
-                # Reservations belong to in-flight snapshots and cannot be
-                # displaced by an ordinary store.
-                nonresident = self._current_memory - sum(
-                    resident.memory_bytes for resident in self._entries.values()
-                )
-                if (nonresident + self._reserved_memory + entry.memory_bytes > self._max_memory
-                        or self._grid_reservation_count >= self._config.max_entries):
-                    self._stats.store_rejections += 1
-                    return False
+                # Active grid reservations cannot be displaced by a store.
+                # Without them, preserve the ordinary eviction path.
+                if self._grid_reservation_count:
+                    nonresident = self._current_memory - sum(
+                        resident.memory_bytes for resident in self._entries.values()
+                    )
+                    if (
+                        nonresident + self._reserved_memory + entry.memory_bytes
+                        > self._max_memory
+                        or self._grid_reservation_count >= self._config.max_entries
+                    ):
+                        self._stats.store_rejections += 1
+                        return False
                 if replace_grid:
                     self._current_memory -= existing.memory_bytes
                     del self._entries[tokens_key]

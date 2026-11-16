@@ -170,7 +170,7 @@ def make_generator(
         prefill_batch_size=4,
         completion_batch_size=8,
         prefill_step_size=prefill_step_size,
-        hybrid_prefix_checkpoints=hybrid_prefix_checkpoints,
+        **({"hybrid_prefix_checkpoints": True} if hybrid_prefix_checkpoints else {}),
         prefix_cache_config=(
             MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=min_prefix_tokens)
             if prefix_cache

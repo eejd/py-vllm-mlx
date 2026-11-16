@@ -361,6 +361,25 @@ class TestHybridGridCheckpoints:
         assert lm.calls[0][0][0] == query[0]
 
     @pytest.mark.parametrize("chunked", [0, 5], ids=["blocking", "interleaved"])
+    @pytest.mark.parametrize("suffix", [0, 2], ids=["no-suffix", "think-suffix"])
+    def test_disabled_reuses_full_prompt_for_extension(self, chunked, suffix):
+        gen, lm = make_generator(
+            hybrid=True,
+            hybrid_prefix_checkpoints=False,
+            prefill_step_size=self.STEP,
+            chunked_prefill=chunked,
+        )
+        source = self.SOURCE[:19]
+        assert serve(gen, "source", source) == greedy_continuation(source, 6)
+        assert tuple(source) in stored_entries(gen)
+        gen._think_suffix_len = suffix
+        query = source + [60, 61, 62]
+        lm.calls.clear()
+        assert serve(gen, "extension", query) == greedy_continuation(query, 6)
+        assert lm.calls[0][0][0] == query[len(source)]
+
+
+    @pytest.mark.parametrize("chunked", [0, 5], ids=["blocking", "interleaved"])
     def test_changed_step_does_not_reuse_off_grid_checkpoint(self, chunked):
         gen, lm = make_generator(
             hybrid=True,
@@ -385,11 +404,16 @@ class TestHybridGridCheckpoints:
             chunked_prefill=chunked,
         )
         serve(gen, "source", self.SOURCE)
-        # This complete prompt leaves a longer non-grid snapshot in the trie.
+        # Install an independently computed full-prompt snapshot alongside
+        # shorter grid entries, without letting a prior prefix hit mask it.
         non_grid = self.SOURCE[:18] + [55]
-        gen.hybrid_prefix_checkpoints = False
-        serve(gen, "non-grid", non_grid)
-        gen.hybrid_prefix_checkpoints = True
+        other, _ = make_generator(hybrid=True, prefill_step_size=self.STEP)
+        serve(other, "non-grid", non_grid)
+        entry = other.prefix_cache._entries[tuple(non_grid)]
+        copied = gen.prefix_cache.prepare_store(
+            non_grid, entry.cache, auxiliary=entry.auxiliary
+        )
+        assert gen.prefix_cache.commit_prepared(copied, evict_prefixes=False)
         assert tuple(non_grid) in stored_entries(gen)
         query = self.SOURCE[:18] + [60, 61, 62]
         lm.calls.clear()
@@ -399,10 +423,11 @@ class TestHybridGridCheckpoints:
     @pytest.mark.parametrize("chunked", [0, 5], ids=["blocking", "interleaved"])
     def test_unaligned_full_prompt_is_not_replayed_with_think_suffix(self, chunked):
         gen, lm = make_generator(
-            hybrid=True, hybrid_prefix_checkpoints=False,
+            hybrid=True, hybrid_prefix_checkpoints=True,
             prefill_step_size=self.STEP, chunked_prefill=chunked,
         )
         source = self.SOURCE[:19]
+        gen.hybrid_prefix_checkpoints = False
         serve(gen, "source", source)
         assert tuple(source) in stored_entries(gen)
         gen.hybrid_prefix_checkpoints = True

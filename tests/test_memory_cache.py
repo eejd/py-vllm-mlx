@@ -785,6 +785,13 @@ class TestMemoryAwarePrefixCache:
         assert small_cache.try_reserve_memory(2 * 1024 * 1024) is False
         assert small_cache.get_stats()["current_memory_mb"] == 0
 
+    def test_store_without_grid_reservations_preserves_existing_eviction_behavior(
+        self, small_cache, mock_kv_cache
+    ):
+        assert small_cache.try_reserve_memory(700_000)
+        assert small_cache.store([1, 2], mock_kv_cache(500_000))
+        assert tuple([1, 2]) in small_cache._entries
+
     def test_memory_mutations_wait_for_memory_lock(self, small_cache, mock_kv_cache):
         def assert_waits_for_lock(operation):
             result = {}

@@ -1626,11 +1626,16 @@ class MLLMBatchGenerator:
     def _fetch_prefill_prefix(self, tokens, suffix=()):
         """Prefer a compatible grid entry, never replay an unaligned hybrid."""
         cache = self.prefix_cache
+        if not getattr(self, "hybrid_prefix_checkpoints", False):
+            found, remaining = cache.fetch(tokens)
+            if found is not None and suffix:
+                remaining = list(remaining) + list(suffix)
+            return found, remaining
+
         full_tokens = tokens + list(suffix)
-        if getattr(self, "hybrid_prefix_checkpoints", False):
-            found, remaining = cache.fetch_grid(full_tokens, self.prefill_step_size)
-            if found is not None:
-                return found, remaining
+        found, remaining = cache.fetch_grid(full_tokens, self.prefill_step_size)
+        if found is not None:
+            return found, remaining
         found, remaining = cache.fetch(tokens)
         fetch_auxiliary = getattr(cache, "fetch_exact_auxiliary", None)
         if (found is not None and callable(fetch_auxiliary)

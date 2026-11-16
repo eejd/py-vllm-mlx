@@ -86,12 +86,18 @@ for versions, API transports, reproduction commands, and coverage limits.
   `--disable-hybrid-prefix-checkpoints`. It is off by default pending end-to-end
   equivalence validation. Checkpoints follow the prefill chunk-step grid and
   share the existing memory-aware prefix-cache budget, including staged entries.
-  Qwen3.5-0.8B testing found exact greedy IDs and selected logprobs for
-  sequential requests and concurrent blocking prefill. Concurrent interleaved
-  prefill is not guaranteed bit-exact: one warm/cold comparison changed a
-  greedy token, and a cold-only change in request order reproduced the same
-  token change. Matching arrival order alone does not guarantee identical
-  decode batches when checkpoint reuse changes prefill timing.
+  Reservations never evict existing entries and are rejected when the cache
+  lacks capacity. Restored prompts do not add deeper checkpoints. Enabling the
+  feature overrides `--chunked-prefill-tokens` with the prefill step size.
+  Qwen3.5-0.8B sequential HTTP testing matched cold greedy output; exact greedy
+  IDs and selected logprobs were observed in direct-generator single-request
+  interleaved and concurrent blocking prefill tests, not established by HTTP.
+  Concurrent interleaved prefill is not guaranteed bit-exact: one warm/cold
+  comparison changed a greedy token, and a cold-only change in request order
+  reproduced the same token change. This is consistent with batching sensitivity
+  but does not exclude checkpoint restore as a contributor. Matching arrival
+  order alone does not guarantee identical decode batches when checkpoint reuse
+  changes prefill timing.
   A measured 0.8B full checkpoint at 1,024 tokens uses 32,120,832 bytes
   (19,537,920 recurrent + 12,582,912 KV). A calculated 4B checkpoint at the
   same length uses 85,065,728 bytes (51,511,296 recurrent + 33,554,432 KV),

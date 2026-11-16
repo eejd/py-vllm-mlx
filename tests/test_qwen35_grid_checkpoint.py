@@ -48,13 +48,13 @@ def test_qwen35_grid_replay_matches_cold_greedy_and_logprobs(shared, boundary):
     cache_types = {type(cache).__name__ for cache in model.make_cache()}
     assert "ArraysCache" in cache_types and "KVCache" in cache_types
 
-    def generator():
+    def generator(grid=False):
         gen = MLLMBatchGenerator(
             SimpleNamespace(language_model=model),
             SimpleNamespace(),
             max_tokens=4,
             prefill_step_size=4,
-            hybrid_prefix_checkpoints=True,
+            **({"hybrid_prefix_checkpoints": True} if grid else {}),
             prefix_cache_config=MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1),
             enable_vision_cache=False,
         )
@@ -84,11 +84,14 @@ def test_qwen35_grid_replay_matches_cold_greedy_and_logprobs(shared, boundary):
 
     source = list(range(1, 16))
     query = source[:shared] + [40, 41, 42]
-    warm = generator()
+    warm = generator(grid=True)
     generate(warm, "source", source)
     cached, remaining = warm.prefix_cache.fetch_grid(query, 4)
     assert cached is not None
     assert len(query) - len(remaining) == boundary
     resumed = generate(warm, "resumed", query)
+    cached_tokens = warm.pop_cached_tokens("resumed")
+    assert cached_tokens is not None and cached_tokens > 0
+    assert cached_tokens == boundary
     cold = generate(generator(), "cold", query)
     assert resumed == cold
