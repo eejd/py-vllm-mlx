@@ -82,7 +82,8 @@ for versions, API transports, reproduction commands, and coverage limits.
 - **Prefix cache**: trie-based, shared across requests
 - **Hybrid prefix checkpoints**: experimental, opt-in grid-aligned snapshots for
   text-only requests through the continuous-batching MLLM path. Enable with
-  `--enable-hybrid-prefix-checkpoints`; it is off by default pending end-to-end
+  `--enable-hybrid-prefix-checkpoints`; disable with
+  `--disable-hybrid-prefix-checkpoints`. It is off by default pending end-to-end
   equivalence validation. Checkpoints follow the prefill chunk-step grid and
   share the existing memory-aware prefix-cache budget, including staged entries.
   A measured 0.8B full checkpoint at 1,024 tokens uses 32,120,832 bytes

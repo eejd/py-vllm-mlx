@@ -1209,11 +1209,18 @@ Examples:
         "prefixes through its prefix-trie cache; the other cache options below "
         "are continuous-batching only",
     )
-    serve_parser.add_argument(
+    hybrid_grid = serve_parser.add_mutually_exclusive_group()
+    hybrid_grid.add_argument(
         "--enable-hybrid-prefix-checkpoints",
         action="store_true",
         help="Enable experimental grid-aligned hybrid prefix checkpoints for "
         "continuous-batching MLLM text requests (default: disabled)",
+    )
+    hybrid_grid.add_argument(
+        "--disable-hybrid-prefix-checkpoints",
+        dest="enable_hybrid_prefix_checkpoints",
+        action="store_false",
+        help="Disable hybrid grid checkpoints",
     )
     serve_parser.add_argument(
         "--disable-prefix-cache",
