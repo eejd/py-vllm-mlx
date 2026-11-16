@@ -430,9 +430,9 @@ class MLLMScheduler:
         # Live hybrid KV is unquantized even when stored prefixes are q8.
         # Use one KV copy plus a chunk-scaled activation allowance, calibrated
         # from three Qwen3.5-9B passes on a 32 GB M6. The 431k-token pass
-        # peaked above the MLX soft limit, so allow 5% over that soft limit;
-        # available host memory remains a separate bound. This is a heuristic,
-        # not a guarantee against OOM or concurrent system memory changes.
+        # peaked above the MLX soft limit, so allow 5% over that soft limit,
+        # capped at the device's recommended working set. Available host memory
+        # remains a separate bound. This is a heuristic, not an OOM guarantee.
         text_config = getattr(getattr(self, "model_config", None), "text_config", None)
         interval = getattr(text_config, "full_attention_interval", None)
         layers = getattr(text_config, "num_hidden_layers", None)
@@ -455,7 +455,11 @@ class MLLMScheduler:
         step = self.config.prefill_step_size
         activation = 2_000_000_000 * min(prompt_tokens, step) // 2048
         estimate = tokens * bytes_per_token + activation
-        budget = max(0, mx.get_memory_limit() * 105 // 100 - mx.get_active_memory())
+        ceiling = mx.get_memory_limit() * 105 // 100
+        recommended = mx.device_info().get("max_recommended_working_set_size", 0)
+        if recommended > 0:
+            ceiling = min(ceiling, recommended)
+        budget = max(0, ceiling - mx.get_active_memory())
         available = _get_available_memory()
         if available > 0:
             budget = min(budget, available)

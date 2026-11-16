@@ -25,6 +25,9 @@ def scheduler(monkeypatch):
     sched.requests = {}
     sched.waiting = deque()
     monkeypatch.setattr(mx, "get_memory_limit", lambda: 24_159_191_040)
+    monkeypatch.setattr(mx, "device_info", lambda: {
+        "max_recommended_working_set_size": 26_843_545_600
+    })
     monkeypatch.setattr(mx, "get_active_memory", lambda: 8_200_000_000)
     # raising=False makes this behavior test reach its assertion on the base
     # revision, which did not import this helper into the scheduler module.
@@ -72,3 +75,13 @@ def test_activation_allowance_scales_with_prefill_chunk(scheduler, monkeypatch):
         scheduler.add_request(prompt="long", max_tokens=128)
     scheduler.config.prefill_step_size = 512
     assert scheduler.add_request(prompt="long", max_tokens=128) in scheduler.requests
+
+
+def test_admission_ceiling_cannot_exceed_recommended_working_set(scheduler, monkeypatch):
+    from vllm_mlx import mllm_scheduler
+    monkeypatch.setattr(mx, "get_memory_limit", lambda: 26_843_545_600)
+    monkeypatch.setattr(mllm_scheduler, "_get_available_memory", lambda: 30_000_000_000)
+    monkeypatch.setattr(mllm_scheduler, "encode_prompt", lambda *args: range(525_000))
+    # This fits 105% of the soft limit, but not the device working set.
+    with pytest.raises(RequestPreprocessingError, match="memory"):
+        scheduler.add_request(prompt="long", max_tokens=128)
