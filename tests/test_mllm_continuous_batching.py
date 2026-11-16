@@ -3011,7 +3011,7 @@ class TestChunkedPrefillCacheHandling:
 
         assert gen._next() == []
         assert gen._next() == []
-        assert gen._partial["checkpoint_entry"] is None
+        assert not getattr(gen, "_grid_staged", {})
         gen._next()
 
         gen._clone_prefix_for_replay.assert_not_called()
@@ -3034,8 +3034,6 @@ class TestChunkedPrefillCacheHandling:
         assert stored[1].keys.reshape(-1).tolist() == list(range(1, 11))
 
     def test_interleaved_abort_during_checkpoint_commit_is_request_local(self):
-        from types import SimpleNamespace
-
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchRequest,
             PrefillAbortedError,
@@ -3059,15 +3057,15 @@ class TestChunkedPrefillCacheHandling:
             "total": 5,
             "cached_count": 0,
             "chunk_count": 1,
-            "checkpoint_at": 3,
-            "checkpoint_key": [1, 2, 3],
-            "checkpoint_entry": SimpleNamespace(tokens=(1, 2, 3)),
         }
-        gen._publish_prefill_checkpoint = MagicMock(
+        handle = object()
+        gen._grid_staged = {req.request_id: [handle]}
+        gen._commit_grid_checkpoints = MagicMock(
             side_effect=PrefillAbortedError(req.request_id)
         )
 
         responses = gen._next()
+        gen._commit_grid_checkpoints.assert_called_once_with(req.request_id)
 
         assert gen._partial is None
         assert len(responses) == 1

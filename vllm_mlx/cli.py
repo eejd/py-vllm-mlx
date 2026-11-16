@@ -383,6 +383,7 @@ def serve_command(args):
             prefill_step_size=args.prefill_step_size,
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
+            hybrid_prefix_checkpoints=getattr(args, "enable_hybrid_prefix_checkpoints", False),
             prefix_cache_size=args.prefix_cache_size,
             # Memory-aware cache options
             use_memory_aware_cache=not args.no_memory_aware_cache,
@@ -1207,6 +1208,19 @@ Examples:
         "explicitly (or with --prefix-trie-cache), also reuses conversation "
         "prefixes through its prefix-trie cache; the other cache options below "
         "are continuous-batching only",
+    )
+    hybrid_grid = serve_parser.add_mutually_exclusive_group()
+    hybrid_grid.add_argument(
+        "--enable-hybrid-prefix-checkpoints",
+        action="store_true",
+        help="Enable experimental grid-aligned hybrid prefix checkpoints for "
+        "continuous-batching MLLM text requests (default: disabled)",
+    )
+    hybrid_grid.add_argument(
+        "--disable-hybrid-prefix-checkpoints",
+        dest="enable_hybrid_prefix_checkpoints",
+        action="store_false",
+        help="Disable hybrid grid checkpoints",
     )
     serve_parser.add_argument(
         "--disable-prefix-cache",

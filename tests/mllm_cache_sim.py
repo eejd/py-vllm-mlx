@@ -149,6 +149,7 @@ def make_generator(
     prefill_step_size: int = 1024,
     min_prefix_tokens: int = 1,
     hybrid: bool = False,
+    hybrid_prefix_checkpoints: bool = False,
 ):
     """Real ``MLLMBatchGenerator`` over the simulated model."""
     from vllm_mlx.memory_cache import MemoryCacheConfig
@@ -169,6 +170,7 @@ def make_generator(
         prefill_batch_size=4,
         completion_batch_size=8,
         prefill_step_size=prefill_step_size,
+        **({"hybrid_prefix_checkpoints": True} if hybrid_prefix_checkpoints else {}),
         prefix_cache_config=(
             MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=min_prefix_tokens)
             if prefix_cache

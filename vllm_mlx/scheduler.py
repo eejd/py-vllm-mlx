@@ -173,6 +173,7 @@ class SchedulerConfig:
 
     # Prefix cache settings
     enable_prefix_cache: bool = True
+    hybrid_prefix_checkpoints: bool = False
     prefix_cache_size: int = 100  # Max cached entries (legacy, ignored if memory-aware)
 
     # Memory-aware cache settings (recommended for large models)

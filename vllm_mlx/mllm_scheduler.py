@@ -76,6 +76,8 @@ class MLLMSchedulerConfig:
     mtp_num_draft_tokens: int = 1
     # Enable KV prefix cache for text-only requests
     enable_prefix_cache: bool = True
+    # Enable experimental grid-aligned snapshots for hybrid model prefixes.
+    hybrid_prefix_checkpoints: bool = False
     # MLLM supports the memory-aware prefix cache only; if disabled, prefix
     # caching is disabled rather than silently falling back to another cache.
     use_memory_aware_cache: bool = True
@@ -336,6 +338,7 @@ class MLLMScheduler:
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
+                hybrid_prefix_checkpoints=self.config.hybrid_prefix_checkpoints,
                 max_kv_size=self.config.max_kv_size,
                 specprefill_draft_model=getattr(self, "specprefill_draft_model", None),
                 specprefill_enabled=self.config.specprefill_enabled,

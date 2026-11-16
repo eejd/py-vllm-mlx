@@ -335,6 +335,135 @@ class TestMemoryAwarePrefixCache:
         assert stats["store_rejections"] == 1
         assert stats["current_memory_mb"] == 0
 
+    def test_grid_reservations_charge_before_copy_and_release_on_error(
+        self, small_cache, mock_kv_cache, monkeypatch
+    ):
+        def fail_copy(_cache):
+            assert small_cache._reserved_memory == 1000
+            assert small_cache._grid_reservation_count == 1
+            raise RuntimeError("copy failed")
+
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._detach_cache_for_storage", fail_copy
+        )
+        assert small_cache.reserve_grid([1, 2], mock_kv_cache(1000), 2) is None
+        assert small_cache._reserved_memory == 0
+        assert small_cache._grid_reservation_count == 0
+        assert len(small_cache) == 0
+
+    def test_grid_reservations_share_budget_with_regular_stores(
+        self, model, mock_kv_cache
+    ):
+        cache = MemoryAwarePrefixCache(
+            model, MemoryCacheConfig(max_memory_mb=1, max_entries=3, min_prefix_tokens=1)
+        )
+        first = cache.reserve_grid([1, 2], mock_kv_cache(300_000), 2)
+        second = cache.reserve_grid([1, 2, 3, 4], mock_kv_cache(300_000), 2)
+        assert first is not None and second is not None
+        assert cache.fetch_grid([1, 2, 3], 2) == (None, [1, 2, 3])
+        assert not cache.store([9], mock_kv_cache(500_000))
+        assert cache._reserved_memory == 600_000
+        assert cache.commit_grid(first)
+        assert cache._reserved_memory == 300_000
+        cache.release_grid(second)
+        cache.release_grid(second)
+        assert cache._reserved_memory == 0
+        assert cache._grid_reservation_count == 0
+        assert cache.store([9], mock_kv_cache(500_000))
+
+    def test_grid_entry_slots_and_cancel_do_not_evict(
+        self, model, mock_kv_cache
+    ):
+        cache = MemoryAwarePrefixCache(
+            model, MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
+        )
+        assert cache.store([9], mock_kv_cache(1000))
+        staged = cache.reserve_grid([1, 2], mock_kv_cache(1000), 2)
+        assert staged is not None
+        assert cache.reserve_grid([3, 4], mock_kv_cache(1000), 2) is None
+        assert not cache.commit_grid(staged, commit_guard=lambda: False)
+        assert cache._reserved_memory == 0
+        assert tuple([9]) in cache._entries
+        assert cache.get_stats()["evictions"] == 0
+
+    def test_clear_invalidates_staged_grid_entries(self, small_cache, mock_kv_cache):
+        entry = small_cache.reserve_grid([1, 2], mock_kv_cache(1000), 2)
+        assert entry is not None
+        small_cache.clear()
+        assert small_cache._reserved_memory == 0
+        assert not small_cache.commit_grid(entry)
+        assert len(small_cache) == 0
+
+    def test_fetch_grid_longest_valid_prefix_and_step(self, small_cache, mock_kv_cache):
+        def checkpoint(tokens, step):
+            entry = small_cache.reserve_grid(tokens, mock_kv_cache(1000), step)
+            assert entry is not None
+            assert small_cache.commit_grid(entry)
+
+        checkpoint([1, 2], 2)
+        checkpoint([1, 2, 3, 4], 4)
+        checkpoint([1, 2, 3, 4, 5, 6], 2)
+        assert small_cache.store([1, 2, 3, 4, 5, 6, 7], mock_kv_cache(1000),
+                                 evict_prefixes=False)
+        result, remaining = small_cache.fetch_grid([1, 2, 3, 4, 5, 6, 7], 2)
+        assert result is small_cache._entries[(1, 2, 3, 4, 5, 6)].cache
+        assert remaining == [7]
+        result, remaining = small_cache.fetch_grid([1, 2, 3, 4, 5, 6], 2)
+        assert result is small_cache._entries[(1, 2)].cache
+        assert remaining == [3, 4, 5, 6]
+        result, remaining = small_cache.fetch_grid([1, 2, 3, 4, 5, 6, 7], 4)
+        assert result is small_cache._entries[(1, 2, 3, 4)].cache
+        assert remaining == [5, 6, 7]
+        stats = small_cache.get_stats()
+        assert stats["hits"] == 3
+        assert stats["tokens_saved"] == 12
+        assert small_cache.fetch_grid([1, 2, 3], 8) == (None, [1, 2, 3])
+        assert small_cache.get_stats()["misses"] == stats["misses"]
+
+    def test_grid_rejects_quantization(self, model, mock_kv_cache):
+        cache = MemoryAwarePrefixCache(
+            model, MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1,
+                                     kv_quantize=True)
+        )
+        assert cache.reserve_grid([1, 2], mock_kv_cache(1000), 2) is None
+        assert cache._reserved_memory == 0
+
+    def test_grid_collision_preserves_exact_logits_and_state(
+        self, small_cache, mock_kv_cache
+    ):
+        pytest.importorskip("mlx.core")
+        tokens = [1, 2]
+        exact = small_cache.prepare_store(
+            tokens, mock_kv_cache(1000), {"last_logits": MockArray(100)}
+        )
+        assert exact is not None and small_cache.commit_prepared(exact)
+        grid = small_cache.reserve_grid(tokens, mock_kv_cache(2000), 2)
+        assert grid is not None
+        assert not small_cache.commit_grid(grid)
+        assert small_cache._entries[tuple(tokens)] is exact
+        assert small_cache.fetch_exact_auxiliary(tokens) == exact.auxiliary
+        assert small_cache._current_memory == exact.memory_bytes
+        assert small_cache._reserved_memory == 0
+
+    def test_exact_logits_replace_grid_with_same_forward_state(
+        self, small_cache, mock_kv_cache
+    ):
+        pytest.importorskip("mlx.core")
+        tokens = [1, 2]
+        grid = small_cache.reserve_grid(tokens, mock_kv_cache(1000), 2)
+        assert grid is not None and small_cache.commit_grid(grid)
+        live = mock_kv_cache(2000)
+        exact = small_cache.prepare_store(tokens, live, {"last_logits": MockArray(100)})
+        assert exact is not None and exact is not grid
+        assert not small_cache.commit_prepared(exact, commit_guard=lambda: False)
+        assert small_cache._entries[tuple(tokens)] is grid
+        assert small_cache.commit_prepared(exact)
+        assert small_cache._entries[tuple(tokens)] is exact
+        assert exact.cache[0].keys is live[0].keys
+        assert "last_logits" in small_cache.fetch_exact_auxiliary(tokens)
+        assert small_cache._current_memory == exact.memory_bytes
+        assert small_cache._sorted_keys.count(tuple(tokens)) == 1
+
     def test_store_and_fetch_exact_match(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3, 4, 5]
         kv = mock_kv_cache(1000)
@@ -655,6 +784,13 @@ class TestMemoryAwarePrefixCache:
     def test_try_reserve_memory_denies_over_limit(self, small_cache):
         assert small_cache.try_reserve_memory(2 * 1024 * 1024) is False
         assert small_cache.get_stats()["current_memory_mb"] == 0
+
+    def test_store_without_grid_reservations_preserves_existing_eviction_behavior(
+        self, small_cache, mock_kv_cache
+    ):
+        assert small_cache.try_reserve_memory(700_000)
+        assert small_cache.store([1, 2], mock_kv_cache(500_000))
+        assert tuple([1, 2]) in small_cache._entries
 
     def test_memory_mutations_wait_for_memory_lock(self, small_cache, mock_kv_cache):
         def assert_waits_for_lock(operation):
